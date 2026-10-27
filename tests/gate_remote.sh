@@ -6,6 +6,11 @@ export GIT_CONFIG_NOSYSTEM=1
 RW=$(cd "$(dirname "$0")/.." && pwd)
 G="$RW/hooks/guard_push.py"
 T=$(mktemp -d "${TMPDIR:-/tmp}/rwtest3.XXXXXX")
+# Test a private copy of the plugin, so the results never depend on this checkout's state.
+mkdir -p "$T/plugin" && cp -R "$RW/scripts" "$RW/hooks" "$T/plugin/"
+RW="$T/plugin"
+G="$RW/hooks/guard_push.py"
+unset RAVENWATCH_DISABLE RAVENWATCH_CHECKS_RUNNING XDG_CONFIG_HOME GIT_DIR GIT_WORK_TREE
 P=push
 D=.git
 cd "$T"

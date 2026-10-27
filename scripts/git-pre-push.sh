@@ -24,6 +24,10 @@ if [ -x "$hook_dir/pre-push.local" ]; then
   printf '%s\n' "$input" | "$hook_dir/pre-push.local" "$@" || exit $?
 fi
 
+if [ "$RAVENWATCH_CHECKS_RUNNING" = "1" ]; then
+  echo "✋ ravenwatch: pushing is disabled while the review's checks run." >&2
+  exit 1
+fi
 [ "$RAVENWATCH_DISABLE" = "1" ] && exit 0
 [ -n "$input" ] || exit 0
 

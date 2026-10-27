@@ -360,8 +360,9 @@ SECRET_PATTERNS = [
         re.I)),
 ]
 
-PLACEHOLDER = re.compile(r"(example|sample|dummy|placeholder|changeme|your[_\-]?|xxx+|<.+>|\$\{|process\.env|os\.environ|"
-                         r"getenv|env\(|test|fake|mock|redacted|\*\*\*)", re.I)
+# Applied to the matched value only (never the whole line: `process.env.KEY ?? "sk_live_…"` is a real leak).
+PLACEHOLDER = re.compile(r"example|sample|dummy|placeholder|changeme|your[_\-]|x{4,}|<.+>|\$\{|\{\{|redacted|\*{3}"
+                         r"|^(?:test|fake|mock)|(?:test|fake|mock)$", re.I)
 
 
 def looks_secret(val):
@@ -402,7 +403,7 @@ def scan_added_lines(lines, commit_label=None):
                     if name == "Generic secret assignment" and not looks_secret(val):
                         continue
                     hits.append((current_file, new_line, name, redact(val),
-                                 bool(PLACEHOLDER.search(line)), commit))
+                                 bool(PLACEHOLDER.search(val)), commit))
                     break
         elif not raw.startswith("-"):
             new_line += 1
@@ -478,7 +479,8 @@ def cmd_prepare(args):
     # Scan: committed history (catches secrets added then removed), or the diff for worktree/full mode.
     # Both are streamed so a long history never has to fit in memory.
     if rng:
-        hits = scan_added_lines(git_lines("log", "-p", "--no-color", "--no-ext-diff", "--format=commit %H", rng))
+        hits = scan_added_lines(git_lines("log", "-p", "--cc", "--no-color", "--no-ext-diff",
+                                          "--format=commit %H", rng))
     else:
         with open(diff_path, encoding="utf-8", errors="replace") as fh:
             hits = scan_added_lines(line.rstrip("\n") for line in fh)
@@ -639,7 +641,10 @@ def store_report(sdir, run_id, head, src):
     if os.path.dirname(src) == os.path.realpath(reports) or os.path.dirname(src) == reports:
         return src
     # Open without following symlinks, then check the opened file itself (no lstat/open race).
-    fd = os.open(src, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        fd = os.open(src, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError as exc:
+        raise RuntimeError(f"report {src} can't be read as a plain file (symlinks are refused): {exc.strerror}")
     with os.fdopen(fd, "rb") as fh:
         st = os.fstat(fh.fileno())
         if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
@@ -664,6 +669,13 @@ def store_report(sdir, run_id, head, src):
     return dest
 
 
+def _mtime(d, f):
+    try:
+        return os.path.getmtime(os.path.join(d, f))
+    except OSError:
+        return 0
+
+
 def cmd_mark(args):
     os.chdir(git("rev-parse", "--show-toplevel"))
     sdir = state_dir()
@@ -678,6 +690,14 @@ def cmd_mark(args):
     if prepared["head"] != head:
         raise RuntimeError(f"HEAD moved since this review was prepared (reviewed {prepared['head'][:8]}, "
                            f"now {head[:8]}); the verdict would cover commits nobody reviewed. Review again.")
+    # A blocking check that failed, timed out or never finished can't be outvoted by pass/warn.
+    if args.verdict in ("pass", "warn"):
+        results = read_kv(os.path.join(runs, run_id, "checks.kv"))
+        bad = [k for k, v in results.items() if not k.endswith(".blocking") and v != "pass"
+               and results.get(k + ".blocking") == "1"]
+        if bad:
+            raise RuntimeError(f"blocking check(s) did not pass in this run: {', '.join(bad)}. Record `block`, or "
+                               "`accepted` if the owner accepts the risk.")
     likely = int(prepared.get("likely_secrets", "0") or 0)
     if args.verdict in ALLOWED and likely and not args.secrets_cleared:
         raise RuntimeError(f"the deterministic scan found {likely} likely real secret(s) in this range. A push can't "
@@ -710,7 +730,7 @@ def cmd_mark(args):
     verdicts = os.path.join(sdir, "verdicts")
     os.makedirs(verdicts, exist_ok=True)
     write_kv_atomic(os.path.join(verdicts, head), lines)
-    old = sorted(os.listdir(verdicts), key=lambda f: os.path.getmtime(os.path.join(verdicts, f)))
+    old = sorted((f for f in os.listdir(verdicts) if not f.endswith(".tmp")), key=lambda f: _mtime(verdicts, f))
     for f in old[:-KEEP_VERDICTS]:
         try:
             os.remove(os.path.join(verdicts, f))
@@ -816,6 +836,21 @@ def parse_brief(text):
                 item[m.group(1)] = _scalar(m.group(2))
             else:
                 errors.append(f"line {n}: could not read `{line[:40]}`")
+    # Accepted risks must be plain one-line bullets in a single section, so the approval screen can show
+    # every word of them and reviewers act on nothing the owner didn't see.
+    sections = list(re.finditer(r"^#{1,6}\s*accepted\s+risks?\b.*$", body, re.M | re.I))
+    if len(sections) > 1:
+        errors.append("only one `## Accepted risks` section is allowed")
+    elif sections:
+        rest = body[sections[0].end():]
+        nxt = re.search(r"^#{1,6}\s", rest, re.M)
+        for line in (rest[:nxt.start()] if nxt else rest).splitlines():
+            if not line.strip():
+                continue
+            if not re.match(r"^- \S", line):
+                errors.append(f"accepted risks: every line must be a `- ` bullet on one line (got `{line.strip()[:40]}`)")
+            elif len(line) > 300:
+                errors.append("accepted risks: keep each entry under 300 characters")
     # Validate the parts that have effects.
     checks = []
     for i, c in enumerate(meta.get("checks") or [], start=1):
@@ -910,11 +945,15 @@ def cmd_trust_brief(args):
     digest = sha256_bytes(data)
     if not args.approve:
         # Step 1: show exactly what would take effect. Nothing is stored.
-        print(f"{BRIEF_NAME} — NOT approved yet. This is what approving it would put into effect:")
+        print(f"{BRIEF_NAME} — NOT approved yet. Approving puts ALL of this into effect; every reviewer reads it "
+              "as yours:")
+        print("----- begin " + BRIEF_NAME + " -----")
+        print(data.decode("utf-8", errors="replace").rstrip("\n"))
+        print("----- end " + BRIEF_NAME + " -----")
         print_brief_summary(meta, body)
         print(f"\nsha256: {digest}")
-        print(f"To approve exactly this content, the owner runs: ravenwatch.py trust-brief --approve {digest}"
-              + (" --private" if args.private else ""))
+        print(f"To approve exactly this content, tell Claude to approve it: it runs `trust-brief --approve {digest}"
+              + (" --private" if args.private else "") + "` and Claude Code asks you to confirm.")
         return 0
     if args.approve != digest:
         raise RuntimeError(f"{BRIEF_NAME} changed since it was shown (expected sha256 {args.approve[:12]}…, now "
@@ -950,11 +989,11 @@ def print_brief_summary(meta, body):
     for k in ("audience", "distribution"):
         if meta.get(k):
             print(f"- {k}: {meta[k]}")
-    accepted = re.search(r"^##\s*Accepted risks\s*$(.*?)(?=^##\s|\Z)", body, re.M | re.S | re.I)
-    items = re.findall(r"^\s*[-*]\s+(.+)$", accepted.group(1), re.M) if accepted else []
+    accepted = re.search(r"^#{1,6}\s*accepted\s+risks?\b.*$(.*?)(?=^#{1,6}\s|\Z)", body, re.M | re.S | re.I)
+    items = re.findall(r"^- (.+)$", accepted.group(1), re.M) if accepted else []
     print(f"- accepted risks: {len(items)}")
     for it in items:
-        print(f"    - {it.strip()[:300]}")
+        print(f"    - {it.strip()}")
 
 
 def brief_context_lines(st, top, cur, files):
@@ -1003,6 +1042,17 @@ GENERIC_ASSIGNMENT = re.compile(
     r"([^\s\"',;]{6,})")
 
 
+HEADER_SECRET = re.compile(r"(?i)\b((?:proxy-)?authorization\s*[:=]\s*(?:bearer|basic|token|digest)?\s*)(\S+)")
+COOKIE = re.compile(r"(?i)\b((?:set-)?cookie\s*[:=]\s*)(.*)")
+QUOTED_SECRET = re.compile(
+    r"(?i)((?<![A-Za-z0-9_])[\w.-]{0,40}(?:key|secret|token|passw(?:or)?d|pwd|credential)s?[\w.-]{0,20}\s*[:=]\s*)"
+    r"([\"'])([^\"']{6,})\2")
+
+
+def _redact_cookies(m):
+    return m.group(1) + re.sub(r"=([^;\s]{4,})", lambda v: "=" + redact(v.group(1)), m.group(2))
+
+
 def redact_output(text):
     out = []
     for line in text.splitlines():
@@ -1010,13 +1060,16 @@ def redact_output(text):
             if name == "Generic secret assignment":
                 continue
             line = rx.sub(lambda m: redact(m.group(0)), line)
+        line = HEADER_SECRET.sub(lambda m: m.group(1) + redact(m.group(2)), line)
+        line = COOKIE.sub(_redact_cookies, line)
+        line = QUOTED_SECRET.sub(lambda m: m.group(1) + m.group(2) + redact(m.group(3)) + m.group(2), line)
         line = GENERIC_ASSIGNMENT.sub(lambda m: m.group(1) + redact(m.group(2)), line)
         out.append(line)
     return "\n".join(out)
 
 
 GIT_SHIM = """#!/bin/sh
-# ravenwatch: git with push disabled, used while owner checks run.
+# ravenwatch: refuses a plain git push while owner checks run (pushes to the remotes are also redirected).
 i=1
 for a in "$@"; do
   case "$a" in
@@ -1031,6 +1084,23 @@ exec "%s" "$@"
 """
 
 _running = {"proc": None}
+
+
+def block_pushes(env):
+    """Make every git process the checks start (whatever its path or aliases) push to an unreachable URL
+    instead of this repository's remotes, through git's own config in the environment. The pre-push hook
+    also refuses while RAVENWATCH_CHECKS_RUNNING is set."""
+    _, out = git("config", "--get-regexp", r"^remote\..*\.(push)?url$", check=False)
+    urls = sorted({line.split(" ", 1)[1] for line in out.splitlines() if " " in line})
+    n = int(env.get("GIT_CONFIG_COUNT", "0") or 0)
+    for u in urls:
+        env[f"GIT_CONFIG_KEY_{n}"] = "url.ravenwatch-checks-cannot-push://blocked/.pushInsteadOf"
+        env[f"GIT_CONFIG_VALUE_{n}"] = u
+        n += 1
+    env["GIT_CONFIG_COUNT"] = str(n)
+
+
+CHECK_OUTPUT_MAX = 50 * 1024 * 1024
 
 
 def _kill_group(proc):
@@ -1048,17 +1118,25 @@ def _on_signal(signum, _frame):
 
 
 def run_check(cmd, cwd, timeout, env):
-    """Run one check in its own process group; output goes to a temp file so it can't fill memory."""
+    """Run one check in its own process group (same session, so a kill of the whole session still reaches it);
+    output goes to a temp file, capped, so it can't fill memory."""
     start = _dt.datetime.now()
     with tempfile.TemporaryFile() as out:
         proc = subprocess.Popen(["/bin/sh", "-c", cmd], cwd=cwd, stdin=subprocess.DEVNULL, stdout=out,
-                                stderr=subprocess.STDOUT, env=env, start_new_session=True)
+                                stderr=subprocess.STDOUT, env=env, preexec_fn=os.setpgrp)
         _running["proc"] = proc
+        deadline = _dt.datetime.now() + _dt.timedelta(seconds=timeout)
+        status = None
         try:
-            proc.wait(timeout=timeout)
-            status = "pass" if proc.returncode == 0 else "fail"
-        except subprocess.TimeoutExpired:
-            status = "timeout"
+            while status is None:
+                try:
+                    proc.wait(timeout=1)
+                    status = "pass" if proc.returncode == 0 else "fail"
+                except subprocess.TimeoutExpired:
+                    if os.fstat(out.fileno()).st_size > CHECK_OUTPUT_MAX:
+                        status = "output-limit"
+                    elif _dt.datetime.now() >= deadline:
+                        status = "timeout"
         finally:
             _kill_group(proc)  # also ends background children of a finished check
             try:
@@ -1102,20 +1180,33 @@ def cmd_checks(args):
     # Checks run the code in the working tree; only run them on exactly the reviewed commits.
     _, wt = git("status", "--porcelain", check=False)
     if wt.strip():
-        raise RuntimeError("the working tree has uncommitted or untracked changes; checks run the files on disk, so "
-                           "commit or stash them first (checks must test exactly the commits being reviewed)")
+        paths = [l[3:] for l in wt.splitlines() if l.strip()]
+        raise RuntimeError("checks run the files on disk, so they need exactly the reviewed commits, but there are "
+                           f"uncommitted or untracked files: {', '.join(paths[:5])}" + (" …" if len(paths) > 5 else "")
+                           + ". Commit them, `git stash -u`, or add them to .gitignore — then prepare the review "
+                           "again if you committed.")
     shim_dir = tempfile.mkdtemp(prefix="ravenwatch-git-")
     real_git = shutil.which("git") or "/usr/bin/git"
     with open(os.path.join(shim_dir, "git"), "w", encoding="utf-8") as fh:
         fh.write(GIT_SHIM % real_git)
     os.chmod(os.path.join(shim_dir, "git"), 0o755)
-    env = dict(os.environ, CI="1", FORCE_COLOR="0", NO_COLOR="1",
+    env = dict(os.environ, CI="1", FORCE_COLOR="0", NO_COLOR="1", RAVENWATCH_CHECKS_RUNNING="1",
                PATH=shim_dir + os.pathsep + os.environ.get("PATH", ""))
     env.pop("RAVENWATCH_DISABLE", None)
+    block_pushes(env)
     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         signal.signal(sig, _on_signal)
 
     out_path = os.path.join(runs, run_id, "checks.md")
+    # Machine-readable results (last result wins); `mark` refuses pass/warn while a blocking check isn't pass.
+    kv_path = os.path.join(runs, run_id, "checks.kv")
+    results = read_kv(kv_path) if args.only else {}
+
+    def record(name, status, blocking):
+        results[name] = status
+        results[name + ".blocking"] = "1" if blocking else "0"
+        write_kv_atomic(kv_path, [f"{k}={v}" for k, v in results.items()])
+
     # Each result is appended as soon as it is known; a check that never reports finished must be
     # treated as failed (the review skill says so). A re-run with --only appends, never erases.
     fresh = not args.only or not os.path.exists(out_path)
@@ -1133,7 +1224,9 @@ def cmd_checks(args):
             kind = "blocking" if c["blocking"] else "non-blocking"
             with open(out_path, "a", encoding="utf-8") as fh:
                 fh.write(f"## {c['name']} — STARTED ({kind}, timeout {c['timeout']}s)\n")
+            record(c["name"], "started", c["blocking"])
             status, code, secs, tail = run_check(c["run"], top, c["timeout"], env)
+            record(c["name"], status, c["blocking"])
             summary.append(f"{c['name']}: {status.upper()} ({kind}, exit {code}, {secs:.0f}s)")
             with open(out_path, "a", encoding="utf-8") as fh:
                 fh.write("\n".join([f"## {c['name']} — {status.upper()} ({kind})", f"- command: `{c['run']}`",
@@ -1146,7 +1239,7 @@ def cmd_checks(args):
         print(f"- {line}")
     print(f"output: {out_path}")
     failed_blocking = [c["name"] for c in meta["checks"] if c["blocking"]
-                       and any(x.startswith(c["name"] + ":") and " PASS " not in x for x in summary)]
+                       and results.get(c["name"], "pass") != "pass"]
     if failed_blocking:
         print(f"BLOCKING CHECKS FAILED: {', '.join(failed_blocking)}")
         return 1
@@ -1215,7 +1308,9 @@ def cmd_install_hook(args):
         if managed:
             raise RuntimeError(f"{hook} looks like a hook manager stub (Husky, lefthook, pre-commit, or a script "
                                "that dispatches on its own path); renaming it would silently stop your own checks. "
-                               "ravenwatch cannot be installed alongside it yet.")
+                               "ravenwatch cannot be installed alongside it yet. You can still run /ravenwatch:review "
+                               "and push from your own terminal; Claude can't push in this repository unless you start "
+                               "Claude Code with RAVENWATCH_DISABLE=1 for it.")
     tmp = f"{hook}.{os.getpid()}.tmp"
     try:
         shutil.copyfile(HOOK_SOURCE, tmp)
@@ -1230,7 +1325,10 @@ def cmd_install_hook(args):
         if os.path.exists(tmp):
             os.remove(tmp)
         raise
-    print(f"{'updated' if state == 'outdated' else 'installed'} the ravenwatch pre-push hook in {hdir}")
+    with open(hook, "rb") as fh:
+        digest = sha256_bytes(fh.read())
+    print(f"{'updated' if state == 'outdated' else 'installed'} the ravenwatch pre-push hook in {hdir} "
+          f"(sha256 {digest[:16]}…)")
     return 0
 
 
@@ -1244,10 +1342,13 @@ def cmd_status(_args):
         print("no review recorded for this repository")
         return 1
     head = git("rev-parse", "HEAD")
+    own = read_kv(os.path.join(sdir, "verdicts", head))
+    if own:
+        st = own  # this commit's own verdict, the one the git hook uses
     covers = st.get("head") == head
     for k, v in st.items():
         print(f"{k}: {v}")
-    print(f"covers current HEAD: {'yes' if covers else 'no (new commits since review)'}")
+    print(f"covers current HEAD: {'yes' if covers else 'no (HEAD has not been reviewed; the latest review covered another commit)'}")
     return 0 if covers and st.get("verdict") in ALLOWED else 1
 
 

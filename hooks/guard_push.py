@@ -28,6 +28,7 @@ import subprocess
 import sys
 
 SCRIPTS = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts"))
+PLUGIN_ROOT = os.path.realpath(os.path.dirname(SCRIPTS))
 HOOK_SOURCE = os.path.join(SCRIPTS, "git-pre-push.sh")
 # A single plain call of the plugin's own helper (it writes verdicts and installs hooks itself;
 # those calls are not pre-approved, so the owner confirms each one).
@@ -56,7 +57,8 @@ BYPASS = [
 ]
 # Text that reaches the hooks, git config or verdict state (case-insensitive: macOS paths are).
 PROTECTED_TEXT = re.compile(
-    r"\.git\b.*\b(hooks|ravenwatch)\b|\.git/config\b|--git-path|--absolute-git-dir|--git-common-dir", re.S | re.I)
+    r"\.git/(?:[^\s;&|<>\"']*/)?(?:hooks|ravenwatch)\b|\.git/config\b|--git-path|--absolute-git-dir|--git-common-dir",
+    re.I)
 # Git config files outside a git directory (inside one, any write is refused).
 GITCONFIG_FILE = re.compile(r"(?:^|/)\.?gitconfig$|/git/config$", re.I)
 # A hooks path assignment inside a file (gitconfig style).
@@ -251,14 +253,17 @@ def resolve(base, target):
     return paths[0] if paths is not None and len(paths) == 1 else None
 
 
-def touches_git_dir(base, words):
-    """The first word (path or redirect target) that refers to something inside a git directory."""
+def touches_git_dir(base, words, protect_plugin=False):
+    """The first word (path or redirect target) that refers to something inside a git directory
+    (or, when protect_plugin is set, to ravenwatch's own installed code)."""
     for w in words:
         if "/" not in w and not any(ch in w for ch in "*?[") and w not in (".git", ".GIT"):
             continue
         for p in expand(base, w) or []:
             gdir = git_dir_of(p)
             if gdir and not REPORTS_PATH.search(p):
+                return w
+            if protect_plugin and under_plugin(p):
                 return w
     return None
 
@@ -270,16 +275,41 @@ def alias_of(repo, sub):
     return value if code == 0 and value else None
 
 
+def developing_plugin(cwd):
+    """True when this session works inside ravenwatch's own source tree (the plugin is loaded from it)."""
+    real = os.path.realpath(cwd)
+    return real == PLUGIN_ROOT or real.startswith(PLUGIN_ROOT + os.sep)
+
+
+def under_plugin(path):
+    real = os.path.realpath(path)
+    return real == PLUGIN_ROOT or real.startswith(PLUGIN_ROOT + os.sep)
+
+
+def plugin_modified():
+    """Uncommitted changes to the plugin's own code (only possible when it runs from a git checkout)."""
+    if not os.path.exists(os.path.join(PLUGIN_ROOT, ".git")):
+        return False
+    code, out = git(PLUGIN_ROOT, "status", "--porcelain", "--", "scripts", "hooks")
+    return code != 0 or bool(out)
+
+
 def check_bash(command, cwd):
-    if OWN_HELPER.match(command):
+    if OWN_HELPER.match(re.sub(r"/{2,}", "/", command)):
+        # The helper records verdicts and installs the hook, so it must be the code that was reviewed.
+        if plugin_modified():
+            return ("ravenwatch's own scripts or hooks have uncommitted changes, so the helper can't be trusted to "
+                    "record verdicts or install hooks. Commit them first (the review will see them).")
         return None
     stripped = re.sub(r"[\"'\\]", "", command)
     for rx, why in BYPASS:
         if rx.search(command) or rx.search(stripped):
             return f"{why}. Run the command without it."
     if PROTECTED_TEXT.search(command) or PROTECTED_TEXT.search(stripped):
-        return ("this command touches the git hooks, git config or ravenwatch state inside .git/. "
-                "Read files there with the Read tool; install or remove the hook with /ravenwatch:install-git-hook.")
+        return ("this command touches the git hooks, git config or ravenwatch state inside .git/. Read files there "
+                "with the Read tool; install or remove the hook with /ravenwatch:install-git-hook. If the path only "
+                "appears in text (for example a commit message), write the text to a file outside .git and use "
+                "`git commit -F <file>`.")
     if git_dir_of(cwd) and not PLAIN_CD.match(command):
         return ("the shell's working directory is inside a git directory, where commands can reach the hooks and "
                 "verdict state. `cd` back to the work tree first.")
@@ -294,7 +324,8 @@ def check_bash(command, cwd):
     if parsed_cmd is None:
         return "could not parse this command. Run `git push` as its own plain command." if pushing else None
     segs, redirects = parsed_cmd
-    if touches_git_dir(cwd, redirects):
+    protect_plugin = not developing_plugin(cwd)
+    if touches_git_dir(cwd, redirects, protect_plugin):
         return ("this command writes inside a git directory (hooks, config or ravenwatch state). "
                 "Install or remove the hook with /ravenwatch:install-git-hook.")
     if not (pushing or GIT_WORD.search(command) or any("/" in w or "*" in w or ".git" in w.lower()
@@ -318,9 +349,9 @@ def check_bash(command, cwd):
                         "state. Read files there with the Read tool.")
             continue
         # Paths given to other programs (cp, printf >, rm …); git's own arguments may name repositories.
-        word = None if os.path.basename(seg[0]) == "git" else touches_git_dir(here, seg[1:])
+        word = None if os.path.basename(seg[0]) == "git" else touches_git_dir(here, seg[1:], protect_plugin)
         if word:
-            return (f"`{word}` is inside a git directory (hooks, config or ravenwatch state). Read files there with "
+            return (f"`{word}` is inside a git directory or ravenwatch's own code (hooks, config, verdict state). Read files there with "
                     "the Read tool; install or remove the hook with /ravenwatch:install-git-hook.")
         parsed = parse_git(seg)
         seg_text = " ".join(seg)
@@ -370,7 +401,9 @@ def check_bash(command, cwd):
                     "/ravenwatch:install-git-hook there, then push in a separate command.")
         if not installed:
             return (f"the ravenwatch git pre-push hook is not installed (or is out of date) in {repo}, so this "
-                    "push could not be checked. Run /ravenwatch:install-git-hook in that repository first.")
+                    "push could not be checked. Run /ravenwatch:install-git-hook in that repository first. (If the "
+                    "repository uses Husky or lefthook, ravenwatch can't install there yet: the owner pushes from "
+                    "their own terminal.)")
         if recurses_into_submodules(repo):
             return ("this repository is configured to push submodules too (push.recurseSubmodules / "
                     "submodule.recurse), and their hooks cannot be checked. Push submodules yourself, or set "
@@ -384,6 +417,9 @@ def check_write(path, texts, cwd):
     if not path:
         return None
     full = os.path.realpath(os.path.join(cwd, os.path.expanduser(path)))
+    if under_plugin(full) and not developing_plugin(cwd):
+        return ("this file is part of the installed ravenwatch plugin; changing it would change the push gate "
+                "itself. Ask the owner.")
     if GITCONFIG_FILE.search(full):
         return "this is a git config file; changes there could skip or redirect the review hook. Ask the owner."
     gdir = git_dir_of(full)

@@ -38,7 +38,7 @@ Read the `## Project brief` section of the context:
 - `not approved` → the brief is ignored entirely (no checks, skips or accepted risks). Mention it in step 7.
 - `approved` or `changed since approval` → use the **approved brief** file it points to (never the working `.ravenwatch.md`): pass its path to every specialist and the verifier. If it changed since approval, tell the owner in step 7 so they can review and approve the change.
 
-If the approved brief lists checks and the review is not `--worktree`, tell the owner in one line which checks will run (they run the code at HEAD on this machine, with `git push` disabled), then run them one at a time (this is deliberately not pre-approved; the owner's confirmation lets them run):
+If the approved brief lists checks and the review is not `--worktree`, tell the owner in one line which checks will run (they run the code at HEAD on this machine with the owner's permissions; pushes to the repository's remotes are blocked while they run), then run them one at a time (this is deliberately not pre-approved; the owner's confirmation lets them run):
 
 ```bash
 python3 ${CLAUDE_PLUGIN_ROOT}/scripts/ravenwatch.py checks --run <run id> --only "<check name>"

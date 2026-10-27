@@ -87,7 +87,7 @@ Approval is two steps, so the owner approves exactly the content they saw. First
 python3 ${CLAUDE_PLUGIN_ROOT}/scripts/ravenwatch.py trust-brief
 ```
 
-Relay its output to the owner **in full** — every check command, the skip list, the audience, and the full text of every accepted risk — and point out anything that came from someone other than the owner (for example entries already in a pulled `.ravenwatch.md`). Then, if they approve, run the command it printed:
+Relay its output to the owner **in full** — the whole file it prints, then every check command, the skip list, the audience, and every accepted risk (it refuses briefs whose accepted risks aren't one-line `- ` bullets in a single section) — and point out anything that came from someone other than the owner (for example entries already in a pulled `.ravenwatch.md`). Then, if they approve, run the command it printed:
 
 ```bash
 python3 ${CLAUDE_PLUGIN_ROOT}/scripts/ravenwatch.py trust-brief --approve <sha256 it printed>

@@ -6,6 +6,11 @@ set -u
 RW=$(cd "$(dirname "$0")/.." && pwd)
 G="$RW/hooks/guard_push.py"
 T=$(mktemp -d "${TMPDIR:-/tmp}/rwtest6.XXXXXX")
+# Test a private copy of the plugin, so the results never depend on this checkout's state.
+mkdir -p "$T/plugin" && cp -R "$RW/scripts" "$RW/hooks" "$T/plugin/"
+RW="$T/plugin"
+G="$RW/hooks/guard_push.py"
+unset RAVENWATCH_DISABLE RAVENWATCH_CHECKS_RUNNING XDG_CONFIG_HOME GIT_DIR GIT_WORK_TREE
 trap 'rm -rf "$T"' EXIT
 export HOME="$T/home"; mkdir -p "$HOME"
 export GIT_CONFIG_NOSYSTEM=1
@@ -135,12 +140,20 @@ sys.exit(0 if "hunter2hunter2" not in out and "abcdef123456" not in out else 1)'
 # --- report drafts are private and removed after mark (SEC-4)
 ctx=$(python3 "$RW/scripts/ravenwatch.py" prepare)
 draft=$(echo "$ctx" | sed -n 's/^- report draft: \([^ ]*\).*/\1/p')
-[ "$(stat -f %Lp "$(dirname "$draft")" 2>/dev/null || stat -c %a "$(dirname "$draft")")" = 700 ] && ok || bad "draft dir not private"
+mode=$(python3 -c 'import os,sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777))' "$(dirname "$draft")")
+[ "$mode" = 0o700 ] && ok || bad "draft dir not private ($mode)"
 echo report > "$draft"
 rwq mark --verdict block --report "$draft" && ok || bad "mark with draft failed"
 [ ! -e "$draft" ] && ok || bad "draft not removed"
-ln -s /etc/hosts "$T/link.md"
-rwq mark --verdict block --report "$T/link.md" && bad "symlinked report accepted" || ok
+# A link to a file the user owns: only the symlink/hard-link defence can refuse it.
+echo owned-secret > "$T/own.txt"
+reports="$(git rev-parse --git-path ravenwatch/reports)"
+ln -s "$T/own.txt" "$T/link.md"
+python3 "$RW/scripts/ravenwatch.py" mark --verdict block --report "$T/link.md" >/dev/null 2>"$T/err" &&
+  bad "symlinked report accepted" || { grep -q "^error:" "$T/err" && ok || { bad "symlink refusal was not a clean error"; cat "$T/err"; }; }
+ln "$T/own.txt" "$T/hard.md"
+rwq mark --verdict block --report "$T/hard.md" && bad "hard-linked report accepted" || ok
+grep -rq owned-secret "$reports" && bad "linked file copied into reports" || ok
 
 echo "round6: passed=$pass failed=$failn"
 [ "$failn" -eq 0 ]
