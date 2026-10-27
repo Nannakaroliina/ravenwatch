@@ -36,6 +36,12 @@ HELPER = os.path.realpath(os.path.join(SCRIPTS, "ravenwatch.py"))
 READERS = {"cat", "head", "tail", "ls", "grep", "egrep", "fgrep", "wc", "file", "stat", "cmp", "md5", "md5sum",
            "shasum", "sha256sum"}
 PYTHONS = re.compile(r"^python3?(?:\.\d+)?$")
+# Options whose value is a pattern to match, not a file (`grep --exclude-dir=.git`, `tar --exclude=.git`).
+PATTERN_OPTION = re.compile(r"exclude|include|ignore|filter|pattern|regex|glob|match", re.I)
+# Words bash runs a following `cd` through (`builtin cd x`, `if cd x; then`, `time cd x`).
+CD_PREFIXES = {"builtin", "command", "exec", "time", "!", "if", "elif", "then", "else", "do", "while", "until"}
+# More matches than this and a glob is treated as unknowable (checking them all could take too long).
+GLOB_LIMIT = 2000
 # File names that matter when the directory a command runs in is unknown.
 SENSITIVE_NAMES = {"status", "latest", "prepared", "checks.kv", "brief-approved.md", "brief-trust", "config",
                    "pre-push", "pre-push.local", "head", "guard_push.py", "ravenwatch.py", "git-pre-push.sh",
@@ -273,10 +279,18 @@ def expand(base, target):
     return [os.path.normpath(full)]
 
 
+class TooManyMatches(Exception):
+    pass
+
+
 def glob_existing(pattern):
     """Matches of a pattern; if none, the pattern's leading directories that do match, with the rest
     appended literally (the path that would be created there)."""
-    found = glob.glob(pattern)
+    found = []
+    for path in glob.iglob(pattern):
+        found.append(path)
+        if len(found) > GLOB_LIMIT:
+            raise TooManyMatches(pattern)
     parent, name = os.path.split(pattern)
     if found or parent == pattern or not any(ch in parent for ch in "*?["):
         return found
@@ -303,13 +317,17 @@ def touches_git_dir(bases, words, protect_plugin=False):
         if w.startswith("-"):
             if "=" not in w:
                 continue
-            w = w.split("=", 1)[1]  # --output=FILE, --target-directory=DIR
-            if not w:
+            opt, w = w.split("=", 1)  # --output=FILE, --target-directory=DIR
+            if not w or PATTERN_OPTION.search(opt):
                 continue
         for base in bases:
             if base is None and not w.startswith(("/", "~", "$")) and risky_when_lost(w):
                 return w, "lost"
-            for p in expand(base, w) or []:
+            try:
+                paths = expand(base, w) or []
+            except TooManyMatches:
+                return w, "many"
+            for p in paths:
                 if git_dir_of(p) and not REPORTS_PATH.search(p):
                     return w, "git"
                 if protect_plugin and under_plugin(p):
@@ -318,6 +336,9 @@ def touches_git_dir(bases, words, protect_plugin=False):
 
 
 def path_refusal(word, kind):
+    if kind == "many":
+        return (f"`{word}` matches more than {GLOB_LIMIT} paths, too many for the guard to check. Use a narrower "
+                "pattern or name the files.")
     if kind == "lost":
         return (f"the guard can't tell which directory `{word}` is in, because an earlier `cd` uses a variable, an "
                 "option or `-`. Use absolute paths, or `cd` to a plain absolute path first.")
@@ -402,13 +423,16 @@ def check_bash(command, cwd):
         hit = touches_git_dir(heres, redirects, protect_plugin)
         if hit:
             return path_refusal(*hit)
-        while seg and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", seg[0]):
+        while seg and (re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", seg[0]) or seg[0] in CD_PREFIXES):
             if seg[0].startswith("CDPATH="):
                 cdpath = True
-            seg = seg[1:]
+            drop = 2 if seg[0] in ("command", "time") and seg[1:2] == ["-p"] else 1
+            seg = seg[drop:]
         if not seg:
             continue
         head = os.path.basename(seg[0])
+        if head == "eval" and any(t.split()[0] in ("cd", "pushd", "popd") for t in seg[1:] if t.split()):
+            heres = list(dict.fromkeys(heres + [None]))
         if head in ("cd", "pushd", "popd"):
             args = [a for a in seg[1:] if a not in ("--", "-P", "-L", "-e", "-@")]
             if head == "popd" or args == ["-"] or (head == "pushd" and not args):
@@ -527,8 +551,28 @@ def check_write(path, texts, cwd):
     return None
 
 
+_CURRENT = {}
+
+
 def _too_slow(signum, frame):
-    raise TimeoutError("the check took too long")
+    """Out of time. A TimeoutError raised here could be swallowed by glob/os.path (it is an OSError), and
+    Claude Code lets a call through when the hook itself times out, so decide here and exit at once:
+    refuse anything that pushes, writes somewhere, or names paths by pattern."""
+    command = _CURRENT.get("command")
+    if command is None:  # Write/Edit: deny only git-looking or plugin paths, like other internal errors
+        target = _CURRENT.get("target", "")
+        risky = bool(re.search(r"(?i)\.git\b|ravenwatch|hooks", target))
+    else:
+        risky = may_push(command) or bool(re.search(r"[*?\[>]|\.git|ravenwatch|hooks|\b(?:cp|mv|tee|dd|ln|install|"
+                                                    r"rsync|ditto|sed|perl|python3?|ruby|node|printf|echo)\b",
+                                                    command, re.I))
+    if risky:
+        sys.stdout.write(json.dumps({"hookSpecificOutput": {
+            "hookEventName": "PreToolUse", "permissionDecision": "deny",
+            "permissionDecisionReason": "ravenwatch push gate: checking this command took too long. Use narrower "
+                                        "paths or patterns, or split it into simpler commands."}}))
+        sys.stdout.flush()
+    os._exit(0)
 
 
 def main():
@@ -543,6 +587,8 @@ def main():
     tool = payload.get("tool_name")
     inp = payload.get("tool_input") or {}
     cwd = payload.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    _CURRENT.update(command=inp.get("command") if tool == "Bash" else None,
+                    target=str(inp.get("file_path") or inp.get("notebook_path") or ""))
     signal.signal(signal.SIGALRM, _too_slow)
     signal.alarm(10)  # hooks.json gives the guard 15 s
     try:
@@ -559,7 +605,7 @@ def main():
         reason = None
         target = str(inp.get("file_path") or inp.get("notebook_path") or "")
         command = inp.get("command") or ""
-        if (tool == "Bash" and (may_push(command) or isinstance(exc, TimeoutError)
+        if (tool == "Bash" and (may_push(command) or isinstance(exc, (TimeoutError, subprocess.TimeoutExpired))
                                 and re.search(r"(?i)\.git|ravenwatch|hooks|>", command))) or \
                 (tool != "Bash" and re.search(r"(?i)\.git\b|ravenwatch|hooks", target)):
             reason = (f"internal error while checking this ({type(exc).__name__}: {exc}). "

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.5 — 2026-10-27
+
+- Guard: `grep --exclude-dir=.git`, `tar --exclude=.git` and other pattern options are no longer refused; `cd` behind `builtin`, `command`, `if`, `time` or `!` is followed, and `eval cd` makes the directory unknown; globs matching more than 2000 paths are refused as uncheckable; when its 10 s budget runs out the guard decides at once (refusing pushes, writes and patterns) instead of raising an exception that file-system code could swallow; git timeouts inside the guard count as timeouts.
+- Secret scan: `$NAME` and `{name}` count as placeholders only when they look like a variable or template field, and `test…`/`…mock` only in values without digits, so `$uperSecret2024` or `Testarossa2024` are flagged; different keys with the same prefix in one file are listed separately.
+- Checks: untracked files count even when `status.showUntrackedFiles` hides them, and a failing `git status` stops the checks instead of passing as a clean tree.
+- Tests: new round-10 suite, including popd and subshell cases that only that tracking can catch.
+
 ## 0.3.4 — 2026-10-27
 
 - Guard: the helper is exempt only as the script of a `python3` call (round 8 let any command overwrite it), and that call refuses uncommitted plugin changes even with `2>&1` or a pipe; `>|` and `&>` count as redirects; `tree`, pagers and `rg` no longer count as read-only; `--opt=PATH` values are checked; every directory a command may be in is checked (`cd x;`, `popd`, subshells), absolute paths are checked after a `cd` it can't follow, and relative paths that could reach hooks or state are refused then; globs naming files that don't exist yet are checked against their directory; pushes are gated in every directory they may run in; the heredoc regex can no longer backtrack exponentially, and the guard decides within 10 s.

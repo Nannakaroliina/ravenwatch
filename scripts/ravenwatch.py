@@ -366,8 +366,18 @@ VALUE_GROUP = {"Generic secret assignment", "Credentials in URL"}
 TESTISH_NAME = re.compile(r"(?:^|[^a-z])(?:test|fake|mock|dummy|example|sample)", re.I)
 # Applied to the matched value only (never the whole line: `process.env.KEY ?? "sk_live_…"` is a real leak).
 PLACEHOLDER = re.compile(r"example|sample|dummy|placeholder|changeme|your[_\-]|x{4,}|<.+>|\$\{|\{\{|redacted|\*{3}"
-                         r"|^(?:test|fake|mock)|(?:test|fake|mock)$"
-                         r"|^\{[A-Za-z_][\w.\[\]'\"]*\}$|^\$[A-Za-z_]\w*$|^%(?:\(\w+\))?s$", re.I)
+                         r"|^%(?:\(\w+\))?s$", re.I)
+# An environment variable ($GITHUB_TOKEN) or a lower-case template field ({password}, {cfg.db_pass}).
+TEMPLATE_VALUE = re.compile(r"\$[A-Z_][A-Z0-9_]*|\{[a-z_][a-z0-9_.]*(?:\[[^\]]*\])?\}")
+TEST_AFFIX = re.compile(r"^(?:test|fake|mock)|(?:test|fake|mock)$", re.I)
+
+
+def is_placeholder(val):
+    """True for values that are clearly not a real secret. A value with digits in it is only a placeholder
+    when it says so outright (example, dummy …); `test…`/`…mock` alone is not enough there."""
+    if PLACEHOLDER.search(val) or TEMPLATE_VALUE.fullmatch(val):
+        return True
+    return not any(c.isdigit() for c in val) and bool(TEST_AFFIX.search(val))
 
 
 def looks_secret(val):
@@ -408,10 +418,11 @@ def scan_added_lines(lines, commit_label=None):
                     if name == "Generic secret assignment" and not looks_secret(val):
                         continue
                     # The value decides; for `name = value` pairs a test-ish name (test_api_key) also counts.
-                    placeholder = bool(PLACEHOLDER.search(val))
+                    placeholder = is_placeholder(val)
                     if name == "Generic secret assignment":
                         placeholder = placeholder or bool(TESTISH_NAME.search(line[m.start():m.start(1)]))
-                    hits.append((current_file, new_line, name, redact(val), placeholder, commit))
+                    digest = sha256_bytes(val.encode("utf-8", "surrogateescape"))[:16]
+                    hits.append((current_file, new_line, name, redact(val), placeholder, commit, digest))
         elif not raw.startswith("-"):
             new_line += 1
     return hits
@@ -491,12 +502,15 @@ def cmd_prepare(args):
     else:
         with open(diff_path, encoding="utf-8", errors="replace") as fh:
             hits = scan_added_lines(line.rstrip("\n") for line in fh)
-    seen, uniq = set(), []
+    # One entry per distinct value (by hash), so two different keys with the same prefix are both listed.
+    seen, uniq, repeats = {}, [], {}
     for h in hits:
-        key = (h[0], h[2], h[3], h[4])
+        key = (h[0], h[2], h[6], h[4])
         if key not in seen:
-            seen.add(key)
+            seen[key] = len(uniq)
             uniq.append(h)
+        else:
+            repeats[seen[key]] = repeats.get(seen[key], 0) + 1
 
     sensitive = [p for s, p in files if s != "D" and classify(p) == "secret-file"]
     large = []
@@ -605,10 +619,11 @@ def cmd_prepare(args):
     out.append("## Deterministic scan")
     if not (uniq or sensitive or large or gitignore_gaps):
         out.append("- clean: no secret patterns, sensitive files, large files or .gitignore gaps detected")
-    for f, ln, name, red, ph, cm in uniq:
+    for i, (f, ln, name, red, ph, cm, _) in enumerate(uniq):
         tag = "possible placeholder" if ph else "LIKELY REAL"
         where = f"{f}:{ln}" if f else "?"
-        out.append(f"- SECRET? [{tag}] {name} at {where}{f' (commit {cm})' if cm else ''}: {red}")
+        more = f" (same value {repeats[i]} more time(s) in this file)" if repeats.get(i) else ""
+        out.append(f"- SECRET? [{tag}] {name} at {where}{f' (commit {cm})' if cm else ''}: {red}{more}")
     for p in sensitive:
         out.append(f"- SENSITIVE FILE in push: {p}")
     for p, sz in large:
@@ -1386,8 +1401,13 @@ def cmd_checks(args):
 
 
 def changed_paths():
-    """Uncommitted or untracked paths, exactly as git reports them."""
-    res = subprocess.run(["git", "status", "--porcelain", "-z"], capture_output=True, text=True)
+    """Uncommitted or untracked paths, exactly as git reports them — whatever status.showUntrackedFiles or
+    diff.ignoreSubmodules say. Refuses rather than calling a tree clean when git can't tell."""
+    res = subprocess.run(["git", "status", "--porcelain=v1", "-z", "--untracked-files=all",
+                          "--ignore-submodules=none"], capture_output=True, text=True, errors="surrogateescape")
+    if res.returncode != 0:
+        raise RuntimeError("could not tell whether the working tree is clean (`git status` failed: "
+                           f"{res.stderr.strip()[:200]}); fix that first")
     return [e[3:] for e in res.stdout.split("\0") if len(e) > 3 and e[2] == " "]
 
 
