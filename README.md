@@ -61,7 +61,7 @@ A code reviewer for people who work alone. Before anything reaches GitHub, a tea
 | bug, security, loophole, resilience, deps, config, impact | CRITICAL | can BLOCK |
 | ux-reviewer | HIGH, only when a user can't complete a core task (including accessibility blockers) | can BLOCK |
 | privacy-reviewer | HIGH (personal data leaking by design, special categories, real personal data committed) | can BLOCK |
-| your checks (from the brief) | a failing `blocking: true` check is HIGH; a failing non-blocking check is MEDIUM | can BLOCK |
+| your checks (from the brief) | a `blocking: true` check that fails, times out or doesn't finish is HIGH; the same for a non-blocking check is MEDIUM | can BLOCK |
 | licence findings | MEDIUM | can WARN, never BLOCK |
 | test-reviewer, design-reviewer | MEDIUM | can WARN, never BLOCK |
 
@@ -135,7 +135,7 @@ Each reviewed commit keeps its own verdict, so you can review two branches and p
 
 ## Where things are stored
 
-Everything lives inside the repository's `.git/ravenwatch/` folder, so nothing is ever committed: `status` (latest verdict and the commit range it covers), `history.log`, `reports/`, and `runs/` (diff and context of the last 20 runs).
+Everything lives inside the repository's `.git/ravenwatch/` folder, so nothing is ever committed: `verdicts/` (one per reviewed commit — what the git hook reads), `status` (the latest verdict, for `--since-last` and display), `checks/` (check results per commit and approved brief), `brief-approved.md` and `brief-trust` (the approved brief snapshot and its hash), `history.log`, `reports/`, and `runs/` (diff and context of the last 20 runs). Report drafts are written to a private temporary folder first, and `--private` adds `/.ravenwatch.md` to `.git/info/exclude`.
 
 ## Limits
 

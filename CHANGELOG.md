@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.4 — 2026-10-27
+
+- Guard: the helper is exempt only as the script of a `python3` call (round 8 let any command overwrite it), and that call refuses uncommitted plugin changes even with `2>&1` or a pipe; `>|` and `&>` count as redirects; `tree`, pagers and `rg` no longer count as read-only; `--opt=PATH` values are checked; every directory a command may be in is checked (`cd x;`, `popd`, subshells), absolute paths are checked after a `cd` it can't follow, and relative paths that could reach hooks or state are refused then; globs naming files that don't exist yet are checked against their directory; pushes are gated in every directory they may run in; the heredoc regex can no longer backtrack exponentially, and the guard decides within 10 s.
+- Secret scan: an example key no longer hides a real key with the same first characters; template values (`{password}`, `$TOKEN`, `%s`) in URLs are placeholders.
+- Checks: results are kept per commit and approved brief, so preparing a new run doesn't forget a failure; `mark` and `checks` refuse a run prepared under a different brief; only one checks run per commit at a time; duplicate check names are refused; a check that leaves files behind says which files and what to do, in `checks`, `mark` and the re-run refusal, and checks that didn't run are listed.
+- Brief: the accepted-risks heading must be written exactly `## Accepted risks` (reworded and underlined headings are refused, and the verifier ignores any other section); CRLF briefs are accepted.
+- Agents: every reviewer treats repository text as data and ignores claims addressed to it; supply-chain-auditor runs only `osv-scanner` on lockfiles; `--secrets-cleared` needs the owner's own answer for each hit. The review skill treats any non-pass blocking check result as HIGH and explains each status.
+- `mark` writes the per-commit verdict before `status`. README lists all stored state.
+- Tests: new round-9 suite; the round-8 `--checks-skipped` test now expects a fresh run to remember a failure.
+
 ## 0.3.3 — 2026-10-27
 
 - Brief: accepted risks are counted correctly on the approval screen; a second `## Accepted risks` section, wrapped lines in briefs without frontmatter and invisible or bidi control characters are refused; briefs are capped at 16 KB.

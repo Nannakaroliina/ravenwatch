@@ -38,6 +38,8 @@ bash_gate() { # expect cwd command
 rwq() { python3 "$RV" "$@" >/dev/null 2>&1; }
 runs_dir() { echo "$(git rev-parse --git-path ravenwatch/runs)"; }
 latest_run() { cat "$(runs_dir)/latest"; }
+# Check results for the current commit (one file per commit and approved brief).
+checks_kv() { ls "$(git rev-parse --git-path ravenwatch/checks)/$(git rev-parse HEAD)"-*.kv; }
 approve() { # approve the current .ravenwatch.md
   sha=$(python3 "$RV" trust-brief --private 2>&1 | sed -n 's/^sha256: //p')
   rwq trust-brief --private --approve "$sha" || bad "approve failed"
@@ -95,11 +97,14 @@ commit b; rwq prepare; run=$(latest_run)
 rwq mark --run "$run" --verdict pass && bad "pass recorded although the blocking check never ran" || ok
 python3 "$RV" mark --run "$run" --verdict pass 2>&1 | grep -q "checks-skipped" && ok || bad "no hint about --checks-skipped"
 rwq checks --run "$run"
-grep -q "^status:unit=fail" "$(runs_dir)/$run/checks.kv" && grep -q "^blocking:unit=1" "$(runs_dir)/$run/checks.kv" \
+grep -q "^status:unit=fail" "$(checks_kv)" && grep -q "^blocking:unit=1" "$(checks_kv)" \
   && ok || bad "checks.kv keys"
 rwq mark --run "$run" --verdict warn && bad "warn recorded over a failed blocking check" || ok
 rwq mark --run "$run" --verdict pass --checks-skipped && bad "--checks-skipped outvoted a failed check" || ok
+# A fresh run of the same commit still remembers the failure (round 9, LOOP-1).
 rwq prepare; run=$(latest_run)
+rwq mark --run "$run" --verdict warn --checks-skipped && bad "a fresh run forgot the failed check" || ok
+commit b2; rwq prepare; run=$(latest_run)
 rwq mark --run "$run" --verdict warn --checks-skipped && ok || bad "--checks-skipped refused"
 grep -q "checks_skipped=1" "$(git rev-parse --git-path ravenwatch/status)" && ok || bad "skipped checks not recorded"
 
@@ -128,7 +133,7 @@ approve
 commit c; rwq prepare; run=$(latest_run)
 rwq checks --run "$run"
 [ -z "$(git ls-remote "$T/remote.git" 'refs/heads/leak*')" ] && ok || bad "a check pushed through pushurl"
-kv="$(runs_dir)/$run/checks.kv"
+kv="$(checks_kv)"
 grep -q "^status:dirty=dirtied-tree" "$kv" && grep -q "^status:after=not-run" "$kv" && ok || bad "dirty tree not caught"
 rm -f made.txt
 git config --unset remote.origin.pushurl

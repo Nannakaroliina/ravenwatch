@@ -366,7 +366,8 @@ VALUE_GROUP = {"Generic secret assignment", "Credentials in URL"}
 TESTISH_NAME = re.compile(r"(?:^|[^a-z])(?:test|fake|mock|dummy|example|sample)", re.I)
 # Applied to the matched value only (never the whole line: `process.env.KEY ?? "sk_live_…"` is a real leak).
 PLACEHOLDER = re.compile(r"example|sample|dummy|placeholder|changeme|your[_\-]|x{4,}|<.+>|\$\{|\{\{|redacted|\*{3}"
-                         r"|^(?:test|fake|mock)|(?:test|fake|mock)$", re.I)
+                         r"|^(?:test|fake|mock)|(?:test|fake|mock)$"
+                         r"|^\{[A-Za-z_][\w.\[\]'\"]*\}$|^\$[A-Za-z_]\w*$|^%(?:\(\w+\))?s$", re.I)
 
 
 def looks_secret(val):
@@ -492,7 +493,7 @@ def cmd_prepare(args):
             hits = scan_added_lines(line.rstrip("\n") for line in fh)
     seen, uniq = set(), []
     for h in hits:
-        key = (h[0], h[2], h[3])
+        key = (h[0], h[2], h[3], h[4])
         if key not in seen:
             seen.add(key)
             uniq.append(h)
@@ -689,6 +690,17 @@ def _mtime(d, f):
         return 0
 
 
+def current_brief_sha(sdir):
+    data, _ = approved_brief(sdir)
+    return sha256_bytes(data) if data is not None else ""
+
+
+def checks_kv_path(sdir, head, brief_sha):
+    """Results of the approved brief's checks for one commit. They outlive runs, so preparing a fresh run
+    never forgets a failure; only a later passing run of that check replaces it."""
+    return os.path.join(sdir, "checks", f"{head}-{brief_sha[:16]}.kv")
+
+
 def cmd_mark(args):
     os.chdir(git("rev-parse", "--show-toplevel"))
     sdir = state_dir()
@@ -703,20 +715,29 @@ def cmd_mark(args):
     if prepared["head"] != head:
         raise RuntimeError(f"HEAD moved since this review was prepared (reviewed {prepared['head'][:8]}, "
                            f"now {head[:8]}); the verdict would cover commits nobody reviewed. Review again.")
-    # Every blocking check of the approved brief must have passed in this run before pass/warn; a check
-    # that failed, timed out, never finished or never ran can't be outvoted.
+    brief_sha = current_brief_sha(sdir)
+    if args.verdict in ALLOWED and prepared.get("brief_sha", "") != brief_sha:
+        raise RuntimeError("the approved project brief changed since this review was prepared, so its checks, "
+                           "skipped reviewers and accepted risks may differ from what the review used. Review again.")
+    # Every blocking check of the approved brief must have passed on this commit before pass/warn; a check
+    # that failed, timed out, never finished or never ran can't be outvoted, and `--checks-skipped` only
+    # covers checks that never ran on this commit at all.
     if args.verdict in ("pass", "warn"):
-        results = read_kv(os.path.join(runs, run_id, "checks.kv"))
+        results = read_kv(checks_kv_path(sdir, head, brief_sha))
         required = [n for n in prepared.get("blocking_checks", "").split(",") if n]
-        failed = [f"{n} ({results['status:' + n]})" for n in required
-                  if results.get("status:" + n) not in (None, "pass")]
+        failed = [n for n in required if results.get("status:" + n) not in (None, "pass")]
         missing = [n for n in required if "status:" + n not in results]
         if failed:
-            raise RuntimeError(f"blocking check(s) did not pass in this run: {', '.join(failed)}. Re-run one with "
-                               f"`checks --run {run_id} --only \"<name>\"`, record `block`, or `accepted` if the owner "
-                               "accepts the risk.")
+            listed = ", ".join(f"{n} ({results['status:' + n]})" for n in failed)
+            hint = (f"Re-run one with `checks --run {run_id} --only \"<name>\"`, record `block`, or `accepted` if the "
+                    "owner accepts the risk.")
+            if any(results["status:" + n] == "dirtied-tree" for n in failed):
+                hint = ("A check passed but left files behind: git-ignore them (commit the .gitignore change) or make "
+                        "the check clean up after itself, delete the files, then review again. Or record `block`, "
+                        "or `accepted` if the owner accepts the risk.")
+            raise RuntimeError(f"blocking check(s) did not pass on this commit: {listed}. {hint}")
         if missing and not args.checks_skipped:
-            raise RuntimeError(f"blocking check(s) never ran in this run: {', '.join(missing)}. Run them with "
+            raise RuntimeError(f"blocking check(s) never ran on this commit: {', '.join(missing)}. Run them with "
                                f"`checks --run {run_id}`, or pass --checks-skipped if the owner chose not to run them.")
     likely = int(prepared.get("likely_secrets", "0") or 0)
     if args.verdict in ALLOWED and likely and not args.secrets_cleared:
@@ -747,11 +768,12 @@ def cmd_mark(args):
         lines.append(f"secrets_cleared={likely}")
     if args.checks_skipped:
         lines.append("checks_skipped=1")
-    write_kv_atomic(os.path.join(sdir, "status"), lines)
-    # One verdict per reviewed commit, so reviewing another branch doesn't cancel this one.
+    # One verdict per reviewed commit, so reviewing another branch doesn't cancel this one. It is what the
+    # hook reads, so it is written before the `status` summary.
     verdicts = os.path.join(sdir, "verdicts")
     os.makedirs(verdicts, exist_ok=True)
     write_kv_atomic(os.path.join(verdicts, head), lines)
+    write_kv_atomic(os.path.join(sdir, "status"), lines)
     old = sorted((f for f in os.listdir(verdicts) if not f.endswith(".tmp")), key=lambda f: _mtime(verdicts, f))
     for f in old[:-KEEP_VERDICTS]:
         try:
@@ -826,6 +848,15 @@ def validate_accepted_risks(body):
     """Accepted risks must be plain one-line bullets in a single section, so the approval screen can show
     every word of them and reviewers act on nothing the owner didn't see."""
     errors = []
+    all_lines = body.split("\n")
+    for n, line in enumerate(all_lines, start=1):
+        m = re.match(r"^ {0,3}#{1,6}\s*(.*)$", line)
+        if m and re.search(r"accept|risk", m.group(1), re.I) and not ACCEPTED_HEADING.match(line):
+            errors.append(f"line {n}: write the accepted-risks heading exactly as `## Accepted risks` "
+                          f"(got `{line.strip()[:40]}`), and use other words for other headings")
+        prev = all_lines[n - 2].strip() if n > 1 else ""
+        if re.fullmatch(r" {0,3}(?:=+|-+)\s*", line) and prev and not prev.startswith(("-", "*", "#", ">")):
+            errors.append(f"line {n}: underlined headings aren't supported; write `## {prev[:30]}` instead")
     count, lines = accepted_risk_section(body)
     if count > 1:
         errors.append("only one `## Accepted risks` section is allowed")
@@ -858,6 +889,7 @@ def invisible_characters(text):
 def parse_brief(text):
     """Return (meta, body, errors). Supports the small YAML subset the brief template uses:
     `key: value`, `key: [a, b]`, lists of scalars, and lists of flat maps (checks)."""
+    text = text.replace("\r\n", "\n")
     errors, meta = invisible_characters(text), {}
     lines = text.replace("\r\n", "\n").split("\n")
     if not lines or lines[0].strip() != "---":
@@ -909,7 +941,7 @@ def parse_brief(text):
                 errors.append(f"line {n}: could not read `{line[:40]}`")
     errors += validate_accepted_risks(body)
     # Validate the parts that have effects.
-    checks = []
+    checks, names = [], set()
     for i, c in enumerate(meta.get("checks") or [], start=1):
         if not isinstance(c, dict):
             errors.append(f"checks #{i}: needs `name:` and `run:`")
@@ -929,6 +961,10 @@ def parse_brief(text):
         if not isinstance(blocking, bool):
             errors.append(f"checks `{name}`: blocking must be true or false")
             continue
+        if name.lower() in names:
+            errors.append(f"checks `{name}`: each check needs its own name")
+            continue
+        names.add(name.lower())
         checks.append({"name": name, "run": run.strip(), "timeout": timeout, "blocking": blocking})
     meta["checks"] = checks
     skip = meta.get("skip") or []
@@ -1237,8 +1273,10 @@ def cmd_checks(args):
     data, _ = approved_brief(sdir)
     if data is None:
         raise RuntimeError("no approved project brief; checks only run from a brief the owner approved")
-    if prepared.get("brief_sha") and prepared["brief_sha"] != sha256_bytes(data):
-        raise RuntimeError("the approved brief changed since this review was prepared; prepare again")
+    brief_sha = sha256_bytes(data)
+    if prepared.get("brief_sha", "") != brief_sha:
+        raise RuntimeError("the approved brief changed since this review was prepared (or was approved after it); "
+                           "prepare again")
     meta, _, _ = parse_brief(data.decode("utf-8", errors="replace"))
     if not meta["checks"]:
         print("the approved brief lists no checks")
@@ -1247,14 +1285,20 @@ def cmd_checks(args):
     unknown = [n for n in (args.only or []) if n not in names]
     if unknown:
         raise RuntimeError(f"no approved check named {', '.join(unknown)} (approved: {', '.join(names)})")
+    kv_path = checks_kv_path(sdir, head, brief_sha)
+    earlier = read_kv(kv_path)
     # Checks run the code in the working tree; only run them on exactly the reviewed commits.
-    _, wt = git("status", "--porcelain", check=False)
-    if wt.strip():
-        paths = [l[3:] for l in wt.splitlines() if l.strip()]
+    paths = changed_paths()
+    if paths:
+        listed = ", ".join(paths[:5]) + (" …" if len(paths) > 5 else "")
+        left = [k[7:] for k, v in earlier.items() if k.startswith("status:") and v == "dirtied-tree"]
+        if left:
+            raise RuntimeError(f"the check(s) {', '.join(left)} left files behind: {listed}. Git-ignore them (commit "
+                               "the .gitignore change and review again) or make the check clean up after itself, "
+                               "and delete the files before running checks again.")
         raise RuntimeError("checks run the files on disk, so they need exactly the reviewed commits, but there are "
-                           f"uncommitted or untracked files: {', '.join(paths[:5])}" + (" …" if len(paths) > 5 else "")
-                           + ". Commit them, `git stash -u`, or add them to .gitignore — then prepare the review "
-                           "again if you committed.")
+                           f"uncommitted or untracked files: {listed}. Commit them, `git stash -u`, or add them to "
+                           ".gitignore — then prepare the review again if you committed.")
     shim_dir = tempfile.mkdtemp(prefix="ravenwatch-git-")
     real_git = shutil.which("git") or "/usr/bin/git"
     with open(os.path.join(shim_dir, "git"), "w", encoding="utf-8") as fh:
@@ -1268,9 +1312,17 @@ def cmd_checks(args):
         signal.signal(sig, _on_signal)
 
     out_path = os.path.join(runs, run_id, "checks.md")
-    # Machine-readable results (last result wins); `mark` refuses pass/warn while a blocking check isn't pass.
-    kv_path = os.path.join(runs, run_id, "checks.kv")
-    results = read_kv(kv_path) if args.only else {}
+    # Machine-readable results for this commit and brief (last result per check wins); `mark` refuses
+    # pass/warn while a blocking check isn't pass. One checks run at a time, so results can't be lost.
+    os.makedirs(os.path.dirname(kv_path), exist_ok=True)
+    import fcntl
+    lock = open(kv_path + ".lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        raise RuntimeError("checks are already running for this commit; wait for them to finish, then run the "
+                           "next one")
+    results = read_kv(kv_path)
 
     def record(name, status, blocking):
         # `:` can't appear in a check name, so these keys never collide with each other.
@@ -1298,13 +1350,14 @@ def cmd_checks(args):
                 fh.write(f"## {c['name']} — STARTED ({kind}, timeout {c['timeout']}s)\n")
             if dirtied:
                 record(c["name"], "not-run", c["blocking"])
+                summary.append(f"{c['name']}: NOT RUN (an earlier check changed the working tree)")
                 continue
             record(c["name"], "started", c["blocking"])
             status, code, secs, tail = run_check(c["run"], top, c["timeout"], env)
             # A check that changed the working tree leaves the next ones testing something nobody reviewed.
-            _, after = git("status", "--porcelain", check=False)
-            if after.strip():
-                dirtied = [l[3:] for l in after.splitlines() if l.strip()]
+            after = changed_paths()
+            if after:
+                dirtied = after
                 status = "dirtied-tree" if status == "pass" else status
                 tail = (f"[this check changed files: {', '.join(dirtied[:5])} — git-ignore them or make the check "
                         "leave the tree clean; later checks were not run]\n") + tail
@@ -1319,6 +1372,10 @@ def cmd_checks(args):
     print("checks:")
     for line in summary:
         print(f"- {line}")
+    if dirtied:
+        print(f"a check left files behind: {', '.join(dirtied[:5])}" + (" …" if len(dirtied) > 5 else "")
+              + ". Git-ignore them (commit the .gitignore change, then review again) or make the check clean up "
+              "after itself, and delete the files.")
     print(f"output: {out_path}")
     failed_blocking = [c["name"] for c in meta["checks"] if c["blocking"]
                        and results.get("status:" + c["name"], "pass") != "pass"]
@@ -1326,6 +1383,12 @@ def cmd_checks(args):
         print(f"BLOCKING CHECKS FAILED: {', '.join(failed_blocking)}")
         return 1
     return 0
+
+
+def changed_paths():
+    """Uncommitted or untracked paths, exactly as git reports them."""
+    res = subprocess.run(["git", "status", "--porcelain", "-z"], capture_output=True, text=True)
+    return [e[3:] for e in res.stdout.split("\0") if len(e) > 3 and e[2] == " "]
 
 
 def read_kv_first_line(p):
