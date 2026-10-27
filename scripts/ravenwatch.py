@@ -34,6 +34,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 
 LARGE_FILE_BYTES = 5 * 1024 * 1024  # 5 MB
 ALLOWED = ("pass", "warn", "accepted")
@@ -353,13 +354,16 @@ SECRET_PATTERNS = [
     ("Anthropic API key", re.compile(r"\bsk-ant-[A-Za-z0-9_\-]{20,}")),
     ("OpenAI-style API key", re.compile(r"\bsk-(?:proj-)?[A-Za-z0-9_\-]{32,}")),
     ("JSON Web Token", re.compile(r"\beyJ[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}")),
-    ("Credentials in URL", re.compile(r"\b[a-z][a-z0-9+.\-]{0,30}://[^/\s:@'\"]+:[^/\s@'\"]{3,}@[^\s'\"]+", re.I)),
+    ("Credentials in URL", re.compile(r"\b[a-z][a-z0-9+.\-]{0,30}://[^/\s:@'\"]+:([^/\s@'\"]{3,})@[^\s'\"]+", re.I)),
     ("Live-mode API key", re.compile(r"\b[a-z]{2,6}_live_[A-Za-z0-9]{16,}")),
     ("Generic secret assignment", re.compile(
         r"(?<![A-Za-z0-9_\-])[A-Za-z0-9_\-]{0,40}(?:key|secret|token|passw(?:or)?d|pwd|credential)s?[\"']?\s*[:=]\s*[\"']([^\"'\s]{12,})[\"']",
         re.I)),
 ]
 
+# Patterns whose group 1 is the secret itself (the rest is context such as a host or a variable name).
+VALUE_GROUP = {"Generic secret assignment", "Credentials in URL"}
+TESTISH_NAME = re.compile(r"(?:^|[^a-z])(?:test|fake|mock|dummy|example|sample)", re.I)
 # Applied to the matched value only (never the whole line: `process.env.KEY ?? "sk_live_…"` is a real leak).
 PLACEHOLDER = re.compile(r"example|sample|dummy|placeholder|changeme|your[_\-]|x{4,}|<.+>|\$\{|\{\{|redacted|\*{3}"
                          r"|^(?:test|fake|mock)|(?:test|fake|mock)$", re.I)
@@ -396,15 +400,17 @@ def scan_added_lines(lines, commit_label=None):
         if raw.startswith("+") and not raw.startswith("+++"):
             new_line += 1
             line = raw[1:]
+            # Every pattern and every match: an example key earlier on a line must not hide a real one.
             for name, rx in SECRET_PATTERNS:
-                m = rx.search(line)
-                if m:
-                    val = m.group(1) if name == "Generic secret assignment" else m.group(0)
+                for m in rx.finditer(line):
+                    val = m.group(1) if name in VALUE_GROUP else m.group(0)
                     if name == "Generic secret assignment" and not looks_secret(val):
                         continue
-                    hits.append((current_file, new_line, name, redact(val),
-                                 bool(PLACEHOLDER.search(val)), commit))
-                    break
+                    # The value decides; for `name = value` pairs a test-ish name (test_api_key) also counts.
+                    placeholder = bool(PLACEHOLDER.search(val))
+                    if name == "Generic secret assignment":
+                        placeholder = placeholder or bool(TESTISH_NAME.search(line[m.start():m.start(1)]))
+                    hits.append((current_file, new_line, name, redact(val), placeholder, commit))
         elif not raw.startswith("-"):
             new_line += 1
     return hits
@@ -619,7 +625,14 @@ def cmd_prepare(args):
         fh.write(text)
     # Only a run whose scan and context completed can be marked.
     likely = sum(1 for h in uniq if not h[4])
+    approved_data, _ = approved_brief(sdir)
+    blocking = []
+    if approved_data is not None and mode != "worktree":
+        bmeta, _, _ = parse_brief(approved_data.decode("utf-8", errors="replace"))
+        blocking = [c["name"] for c in bmeta["checks"] if c["blocking"]]
     write_kv_atomic(os.path.join(cur, "prepared"), [
+        f"brief_sha={sha256_bytes(approved_data) if approved_data is not None else ''}",
+        f"blocking_checks={','.join(blocking)}",
         f"head={head}", f"diff_base={base}", f"base={covered_base}", f"mode={mode}", f"range={label}",
         f"likely_secrets={likely}", f"profile={'quick' if args.quick else 'standard'}", f"draft_dir={draft_dir}",
     ])
@@ -690,14 +703,21 @@ def cmd_mark(args):
     if prepared["head"] != head:
         raise RuntimeError(f"HEAD moved since this review was prepared (reviewed {prepared['head'][:8]}, "
                            f"now {head[:8]}); the verdict would cover commits nobody reviewed. Review again.")
-    # A blocking check that failed, timed out or never finished can't be outvoted by pass/warn.
+    # Every blocking check of the approved brief must have passed in this run before pass/warn; a check
+    # that failed, timed out, never finished or never ran can't be outvoted.
     if args.verdict in ("pass", "warn"):
         results = read_kv(os.path.join(runs, run_id, "checks.kv"))
-        bad = [k for k, v in results.items() if not k.endswith(".blocking") and v != "pass"
-               and results.get(k + ".blocking") == "1"]
-        if bad:
-            raise RuntimeError(f"blocking check(s) did not pass in this run: {', '.join(bad)}. Record `block`, or "
-                               "`accepted` if the owner accepts the risk.")
+        required = [n for n in prepared.get("blocking_checks", "").split(",") if n]
+        failed = [f"{n} ({results['status:' + n]})" for n in required
+                  if results.get("status:" + n) not in (None, "pass")]
+        missing = [n for n in required if "status:" + n not in results]
+        if failed:
+            raise RuntimeError(f"blocking check(s) did not pass in this run: {', '.join(failed)}. Re-run one with "
+                               f"`checks --run {run_id} --only \"<name>\"`, record `block`, or `accepted` if the owner "
+                               "accepts the risk.")
+        if missing and not args.checks_skipped:
+            raise RuntimeError(f"blocking check(s) never ran in this run: {', '.join(missing)}. Run them with "
+                               f"`checks --run {run_id}`, or pass --checks-skipped if the owner chose not to run them.")
     likely = int(prepared.get("likely_secrets", "0") or 0)
     if args.verdict in ALLOWED and likely and not args.secrets_cleared:
         raise RuntimeError(f"the deterministic scan found {likely} likely real secret(s) in this range. A push can't "
@@ -725,6 +745,8 @@ def cmd_mark(args):
         return 0
     if likely and args.secrets_cleared:
         lines.append(f"secrets_cleared={likely}")
+    if args.checks_skipped:
+        lines.append("checks_skipped=1")
     write_kv_atomic(os.path.join(sdir, "status"), lines)
     # One verdict per reviewed commit, so reviewing another branch doesn't cancel this one.
     verdicts = os.path.join(sdir, "verdicts")
@@ -753,6 +775,7 @@ def cmd_mark(args):
 # commands, skip reviewers or accept risks without the owner approving it again.
 
 BRIEF_NAME = ".ravenwatch.md"
+BRIEF_MAX_BYTES = 16 * 1024
 SKIPPABLE = ("impact-analyzer", "ux-reviewer", "test-reviewer", "design-reviewer", "privacy-reviewer")
 CHECK_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.\-]{0,39}$")
 CHECK_TIMEOUT_DEFAULT = 600
@@ -786,17 +809,65 @@ def _scalar(v):
     return v
 
 
+ACCEPTED_HEADING = re.compile(r"^#{1,6}[ \t]*accepted\s+risks?\b[^\n]*$", re.M | re.I)
+
+
+def accepted_risk_section(body):
+    """(number of `Accepted risks` headings, the lines of the first such section)."""
+    heads = list(ACCEPTED_HEADING.finditer(body))
+    if not heads:
+        return 0, []
+    rest = body[heads[0].end():]
+    nxt = re.search(r"^#{1,6}\s", rest, re.M)
+    return len(heads), (rest[:nxt.start()] if nxt else rest).splitlines()
+
+
+def validate_accepted_risks(body):
+    """Accepted risks must be plain one-line bullets in a single section, so the approval screen can show
+    every word of them and reviewers act on nothing the owner didn't see."""
+    errors = []
+    count, lines = accepted_risk_section(body)
+    if count > 1:
+        errors.append("only one `## Accepted risks` section is allowed")
+    for line in lines:
+        if not line.strip():
+            continue
+        if not re.match(r"^- \S", line):
+            errors.append(f"accepted risks: every line must be a `- ` bullet on one line (got `{line.strip()[:40]}`)"
+                          " — join wrapped lines into one")
+        elif len(line) > 300:
+            errors.append(f"accepted risks: keep each entry under 300 characters (`{line[2:42]}…`)")
+    return errors
+
+
+def invisible_characters(text):
+    """Characters that don't show on screen (control, format, private-use, bidi, tag characters) could hide
+    text the owner approves without seeing it."""
+    import unicodedata
+    errors = []
+    for n, line in enumerate(text.split("\n"), start=1):
+        bad = sorted({f"U+{ord(ch):04X}" for ch in line
+                      if ch != "\t" and unicodedata.category(ch) in ("Cc", "Cf", "Co", "Cs")})
+        if bad:
+            errors.append(f"line {n}: invisible or control characters ({', '.join(bad[:5])}) — remove them")
+        if len(errors) >= 10:
+            break
+    return errors
+
+
 def parse_brief(text):
     """Return (meta, body, errors). Supports the small YAML subset the brief template uses:
     `key: value`, `key: [a, b]`, lists of scalars, and lists of flat maps (checks)."""
-    errors, meta = [], {}
+    errors, meta = invisible_characters(text), {}
     lines = text.replace("\r\n", "\n").split("\n")
     if not lines or lines[0].strip() != "---":
+        errors += validate_accepted_risks(text)
+        meta["checks"], meta["skip"] = [], []
         return meta, text, errors
     try:
         end = next(i for i in range(1, len(lines)) if lines[i].strip() == "---")
     except StopIteration:
-        return meta, text, ["frontmatter starts with --- but never ends with ---"]
+        return meta, text, errors + ["frontmatter starts with --- but never ends with ---"]
     body = "\n".join(lines[end + 1:])
     key, item = None, None
     for n, raw in enumerate(lines[1:end], start=2):
@@ -836,21 +907,7 @@ def parse_brief(text):
                 item[m.group(1)] = _scalar(m.group(2))
             else:
                 errors.append(f"line {n}: could not read `{line[:40]}`")
-    # Accepted risks must be plain one-line bullets in a single section, so the approval screen can show
-    # every word of them and reviewers act on nothing the owner didn't see.
-    sections = list(re.finditer(r"^#{1,6}\s*accepted\s+risks?\b.*$", body, re.M | re.I))
-    if len(sections) > 1:
-        errors.append("only one `## Accepted risks` section is allowed")
-    elif sections:
-        rest = body[sections[0].end():]
-        nxt = re.search(r"^#{1,6}\s", rest, re.M)
-        for line in (rest[:nxt.start()] if nxt else rest).splitlines():
-            if not line.strip():
-                continue
-            if not re.match(r"^- \S", line):
-                errors.append(f"accepted risks: every line must be a `- ` bullet on one line (got `{line.strip()[:40]}`)")
-            elif len(line) > 300:
-                errors.append("accepted risks: keep each entry under 300 characters")
+    errors += validate_accepted_risks(body)
     # Validate the parts that have effects.
     checks = []
     for i, c in enumerate(meta.get("checks") or [], start=1):
@@ -936,9 +993,10 @@ def cmd_trust_brief(args):
     if not os.path.isfile(path) or os.path.islink(path):
         raise RuntimeError(f"no {BRIEF_NAME} in {top}; create one with /ravenwatch:init-brief")
     with open(path, "rb") as fh:
-        data = fh.read(256 * 1024 + 1)
-    if len(data) > 256 * 1024:
-        raise RuntimeError(f"{BRIEF_NAME} is larger than 256 KB")
+        data = fh.read(BRIEF_MAX_BYTES + 1)
+    if len(data) > BRIEF_MAX_BYTES:
+        raise RuntimeError(f"{BRIEF_NAME} is larger than {BRIEF_MAX_BYTES // 1024} KB; keep it short enough to be "
+                           "shown in full when you approve it")
     meta, body, errors = parse_brief(data.decode("utf-8", errors="replace"))
     if errors:
         raise RuntimeError("the brief has problems; fix them and approve again:\n  - " + "\n  - ".join(errors))
@@ -989,8 +1047,8 @@ def print_brief_summary(meta, body):
     for k in ("audience", "distribution"):
         if meta.get(k):
             print(f"- {k}: {meta[k]}")
-    accepted = re.search(r"^#{1,6}\s*accepted\s+risks?\b.*$(.*?)(?=^#{1,6}\s|\Z)", body, re.M | re.S | re.I)
-    items = re.findall(r"^- (.+)$", accepted.group(1), re.M) if accepted else []
+    _, lines = accepted_risk_section(body)
+    items = [l[2:] for l in lines if l.startswith("- ")]
     print(f"- accepted risks: {len(items)}")
     for it in items:
         print(f"    - {it.strip()}")
@@ -1087,15 +1145,25 @@ _running = {"proc": None}
 
 
 def block_pushes(env):
-    """Make every git process the checks start (whatever its path or aliases) push to an unreachable URL
-    instead of this repository's remotes, through git's own config in the environment. The pre-push hook
-    also refuses while RAVENWATCH_CHECKS_RUNNING is set."""
+    """Best-effort guard against *accidental* pushes from checks: git processes the checks start (whatever
+    their path or aliases) push the configured remotes to an unreachable URL, through git's own config in
+    the environment, and the pre-push hook refuses while RAVENWATCH_CHECKS_RUNNING is set. Check code runs
+    with the owner's permissions and can undo all of this on purpose."""
     _, out = git("config", "--get-regexp", r"^remote\..*\.(push)?url$", check=False)
-    urls = sorted({line.split(" ", 1)[1] for line in out.splitlines() if " " in line})
     n = int(env.get("GIT_CONFIG_COUNT", "0") or 0)
-    for u in urls:
-        env[f"GIT_CONFIG_KEY_{n}"] = "url.ravenwatch-checks-cannot-push://blocked/.pushInsteadOf"
-        env[f"GIT_CONFIG_VALUE_{n}"] = u
+    seen = set()
+    for line in out.splitlines():
+        if " " not in line:
+            continue
+        key, url = line.split(" ", 1)
+        # git applies pushInsteadOf only to remotes without an explicit pushurl; pushurls are rewritten by
+        # insteadOf (they are only used for pushing, so fetches are unaffected).
+        kind = "insteadOf" if key.endswith(".pushurl") else "pushInsteadOf"
+        if (kind, url) in seen:
+            continue
+        seen.add((kind, url))
+        env[f"GIT_CONFIG_KEY_{n}"] = f"url.ravenwatch-checks-cannot-push://blocked/.{kind}"
+        env[f"GIT_CONFIG_VALUE_{n}"] = url
         n += 1
     env["GIT_CONFIG_COUNT"] = str(n)
 
@@ -1125,17 +1193,17 @@ def run_check(cmd, cwd, timeout, env):
         proc = subprocess.Popen(["/bin/sh", "-c", cmd], cwd=cwd, stdin=subprocess.DEVNULL, stdout=out,
                                 stderr=subprocess.STDOUT, env=env, preexec_fn=os.setpgrp)
         _running["proc"] = proc
-        deadline = _dt.datetime.now() + _dt.timedelta(seconds=timeout)
+        deadline = time.monotonic() + timeout
         status = None
         try:
             while status is None:
                 try:
-                    proc.wait(timeout=1)
+                    proc.wait(timeout=0.2)
                     status = "pass" if proc.returncode == 0 else "fail"
                 except subprocess.TimeoutExpired:
                     if os.fstat(out.fileno()).st_size > CHECK_OUTPUT_MAX:
                         status = "output-limit"
-                    elif _dt.datetime.now() >= deadline:
+                    elif time.monotonic() >= deadline:
                         status = "timeout"
         finally:
             _kill_group(proc)  # also ends background children of a finished check
@@ -1169,6 +1237,8 @@ def cmd_checks(args):
     data, _ = approved_brief(sdir)
     if data is None:
         raise RuntimeError("no approved project brief; checks only run from a brief the owner approved")
+    if prepared.get("brief_sha") and prepared["brief_sha"] != sha256_bytes(data):
+        raise RuntimeError("the approved brief changed since this review was prepared; prepare again")
     meta, _, _ = parse_brief(data.decode("utf-8", errors="replace"))
     if not meta["checks"]:
         print("the approved brief lists no checks")
@@ -1203,8 +1273,9 @@ def cmd_checks(args):
     results = read_kv(kv_path) if args.only else {}
 
     def record(name, status, blocking):
-        results[name] = status
-        results[name + ".blocking"] = "1" if blocking else "0"
+        # `:` can't appear in a check name, so these keys never collide with each other.
+        results["status:" + name] = status
+        results["blocking:" + name] = "1" if blocking else "0"
         write_kv_atomic(kv_path, [f"{k}={v}" for k, v in results.items()])
 
     # Each result is appended as soon as it is known; a check that never reports finished must be
@@ -1217,6 +1288,7 @@ def cmd_checks(args):
         else:
             fh.write(f"\n# Run ({_dt.datetime.now().strftime('%H:%M:%S')}): {', '.join(args.only)}\n\n")
     summary = []
+    dirtied = []
     try:
         for c in meta["checks"]:
             if args.only and c["name"] not in args.only:
@@ -1224,8 +1296,18 @@ def cmd_checks(args):
             kind = "blocking" if c["blocking"] else "non-blocking"
             with open(out_path, "a", encoding="utf-8") as fh:
                 fh.write(f"## {c['name']} — STARTED ({kind}, timeout {c['timeout']}s)\n")
+            if dirtied:
+                record(c["name"], "not-run", c["blocking"])
+                continue
             record(c["name"], "started", c["blocking"])
             status, code, secs, tail = run_check(c["run"], top, c["timeout"], env)
+            # A check that changed the working tree leaves the next ones testing something nobody reviewed.
+            _, after = git("status", "--porcelain", check=False)
+            if after.strip():
+                dirtied = [l[3:] for l in after.splitlines() if l.strip()]
+                status = "dirtied-tree" if status == "pass" else status
+                tail = (f"[this check changed files: {', '.join(dirtied[:5])} — git-ignore them or make the check "
+                        "leave the tree clean; later checks were not run]\n") + tail
             record(c["name"], status, c["blocking"])
             summary.append(f"{c['name']}: {status.upper()} ({kind}, exit {code}, {secs:.0f}s)")
             with open(out_path, "a", encoding="utf-8") as fh:
@@ -1239,7 +1321,7 @@ def cmd_checks(args):
         print(f"- {line}")
     print(f"output: {out_path}")
     failed_blocking = [c["name"] for c in meta["checks"] if c["blocking"]
-                       and results.get(c["name"], "pass") != "pass"]
+                       and results.get("status:" + c["name"], "pass") != "pass"]
     if failed_blocking:
         print(f"BLOCKING CHECKS FAILED: {', '.join(failed_blocking)}")
         return 1
@@ -1367,6 +1449,8 @@ def main():
     m.add_argument("--run", help="run id printed by prepare (default: the most recent run)")
     m.add_argument("--report")
     m.add_argument("--note")
+    m.add_argument("--checks-skipped", action="store_true",
+                   help="owner chose not to run the brief's blocking checks for this review")
     m.add_argument("--secrets-cleared", action="store_true",
                    help="owner confirms the scan's likely secrets are not credentials (or were removed and rotated)")
     sub.add_parser("status")

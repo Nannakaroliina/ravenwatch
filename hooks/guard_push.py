@@ -29,6 +29,10 @@ import sys
 
 SCRIPTS = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts"))
 PLUGIN_ROOT = os.path.realpath(os.path.dirname(SCRIPTS))
+HELPER = os.path.realpath(os.path.join(SCRIPTS, "ravenwatch.py"))
+# Commands that only read their arguments: reading the plugin's own files is fine.
+READERS = {"cat", "less", "more", "head", "tail", "ls", "grep", "egrep", "fgrep", "rg", "wc", "file", "stat",
+           "diff", "cmp", "md5", "md5sum", "shasum", "sha256sum", "bat", "tree"}
 HOOK_SOURCE = os.path.join(SCRIPTS, "git-pre-push.sh")
 # A single plain call of the plugin's own helper (it writes verdicts and installs hooks itself;
 # those calls are not pre-approved, so the owner confirms each one).
@@ -83,7 +87,8 @@ CAT_HEREDOC = re.compile(r"\bcat\s+<<-?\s*(['\"]?)(\w+)\1([^\n]*)\n.*?\n[ \t]*\2
 HARMLESS_REST = re.compile(r"[\s\"')]*(?:\d*>>?\s*[^\s;&|()]+[\s\"')]*)*")
 REPORTS_PATH = re.compile(r"/ravenwatch/reports(?:/|$)")
 # ravenwatch state file names, wherever they are written (a directory may become a git dir later).
-STATE_NAME = re.compile(r"/ravenwatch/(?:status|latest|brief-approved\.md|brief-trust|verdicts/|runs/[^/]+/prepared$)")
+STATE_NAME = re.compile(r"/ravenwatch/(?:status|latest|brief-approved\.md|brief-trust|verdicts/"
+                        r"|runs/[^/]+/(?:prepared|checks\.kv|checks\.md|brief\.md|context\.md)$)")
 # git subcommands that can run arbitrary commands (and so a push the gate can't see).
 RUNS_COMMANDS = {"submodule", "bisect", "rebase", "filter-branch", "filter-repo", "for-each-repo", "difftool",
                  "mergetool", "worktree"}
@@ -162,8 +167,8 @@ def git_dir_of(path):
 
 
 def segments(command):
-    """Split a command into simple commands (token lists) and redirect targets, honouring quotes,
-    comments and line continuations like the shell does. None if it can't be parsed."""
+    """Split a command into simple commands, each (tokens, redirect targets), honouring quotes, comments
+    and line continuations like the shell does. None if it can't be parsed."""
     out, quote, escaped, i, n = [], None, False, 0, len(command)
     while i < n:
         ch = command[i]
@@ -202,18 +207,18 @@ def segments(command):
                 redirects.append(tok)
             continue
         if tok in SEPARATORS:
-            if cur:
-                segs.append(cur)
-            cur = []
+            if cur or redirects:
+                segs.append((cur, redirects))
+            cur, redirects = [], []
         elif REDIRECT.match(tok):
             if cur and cur[-1].isdigit():
                 cur.pop()  # the file descriptor of `2>`
             skip = True  # the redirect target (`2>&1` leaves `1`, which is skipped too)
         else:
             cur.append(tok)
-    if cur:
-        segs.append(cur)
-    return segs, redirects
+    if cur or redirects:
+        segs.append((cur, redirects))
+    return segs
 
 
 def parse_git(seg):
@@ -254,18 +259,28 @@ def resolve(base, target):
 
 
 def touches_git_dir(base, words, protect_plugin=False):
-    """The first word (path or redirect target) that refers to something inside a git directory
-    (or, when protect_plugin is set, to ravenwatch's own installed code)."""
+    """(word, "git" | "plugin") for the first word (argument or redirect target) that refers to something
+    inside a git directory or, when protect_plugin is set, to ravenwatch's own installed code; else None."""
     for w in words:
-        if "/" not in w and not any(ch in w for ch in "*?[") and w not in (".git", ".GIT"):
+        if w.startswith("-"):
             continue
         for p in expand(base, w) or []:
-            gdir = git_dir_of(p)
-            if gdir and not REPORTS_PATH.search(p):
-                return w
-            if protect_plugin and under_plugin(p):
-                return w
+            if git_dir_of(p) and not REPORTS_PATH.search(p):
+                return w, "git"
+            if protect_plugin and under_plugin(p) and os.path.realpath(p) != HELPER:
+                return w, "plugin"
     return None
+
+
+def path_refusal(word, kind):
+    if kind == "plugin":
+        return (f"`{word}` is part of the installed ravenwatch plugin, which Claude can't change (it is the push "
+                "gate itself). If the plugin needs a change, the owner makes it in the ravenwatch repository and "
+                "updates the plugin. To run the helper, use one plain command: `python3 <plugin>/scripts/"
+                "ravenwatch.py <args>`.")
+    return (f"`{word}` is inside a git directory (hooks, config or ravenwatch verdict state). Read files there with "
+            "the Read tool; install or remove the hook with /ravenwatch:install-git-hook. If the path only appears "
+            "in text (for example a commit message), write the text to a file outside .git and use `git commit -F`.")
 
 
 def alias_of(repo, sub):
@@ -323,17 +338,15 @@ def check_bash(command, cwd):
     parsed_cmd = segments(command)
     if parsed_cmd is None:
         return "could not parse this command. Run `git push` as its own plain command." if pushing else None
-    segs, redirects = parsed_cmd
+    segs = parsed_cmd
     protect_plugin = not developing_plugin(cwd)
-    if touches_git_dir(cwd, redirects, protect_plugin):
-        return ("this command writes inside a git directory (hooks, config or ravenwatch state). "
-                "Install or remove the hook with /ravenwatch:install-git-hook.")
-    if not (pushing or GIT_WORD.search(command) or any("/" in w or "*" in w or ".git" in w.lower()
-                                                       for s in segs for w in s)):
-        return None
 
     here = cwd
-    for seg in segs:
+    for seg, redirects in segs:
+        # Redirect targets resolve against the directory the command has moved to.
+        hit = touches_git_dir(here, redirects, protect_plugin)
+        if hit:
+            return path_refusal(*hit)
         while seg and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", seg[0]):
             if seg[0].startswith("CDPATH="):
                 here = None
@@ -347,12 +360,16 @@ def check_bash(command, cwd):
             if here is not None and git_dir_of(here):
                 return ("this command changes into a git directory, where it can reach the hooks and verdict "
                         "state. Read files there with the Read tool.")
+            if here is not None and protect_plugin and under_plugin(here):
+                return ("this command changes into the installed ravenwatch plugin, which Claude can't change. Read "
+                        "its files with the Read tool, or by path without `cd`.")
             continue
         # Paths given to other programs (cp, printf >, rm …); git's own arguments may name repositories.
-        word = None if os.path.basename(seg[0]) == "git" else touches_git_dir(here, seg[1:], protect_plugin)
+        word = None if head == "git" else touches_git_dir(here, seg[1:], protect_plugin and head not in READERS)
         if word:
-            return (f"`{word}` is inside a git directory or ravenwatch's own code (hooks, config, verdict state). Read files there with "
-                    "the Read tool; install or remove the hook with /ravenwatch:install-git-hook.")
+            return path_refusal(*word)
+        if not (pushing or GIT_WORD.search(" ".join(seg))):
+            continue
         parsed = parse_git(seg)
         seg_text = " ".join(seg)
         if parsed is None:
@@ -419,7 +436,8 @@ def check_write(path, texts, cwd):
     full = os.path.realpath(os.path.join(cwd, os.path.expanduser(path)))
     if under_plugin(full) and not developing_plugin(cwd):
         return ("this file is part of the installed ravenwatch plugin; changing it would change the push gate "
-                "itself. Ask the owner.")
+                "itself. If it needs a change, the owner makes it in the ravenwatch repository and updates the "
+                "plugin.")
     if GITCONFIG_FILE.search(full):
         return "this is a git config file; changes there could skip or redirect the review hook. Ask the owner."
     gdir = git_dir_of(full)

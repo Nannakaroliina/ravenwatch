@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.3 — 2026-10-27
+
+- Brief: accepted risks are counted correctly on the approval screen; a second `## Accepted risks` section, wrapped lines in briefs without frontmatter and invisible or bidi control characters are refused; briefs are capped at 16 KB.
+- Secret scan: every match on a line is judged (an example value no longer hides a real one); `Credentials in URL` judges the password, not the path; a test-ish key name (`test_api_key = …`) marks a `name = value` pair as a placeholder.
+- `mark` refuses pass/warn while a blocking check of the approved brief never ran in this run, unless the owner skipped the checks (`--checks-skipped`, recorded); warn is refused over a failed blocking check like pass.
+- Checks: refuse to run when the approved brief changed since `prepare`; a check that changes the working tree is recorded as `dirtied-tree` and stops the rest; `pushurl` is redirected as well as `url`; result keys can't collide; timeouts use a monotonic clock.
+- Guard: follows `cd` for redirect targets and plain file names, refuses `cd` into the installed plugin, lets reads of the plugin's files and helper calls with redirects through, protects more run files, and its refusals say what to do instead.
+- Docs: the push redirect during checks is best-effort, checks run unreviewed code at HEAD, and committed changes to ravenwatch's own code are trusted when developing it.
+- Author name is Nanna Karoliina throughout.
+- Tests: new round-8 suite.
+
 ## 0.3.2 — 2026-10-27
 
 - Secret gate: the placeholder heuristic now looks at the matched value only, so `process.env.KEY ?? "sk_live_…"` and keys on lines mentioning "latest"/"test" count as likely real; merge-commit resolutions are scanned too.

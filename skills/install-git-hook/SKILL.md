@@ -3,7 +3,8 @@ name: install-git-hook
 description: >
   Installs (or removes) the ravenwatch git pre-push hook in the current repository. The hook is what actually
   enforces review verdicts: it blocks pushes from Claude, the terminal or any app until /ravenwatch:review has
-  passed for the commits being pushed, and Claude's pushes are refused in repositories without it. Use when the
+  passed for the commits being pushed, and Claude's pushes are refused in repositories without it. It guards
+  against accidental pushes on this machine; branch protection on GitHub is the real enforcement. Use when the
   user types /ravenwatch:install-git-hook or asks to "install the pre-push hook", "gate my pushes", or "remove
   the pre-push hook".
 argument-hint: "[--uninstall]"

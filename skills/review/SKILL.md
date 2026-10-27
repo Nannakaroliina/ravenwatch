@@ -132,7 +132,7 @@ Then record the verdict for the push gate:
 python3 ${CLAUDE_PLUGIN_ROOT}/scripts/ravenwatch.py mark --verdict <pass|warn|block> --run <run id> --report <report draft path>
 ```
 
-This command is deliberately not pre-approved, so the owner confirms every verdict that could unlock a push. `mark` refuses if HEAD moved since `prepare`; if that happens, tell the owner and review again rather than working around it.
+This command is deliberately not pre-approved, so the owner confirms every verdict that could unlock a push. `mark` refuses if HEAD moved since `prepare`; if that happens, tell the owner and review again rather than working around it. It also refuses `pass`/`warn` while a blocking check failed, didn't finish or never ran in this run; add `--checks-skipped` only when the owner declined to run the checks (say so in the report).
 
 `mark` also refuses `pass`, `warn` and `accepted` while the deterministic scan found `LIKELY REAL` secrets in the range. Add `--secrets-cleared` only when `infra-config-auditor` confirmed every such hit is not a credential, or the owner says it was removed from history and rotated — and tell the owner you are adding it, so their confirmation covers it. Each reviewed commit keeps its own verdict, so reviewing another branch does not cancel this one.
 
