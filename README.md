@@ -7,7 +7,8 @@ A code reviewer for people who work alone. Before anything reaches GitHub, a tea
 ```
 /ravenwatch:review
    │
-   ├─ 1. prepare      what's about to be pushed (unpushed commits, or full history on a first push)
+   ├─ 1. prepare      what's about to be pushed (unpushed commits, or full history on a first push),
+   │                  or with --full the whole repository at HEAD, split into review groups
    │                  + fast deterministic scan: secret patterns, sensitive files, large files, .gitignore gaps
    │                  (scans every commit in the range, so a secret added then deleted is still caught)
    │
@@ -48,7 +49,7 @@ A code reviewer for people who work alone. Before anything reaches GitHub, a tea
 
 | Component | What it does |
 |---|---|
-| `/ravenwatch:review` | Runs the review. Arguments: none (unpushed commits), `--since-last` (only commits since the last passing review), `--base <ref>`, `--worktree` (uncommitted changes; never unlocks a push), `--full` (whole repo, e.g. before making it public). Add `--quick` to any of these to run only the core reviewers. |
+| `/ravenwatch:review` | Runs the review. Arguments: none (unpushed commits), `--since-last` (only commits since the last passing review), `--base <ref>`, `--worktree` (uncommitted changes; never unlocks a push), `--full` (audit the whole repository at HEAD, not just what changed — see below). Add `--quick` to any of these to run only the core reviewers. |
 | `/ravenwatch:init-brief` | Drafts the project brief from your repo (stack, commands, routes, data), asks you a few questions, and asks you to approve it. `--update` edits an existing brief, e.g. to accept a risk permanently. |
 | `/ravenwatch:install-git-hook` | Installs the git `pre-push` hook in the current repo. This hook is the real gate: git hands it the exact commits being pushed, it asks the remote what it already has, and it requires every new commit to be covered by a PASS, WARN or owner-accepted review. Works for pushes from Claude, the terminal or any app. `--uninstall` removes it. |
 | 12 agents | The eleven specialists above plus `finding-verifier`. All are read-only and never run your code; only the checks you approve in the brief are run. |
@@ -124,6 +125,17 @@ Optional: if [gitleaks](https://github.com/gitleaks/gitleaks), `osv-scanner`, `p
 If you deliberately want to push despite a BLOCK, tell Claude you accept the risk; it records your reason. Confirmed leaked credentials can't be accepted this way — rotate them first. A verdict can't unlock a push while the secret scan has likely-real hits, unless you confirm they aren't credentials (`--secrets-cleared`).
 
 Each reviewed commit keeps its own verdict, so you can review two branches and push both. Only a reviewed commit can be pushed as a new branch or tag tip.
+
+## Reviewing the whole repository
+
+`/ravenwatch:review --full` audits everything at HEAD instead of what changed — before making a repository public, or when you start using ravenwatch on a project that was never reviewed.
+
+- `prepare --full` splits the code into **review groups** of related files (at most 20 files and about 2,500 lines each, so one reviewer can read every file in full) and marks groups whose paths look like auth, sessions, payments, webhooks, uploads, admin, routes or migrations as high priority. The groups are in the run's `groups.txt`; `files.txt` says which group each file is in.
+- Lockfiles, vendored and generated code (`node_modules/`, `vendor/`, `dist/`, `build/`, `*.min.js`, files marked `linguist-generated` or `linguist-vendored` in `.gitattributes` …) and binary files go into no group. The secret scan still reads them, across every commit in the history. Because the repository itself decides what looks vendored, the review lists every such directory and you can have any of it added to a group.
+- Each group gets its own `bug-hunter` and `security-auditor`; config, dependencies, CI, abuse cases, failure handling, privacy, UX, tests and design are reviewed once for the whole repository. `impact-analyzer` doesn't run, because nothing is changing.
+- Pre-existing issues count at every severity, as they're the point of an audit.
+- Claude tells you how many groups and agents the audit will use, and with more than 10 groups asks whether to audit all of them or only the high-priority ones. Agents run in waves of at most 12, high-priority groups first. The report has a coverage section listing every group and whether it was reviewed.
+- The verdict covers the whole history at HEAD, like a first-push review. Fix the findings in small commits and review those as usual.
 
 ## Escape hatches
 

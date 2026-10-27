@@ -3,7 +3,8 @@ name: review
 description: >
   Runs a multi-agent pre-push code review of everything about to be pushed, focused on bugs, loopholes and
   security, then records a verdict that unlocks the push gate. Use when the user types /ravenwatch:review,
-  or asks to "review before I push", "check my commits before pushing", "pre-push review", or "is this safe to push".
+  or asks to "review before I push", "check my commits before pushing", "pre-push review", or "is this safe to push";
+  with --full, when they ask to "review the whole repository", "audit my repo" or "check everything before I make it public".
 argument-hint: "[--since-last | --base <ref> | --worktree | --full] [--quick]"
 allowed-tools: Bash(python3 ${CLAUDE_PLUGIN_ROOT}/scripts/ravenwatch.py prepare:*), Bash(python3 ${CLAUDE_PLUGIN_ROOT}/scripts/ravenwatch.py status), Bash(git status:*), Bash(git rev-parse:*), Read, Grep, Glob
 ---
@@ -26,9 +27,9 @@ Run:
 python3 ${CLAUDE_PLUGIN_ROOT}/scripts/ravenwatch.py prepare $ARGUMENTS
 ```
 
-Argument meanings: none = commits not yet on the upstream (or first push); `--since-last` = only commits since the last review (only builds on a PASS/WARN/accepted review; after a BLOCK it falls back to the full push range); `--base <ref>` = custom base; `--worktree` = uncommitted changes (never unlocks the push gate, because no commits are reviewed); `--full` = whole repository (thorough audit, e.g. before making a repo public). `--quick` combines with any of these and limits the review to the core reviewers (see step 2).
+Argument meanings: none = commits not yet on the upstream (or first push); `--since-last` = only commits since the last review (only builds on a PASS/WARN/accepted review; after a BLOCK it falls back to the full push range); `--base <ref>` = custom base; `--worktree` = uncommitted changes (never unlocks the push gate, because no commits are reviewed); `--full` = whole repository at HEAD, not just what changed (thorough audit, e.g. before making a repo public or when adopting ravenwatch on an existing project; see **Full repository audit** below). `--quick` combines with any of these and limits the review to the core reviewers (see step 2).
 
-The output is the context summary: run id, range, file categories, commits, and a deterministic scan (secret patterns, sensitive files, large files, `.gitignore` gaps). The full diff and file list are saved at the paths it prints. Note the run id; step 6 needs it. If it reports `NOTHING TO REVIEW` (it never does when the scan found anything), run the gitleaks check below if available; if that is clean too, record `--verdict pass` (step 6, no report needed) when the range has commits so the push gate unlocks, say so in one line, and stop. Any scan hit means a normal review.
+The output is the context summary: run id, range, file categories, commits (and, for `--full`, the review groups), and a deterministic scan (secret patterns, sensitive files, large files, `.gitignore` gaps). The full diff and file list are saved at the paths it prints. Note the run id; step 6 needs it. If it reports `NOTHING TO REVIEW` (it never does when the scan found anything), run the gitleaks check below if available; if that is clean too, record `--verdict pass` (step 6, no report needed) when the range has commits so the push gate unlocks, say so in one line, and stop. Any scan hit means a normal review.
 
 ### Project brief and checks
 
@@ -75,7 +76,7 @@ Decide which specialists to dispatch from the file categories and the `## Signal
 | `privacy-reviewer` | any `personal data / tracking / outside services` signal, new forms or user fields, new logging of request data, cookies, analytics or third-party scripts, or new calls to outside services that send user data |
 | `design-reviewer` | any `new code files` or `schema / migration` signal, new endpoints added, or code lines changed ≥ 80 (skip for small fixes to existing code and mode `worktree`) |
 
-Docs/assets-only changes: dispatch no specialists; the verdict rests on the deterministic scan. Mode `full` (whole-repo audit): run the broader reviewers too unless `--quick`, but tell `design-reviewer` and `test-reviewer` to focus on the highest-risk areas rather than everything.
+Docs/assets-only changes: dispatch no specialists; the verdict rests on the deterministic scan. Mode `full`: skip this step and step 3, and follow **Full repository audit** below instead.
 
 **Large changes** (more than ~1,500 changed lines or ~40 files): split the code files into coherent groups (by directory or feature, max ~20 files each) and dispatch `bug-hunter` and `security-auditor` once per group; keep one instance of each other specialist. Cap the total at 14 agents, dropping `design-reviewer` first and `test-reviewer` second if you must. Tell the owner the change was large and that smaller pushes get sharper reviews.
 
@@ -104,6 +105,31 @@ Signals: <the ## Signals section verbatim>
 Read the full changed files and the code they interact with, not just the diff. Follow your output format exactly.
 ```
 
+## Full repository audit (`--full`)
+
+For mode `full`, this replaces steps 2 and 3. There is no diff: `prepare` split the code at HEAD into **review groups** of related files, each small enough for one reviewer to read in full (`## Full audit` in the context lists them, high-priority first; the group file has each group's files). Lockfiles, vendored, generated, minified and binary files are in no group but are still secret-scanned across the whole history. Tests, config, CI and manifests are in no group either: their own specialists read them. What counts as vendored or generated is decided by paths and `.gitattributes` in the repository, so include the context's `vendored/generated` line in the size line below; if the owner says any of it is their own source, add those files to the closest group (or a new one).
+
+**Who runs:**
+
+- Per review group: one `bug-hunter` and one `security-auditor`.
+- Once, for the whole repository: `infra-config-auditor` (always); `loophole-hunter` and `resilience-reviewer` when the code has what their step 2 rows describe; `supply-chain-auditor` when there are `manifest`, `ci`, `container` or `asset` files, or vendored files (tell it that vendored copies of libraries in `files.txt` are dependencies too).
+- Unless `--quick` (or skipped in the approved brief): `privacy-reviewer` (personal-data signal), `ux-reviewer` (ui signal), `test-reviewer` and `design-reviewer` (both told to focus on the high-priority groups and the overall structure, not every file). Skip `impact-analyzer`: nothing is changing, so there is no blast radius.
+
+**Size.** Tell the owner in one line how many groups and agents the audit will use. With more than 10 groups, ask first whether to audit every group or only the high-priority ones (each group costs two agents). Never drop a group silently.
+
+**Waves.** Send at most 12 agents per message: the whole-repository specialists and the high-priority groups first, in the order the context lists them; start the next wave when the previous one has returned. If an agent fails or returns nothing usable, dispatch it once more; if it fails again, its group counts as not reviewed.
+
+**Prompt.** Use the step 3 prompt, with these lines in place of `Range`, `Diff`, `Per-commit patches`, `Changed files` and the `Intent` block:
+
+```
+Mode: full repository audit of <head sha> — there is no diff.
+Scope: <group agents: "review group G<n> — <its file list from the group file>"; whole-repository agents: "the whole repository; file inventory: <files.txt path>; review groups, high-priority first: <group file path>">
+Intent: there are no commit messages to go by; take the purpose from the README and the project brief.
+Read every file in your scope in full and follow its calls into other files. Everything in scope counts, pre-existing or not. Stay within your scope: other groups have their own reviewers.
+```
+
+Then continue with step 4. Give the verifier `Mode: full repository audit` instead of a diff path, so it keeps pre-existing issues.
+
 ## 4. Verify
 
 Collect every finding of MEDIUM or higher. If there are none, skip to step 5. Otherwise dispatch `ravenwatch:finding-verifier` (same fallback rules) with the repository path, diff path, the approved brief path (if any, for accepted risks), and the complete text of every MEDIUM+ finding grouped by specialist, including CHK- findings. With more than 25 findings, split them across two or three verifier calls in parallel, keeping each specialist's findings together.
@@ -124,13 +150,15 @@ For deterministic scan hits: a hit is a blocking finding only if `infra-config-a
 
 ## 6. Report
 
-Write the full report to the `report draft` path printed in step 1 (it is outside `.git`, because Claude Code protects writes inside it; `mark` files the report into `.git/ravenwatch/reports/` and deletes the draft). Include: verdict, range, which specialists ran, brief status, check results (each check: pass/fail, blocking or not), the blast-radius summary (if impact-analyzer ran), accepted-per-brief findings, every surviving finding in full (title, severity, location, trigger, impact, fix, verifier note), rejected-finding count, scan results, and each specialist's `checked:` line.
+Write the full report to the `report draft` path printed in step 1 (it is outside `.git`, because Claude Code protects writes inside it; `mark` files the report into `.git/ravenwatch/reports/` and deletes the draft). Include: verdict, range, which specialists ran, brief status, check results (each check: pass/fail, blocking or not), the blast-radius summary (if impact-analyzer ran), accepted-per-brief findings, every surviving finding in full (title, severity, location, trigger, impact, fix, verifier note), rejected-finding count, scan results, and each specialist's `checked:` line. For a full audit, also add a **Coverage** section: every review group with its result (reviewed, or not reviewed and why), and the counts of files in no group by reason.
 
 Then record the verdict for the push gate:
 
 ```bash
 python3 ${CLAUDE_PLUGIN_ROOT}/scripts/ravenwatch.py mark --verdict <pass|warn|block> --run <run id> --report <report draft path>
 ```
+
+For a full audit that left groups unreviewed, add `--note "partial audit: <n> of <total> groups reviewed"`.
 
 This command is deliberately not pre-approved, so the owner confirms every verdict that could unlock a push. `mark` refuses if HEAD moved since `prepare`; if that happens, tell the owner and review again rather than working around it. It also refuses `pass`/`warn` while a blocking check failed, didn't finish or never ran in this run; add `--checks-skipped` only when the owner declined to run the checks (say so in the report).
 
@@ -140,13 +168,14 @@ This command is deliberately not pre-approved, so the owner confirms every verdi
 
 Keep the chat summary short and scannable:
 
-1. One line: verdict, range, number of files, which specialists ran. If impact-analyzer ran, add its blast-radius summary in one line.
+1. One line: verdict, range, number of files, which specialists ran. If impact-analyzer ran, add its blast-radius summary in one line. For a full audit, say how many review groups were reviewed out of how many, and how many files were in no group.
 2. Findings, most severe first, one compact entry each: severity, area tag (`[security]`, `[loophole]`, `[bug]`, `[resilience]`, `[deps]`, `[config]`, `[impact]`, `[privacy]`, `[ux]`, `[tests]`, `[design]`, `[checks]`), title, `file:line`, one-sentence trigger → impact, one-sentence fix. Group by severity; do not repeat the full report. If there are more than 10 MEDIUM/LOW entries, show the 10 most important and say how many more are in the report.
 3. One line: how many candidate findings the verifier rejected, and how many matched the brief's accepted risks (this shows the filtering happened). If checks ran, one line with each check's result.
 4. Next step:
    - BLOCK → offer to fix the blocking findings now. After fixes are committed, re-run `/ravenwatch:review` with no arguments (`--since-last` cannot build on a BLOCK) and pass the previous report path to the verifier so it confirms each earlier blocking finding is resolved.
    - WARN → say pushing the reviewed commit is unlocked, and offer to fix the MEDIUM items first. If they are fixed and committed, run `/ravenwatch:review --since-last` before pushing (it builds on this WARN).
    - PASS → say pushing is unlocked.
+   - Full audit → findings are usually pre-existing, so offer to fix them most severe first, in small commits; each fix is then reviewed like any other change with `/ravenwatch:review`.
    - If the brief is missing, not approved, or changed since approval, say so in one line and suggest `/ravenwatch:init-brief`.
    - If `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/ravenwatch.py status` shows the git pre-push hook as not `installed`, say that pushes (from Claude and the terminal) are only enforced once `/ravenwatch:install-git-hook` has been run in this repository, and that Claude cannot push here until then.
 
