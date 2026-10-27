@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.0 — 2026-10-27
+
+- Project brief (`.ravenwatch.md`) and `/ravenwatch:init-brief`: describe the project, its audience, data, conventions and accepted risks; every reviewer reads it. Only an owner-approved snapshot (`trust-brief`, stored in `.git/ravenwatch/`) is acted on; the review flags when the file differs from it. `--private` keeps the brief out of the repository.
+- Checks: the brief can list your own commands (tests, type checks, linters). `ravenwatch.py checks` runs them from the approved snapshot with `CI=1`, timeouts and redacted output, after your confirmation. A failing blocking check is a HIGH finding.
+- `privacy-reviewer`: personal data in logs, URLs, client storage or outside services, tracking before consent, special categories, retention and deletion, new processors. Can block (max HIGH).
+- security-auditor and loophole-hunter now cover AI/LLM features: prompt injection, model output reaching sinks, keys in prompts, over-permissioned tools, unmetered paid AI endpoints, rules enforced only by the prompt.
+- resilience-reviewer now covers cloud and API cost blowups.
+- supply-chain-auditor now checks licences of new dependencies and added fonts/media (max MEDIUM).
+- finding-verifier: `ACCEPTED` verdict for findings matching the brief's accepted risks (never CRITICAL or leaked credentials); checks for PRIV- and CHK- findings.
+- `prepare` adds a personal-data/tracking signal and a project-brief section; `status` shows the brief's state.
+
 ## 0.2.0 — 2026-10-27
 
 - Four new reviewers, run when relevant and skipped with `--quick`:

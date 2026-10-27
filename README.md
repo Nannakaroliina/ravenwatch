@@ -1,6 +1,6 @@
 # ravenwatch
 
-A code reviewer for people who work alone. Before anything reaches GitHub, a team of specialist agents reviews your unpushed commits with an emphasis on **bugs, loopholes and security** — and also checks the blast radius, user experience, tests and design — a skeptical verifier throws out false alarms, and a push gate stops `git push` until the review passes.
+A code reviewer for people who work alone. Before anything reaches GitHub, a team of specialist agents reviews your unpushed commits with an emphasis on **bugs, loopholes and security** — and also checks the blast radius, privacy, user experience, tests and design, and runs your own tests if you want — a skeptical verifier throws out false alarms, and a push gate stops `git push` until the review passes.
 
 ## How it works
 
@@ -10,6 +10,8 @@ A code reviewer for people who work alone. Before anything reaches GitHub, a tea
    ├─ 1. prepare      what's about to be pushed (unpushed commits, or full history on a first push)
    │                  + fast deterministic scan: secret patterns, sensitive files, large files, .gitignore gaps
    │                  (scans every commit in the range, so a secret added then deleted is still caught)
+   │
+   │                  + reads your approved project brief (.ravenwatch.md) and runs its checks (tests, types, lint)
    │
    ├─ 2. triage       picks specialists from what changed
    │
@@ -25,13 +27,16 @@ A code reviewer for people who work alone. Before anything reaches GitHub, a tea
    │    broader (skipped with --quick)                                                │
    │      impact-analyzer       blast radius: dependents, breaking API/schema changes,│
    │                            migrations, env vars, deploy order, rollback  (blocks)│
+   │      privacy-reviewer      personal data in logs/URLs/3rd parties, consent,      │
+   │                            retention, special categories (GDPR-minded) (≤ HIGH)  │
    │      ux-reviewer           flows, states, accessibility, mobile, copy  (≤ HIGH)  │
    │      test-reviewer         risky code without tests, tests that can't fail,      │
    │                            weakened/skipped tests, flakiness         (≤ MEDIUM)  │
    │      design-reviewer       architecture fit, duplication, coupling, data model,  │
    │                            over-engineering                          (≤ MEDIUM)  │
    │                                                                                  │
-   ├─ 4. finding-verifier  tries to disprove every MEDIUM+ finding ◄──────────────────┘
+   ├─ 4. finding-verifier  tries to disprove every MEDIUM+ finding, and sets aside ◄─┘
+   │                       ones matching your brief's accepted risks
    │
    ├─ 5. verdict      BLOCK (critical/high) · WARN (medium) · PASS
    │
@@ -44,8 +49,9 @@ A code reviewer for people who work alone. Before anything reaches GitHub, a tea
 | Component | What it does |
 |---|---|
 | `/ravenwatch:review` | Runs the review. Arguments: none (unpushed commits), `--since-last` (only commits since the last passing review), `--base <ref>`, `--worktree` (uncommitted changes; never unlocks a push), `--full` (whole repo, e.g. before making it public). Add `--quick` to any of these to run only the core reviewers. |
+| `/ravenwatch:init-brief` | Drafts the project brief from your repo (stack, commands, routes, data), asks you a few questions, and asks you to approve it. `--update` edits an existing brief, e.g. to accept a risk permanently. |
 | `/ravenwatch:install-git-hook` | Installs the git `pre-push` hook in the current repo. This hook is the real gate: git hands it the exact commits being pushed, it asks the remote what it already has, and it requires every new commit to be covered by a PASS, WARN or owner-accepted review. Works for pushes from Claude, the terminal or any app. `--uninstall` removes it. |
-| 11 agents | The ten specialists above plus `finding-verifier`. All are read-only; none runs your code or tests. |
+| 12 agents | The eleven specialists above plus `finding-verifier`. All are read-only and never run your code; only the checks you approve in the brief are run. |
 | Claude guard hook | Keeps Claude from getting around the git hook: refuses Claude's pushes in repos where the hook isn't installed, refuses `--no-verify`, hooks-path overrides, `send-pack` and similar, and refuses edits to `.git/hooks`, `.git/config` and the verdict state. |
 
 ## What blocks a push
@@ -54,9 +60,42 @@ A code reviewer for people who work alone. Before anything reaches GitHub, a tea
 |---|---|---|
 | bug, security, loophole, resilience, deps, config, impact | CRITICAL | can BLOCK |
 | ux-reviewer | HIGH, only when a user can't complete a core task (including accessibility blockers) | can BLOCK |
+| privacy-reviewer | HIGH (personal data leaking by design, special categories, real personal data committed) | can BLOCK |
+| your checks (from the brief) | a failing `blocking: true` check is HIGH; a failing non-blocking check is MEDIUM | can BLOCK |
+| licence findings | MEDIUM | can WARN, never BLOCK |
 | test-reviewer, design-reviewer | MEDIUM | can WARN, never BLOCK |
 
-The broader reviewers only run when they're relevant: impact-analyzer for schema, API, route, env or deleted-file changes; ux-reviewer for UI files and user-facing text; test-reviewer for code changes of 20+ lines; design-reviewer for larger changes or new modules, schemas or endpoints.
+The broader reviewers only run when they're relevant (privacy-reviewer when the change touches personal data, forms, logging, cookies, analytics or outside services): impact-analyzer for schema, API, route, env or deleted-file changes; ux-reviewer for UI files and user-facing text; test-reviewer for code changes of 20+ lines; design-reviewer for larger changes or new modules, schemas or endpoints.
+
+## Project brief
+
+`.ravenwatch.md` tells the reviewers what your project is, so they raise fewer false alarms and stop repeating things you've decided to accept. Create it with `/ravenwatch:init-brief`.
+
+```markdown
+---
+audience: public, EU
+distribution: closed-source commercial
+checks:
+  - name: tests
+    run: npm test
+    blocking: true
+  - name: lint
+    run: npm run lint
+    blocking: false
+skip: []            # optional: impact-analyzer, ux-reviewer, test-reviewer, design-reviewer, privacy-reviewer
+---
+# Cabin booking
+## About
+## Public and private parts
+## Data
+## Conventions
+## Accepted risks
+- WINTER discount code is public on purpose (marketing), public/book.js — 2026-10-27
+```
+
+**Only a version you approve counts.** Approving (`trust-brief`, which Claude asks you to confirm) stores a snapshot inside `.git/ravenwatch/`. Checks always run from that snapshot, so nobody — including Claude — can add a command, skip a reviewer or accept a risk by editing the file; the review tells you when the file differs from what you approved. Checks run with `CI=1`, a timeout and redacted output, and each run asks for your confirmation first. Accepted risks only cover the specific issue and place they name, never CRITICAL findings or leaked credentials.
+
+For public repos, keep the brief private (`init-brief` offers this): a committed brief tells everyone which risks you've accepted. Private means git-ignored in this clone only.
 
 ## Setup
 
@@ -116,8 +155,8 @@ Everything lives inside the repository's `.git/ravenwatch/` folder, so nothing i
 
 ```
 .claude-plugin/   plugin.json (the plugin) + marketplace.json (lets this repo be added as a marketplace)
-agents/           the eleven reviewer agents
-skills/           /ravenwatch:review and /ravenwatch:install-git-hook
+agents/           the twelve reviewer agents
+skills/           /ravenwatch:review, /ravenwatch:init-brief and /ravenwatch:install-git-hook
 hooks/            the Claude Code push gate
 scripts/          ravenwatch.py (range, scan, verdicts) and the git pre-push hook
 ```

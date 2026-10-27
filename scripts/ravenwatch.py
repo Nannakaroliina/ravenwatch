@@ -3,7 +3,7 @@
 deterministic secret/risk scan, and records review verdicts for the push gate.
 
 Subcommands
-  prepare [--base REF] [--since-last] [--worktree] [--full]
+  prepare [--base REF] [--since-last] [--worktree] [--full] [--quick]
       Decide the review range, write diff + file list + context to a new run
       directory, run the secret/risk scan, and print a context summary.
   mark --verdict pass|warn|block|accepted [--run ID] [--report PATH] [--note TEXT]
@@ -13,9 +13,15 @@ Subcommands
       Print the recorded verdict, whether it covers the current HEAD, and the git hook state.
   install-hook [--uninstall] [--hooks-path-ok]
       Install (or remove) the git pre-push hook that enforces verdicts.
+  trust-brief [--private]
+      Approve the current .ravenwatch.md. Only the approved snapshot is acted on
+      (checks, skipped reviewers, accepted risks). --private git-ignores the brief
+      for this clone.
+  checks [--run ID] [--only NAME ...]
+      Run the checks listed in the approved brief and save their output to the run.
 
 All state lives inside the git directory (never committed):
-  <git-dir>/ravenwatch/   status, history.log, reports/, runs/<id>/
+  <git-dir>/ravenwatch/   status, history.log, reports/, runs/<id>/, brief-approved.md, brief-trust
 """
 
 import argparse
@@ -268,6 +274,28 @@ SIGNAL_RULES = [
 ]
 
 
+PERSONAL_DATA = re.compile(
+    r"(?<![A-Za-z])(e-?mail|phone|mobile_?number|address|postcode|zip_?code|birth_?date|date_?of_?birth|dob|ssn|"
+    r"social_?security|passport|national_?id|hetu|iban|ip_?addr(ess)?|remote_?addr|cf-connecting-ip|x-forwarded-for|"
+    r"user_?agent|geo_?location|latitude|longitude|first_?name|last_?name|full_?name|surname|gender|health|"
+    r"set-cookie|document\.cookie|localStorage|sessionStorage|gtag|google-analytics|googletagmanager|plausible|"
+    r"posthog|mixpanel|segment\.(io|com)|hotjar|clarity\.ms|sentry|datadog|fbq|facebook pixel|"
+    r"openai|anthropic|api\.mistral|generativelanguage)(?![A-Za-z])", re.I)
+
+
+def personal_data_files(diff_path):
+    """Files whose added lines mention personal data, tracking, cookies or outside AI services."""
+    found, current = [], None
+    with open(diff_path, encoding="utf-8", errors="replace") as fh:
+        for raw in fh:
+            if raw.startswith("+++ "):
+                p = raw[4:].rstrip("\n")
+                current = p[2:] if p.startswith("b/") else None
+            elif raw.startswith("+") and current and current not in found and PERSONAL_DATA.search(raw):
+                found.append(current)
+    return found
+
+
 def signals_for(path):
     return [name for name, rx in SIGNAL_RULES if rx.search(path)]
 
@@ -503,8 +531,13 @@ def cmd_prepare(args):
         out.append(f"- new code files ({len(new_code)}): " + ", ".join(new_code[:20]))
     out.append(f"- code lines changed: {code_lines}; code files: {code_changed}; test files: {tests_changed}"
                + (" (code changed without any test changes)" if code_changed and not tests_changed else ""))
-    if not (sig or deleted or code_changed):
+    pd = [p for p in personal_data_files(diff_path) if classify(p) not in ("docs", "asset")]
+    if pd:
+        out.append(f"- personal data / tracking / outside services ({len(pd)}): " + ", ".join(pd[:20]))
+    if not (sig or deleted or code_changed or pd):
         out.append("- none")
+    brief_lines, _brief_meta = brief_context_lines(brief_state(top, sdir), top, cur, files)
+    out.extend(brief_lines)
     if commits:
         out.append("")
         out.append("## Commits")
@@ -622,6 +655,323 @@ def cmd_mark(args):
     return 0
 
 
+# ------------------------------------------------------------------ project brief
+#
+# The owner describes the project in .ravenwatch.md (YAML-ish frontmatter + Markdown body).
+# Only a snapshot the owner approved with `trust-brief` is acted on: checks are run from that
+# snapshot, never from the working file, so a commit (or an agent) editing the brief cannot add
+# commands, skip reviewers or accept risks without the owner approving it again.
+
+BRIEF_NAME = ".ravenwatch.md"
+SKIPPABLE = ("impact-analyzer", "ux-reviewer", "test-reviewer", "design-reviewer", "privacy-reviewer")
+CHECK_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.\-]{0,39}$")
+CHECK_TIMEOUT_DEFAULT = 600
+CHECK_OUTPUT_LINES = 120
+CHECK_OUTPUT_BYTES = 20000
+
+
+def _scalar(v):
+    v = v.strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+        return v[1:-1]
+    if v.lower() in ("true", "yes"):
+        return True
+    if v.lower() in ("false", "no"):
+        return False
+    if re.fullmatch(r"-?\d+", v):
+        return int(v)
+    return v
+
+
+def parse_brief(text):
+    """Return (meta, body, errors). Supports the small YAML subset the brief template uses:
+    `key: value`, `key: [a, b]`, lists of scalars, and lists of flat maps (checks)."""
+    errors, meta = [], {}
+    lines = text.replace("\r\n", "\n").split("\n")
+    if not lines or lines[0].strip() != "---":
+        return meta, text, errors
+    try:
+        end = next(i for i in range(1, len(lines)) if lines[i].strip() == "---")
+    except StopIteration:
+        return meta, text, ["frontmatter starts with --- but never ends with ---"]
+    body = "\n".join(lines[end + 1:])
+    key, item = None, None
+    for n, raw in enumerate(lines[1:end], start=2):
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        indent = len(raw) - len(raw.lstrip(" "))
+        line = raw.strip()
+        if indent == 0:
+            m = re.fullmatch(r"([A-Za-z_][\w-]*)\s*:\s*(.*)", line)
+            if not m:
+                errors.append(f"line {n}: expected `key: value`")
+                continue
+            key, val = m.group(1), m.group(2)
+            item = None
+            if val.startswith("[") and val.endswith("]"):
+                meta[key] = [_scalar(x) for x in val[1:-1].split(",") if x.strip()]
+            elif val:
+                meta[key] = _scalar(val)
+            else:
+                meta[key] = []
+        elif key is None:
+            errors.append(f"line {n}: indented line outside a key")
+        elif line.startswith("- "):
+            rest = line[2:].strip()
+            m = re.fullmatch(r"([A-Za-z_][\w-]*)\s*:\s*(.*)", rest)
+            if not isinstance(meta.get(key), list):
+                meta[key] = []
+            if m:
+                item = {m.group(1): _scalar(m.group(2))}
+                meta[key].append(item)
+            else:
+                item = None
+                meta[key].append(_scalar(rest))
+        else:
+            m = re.fullmatch(r"([A-Za-z_][\w-]*)\s*:\s*(.*)", line)
+            if m and isinstance(item, dict):
+                item[m.group(1)] = _scalar(m.group(2))
+            else:
+                errors.append(f"line {n}: could not read `{line[:40]}`")
+    # Validate the parts that have effects.
+    checks = []
+    for i, c in enumerate(meta.get("checks") or [], start=1):
+        if not isinstance(c, dict):
+            errors.append(f"checks #{i}: needs `name:` and `run:`")
+            continue
+        name, run = str(c.get("name", "")).strip(), c.get("run")
+        if not CHECK_NAME.match(name):
+            errors.append(f"checks #{i}: name must be 1-40 letters, digits, spaces, . _ -")
+            continue
+        if not isinstance(run, str) or not run.strip() or "\n" in run:
+            errors.append(f"checks `{name}`: `run:` must be a single-line command")
+            continue
+        timeout = c.get("timeout", CHECK_TIMEOUT_DEFAULT)
+        if not isinstance(timeout, int) or not 10 <= timeout <= 3600:
+            errors.append(f"checks `{name}`: timeout must be 10-3600 seconds")
+            continue
+        blocking = c.get("blocking", True)
+        if not isinstance(blocking, bool):
+            errors.append(f"checks `{name}`: blocking must be true or false")
+            continue
+        checks.append({"name": name, "run": run.strip(), "timeout": timeout, "blocking": blocking})
+    meta["checks"] = checks
+    skip = meta.get("skip") or []
+    if not isinstance(skip, list):
+        skip = [skip]
+    bad = [s for s in skip if s not in SKIPPABLE]
+    if bad:
+        errors.append(f"skip: only these reviewers can be skipped: {', '.join(SKIPPABLE)} (got {', '.join(map(str, bad))})")
+    meta["skip"] = [s for s in skip if s in SKIPPABLE]
+    return meta, body, errors
+
+
+def sha256_bytes(data):
+    import hashlib
+    return hashlib.sha256(data).hexdigest()
+
+
+def brief_paths(sdir):
+    return os.path.join(sdir, "brief-approved.md"), os.path.join(sdir, "brief-trust")
+
+
+def approved_brief(sdir):
+    """(bytes, meta) of the owner-approved snapshot, or (None, {}) if there is none or it was tampered with."""
+    snap, trust = brief_paths(sdir)
+    info = read_kv(trust)
+    try:
+        with open(snap, "rb") as fh:
+            data = fh.read()
+    except OSError:
+        return None, {}
+    if not info.get("sha256") or sha256_bytes(data) != info["sha256"]:
+        return None, {}
+    return data, info
+
+
+def brief_state(top, sdir):
+    """Describe the brief: which version is in effect and whether the working file matches it."""
+    work = os.path.join(top, BRIEF_NAME)
+    work_data = None
+    if os.path.isfile(work) and not os.path.islink(work):
+        with open(work, "rb") as fh:
+            work_data = fh.read(256 * 1024)
+    approved, info = approved_brief(sdir)
+    st = {"working": work_data is not None, "approved": approved is not None,
+          "approved_at": info.get("approved_at", ""), "data": approved}
+    if approved is None:
+        st["status"] = "not approved" if work_data is not None else "none"
+    elif work_data is None:
+        st["status"] = "approved (working file missing; using the approved snapshot)"
+    elif sha256_bytes(work_data) == info["sha256"]:
+        st["status"] = "approved"
+    else:
+        st["status"] = "changed since approval (using the approved version)"
+    return st
+
+
+def cmd_trust_brief(args):
+    top = git("rev-parse", "--show-toplevel")
+    os.chdir(top)
+    sdir = state_dir()
+    path = os.path.join(top, BRIEF_NAME)
+    if not os.path.isfile(path) or os.path.islink(path):
+        raise RuntimeError(f"no {BRIEF_NAME} in {top}; create one with /ravenwatch:init-brief")
+    with open(path, "rb") as fh:
+        data = fh.read(256 * 1024 + 1)
+    if len(data) > 256 * 1024:
+        raise RuntimeError(f"{BRIEF_NAME} is larger than 256 KB")
+    meta, body, errors = parse_brief(data.decode("utf-8", errors="replace"))
+    if errors:
+        raise RuntimeError("the brief has problems; fix them and approve again:\n  - " + "\n  - ".join(errors))
+    snap, trust = brief_paths(sdir)
+    tmp = snap + ".tmp"
+    with open(tmp, "wb") as fh:
+        fh.write(data)
+    os.replace(tmp, snap)
+    write_kv_atomic(trust, [f"sha256={sha256_bytes(data)}",
+                            f"approved_at={_dt.datetime.now().astimezone().isoformat(timespec='seconds')}"])
+    if args.private:
+        exclude = git("rev-parse", "--path-format=absolute", "--git-path", "info/exclude")
+        os.makedirs(os.path.dirname(exclude), exist_ok=True)
+        existing = open(exclude, encoding="utf-8").read() if os.path.exists(exclude) else ""
+        if f"/{BRIEF_NAME}" not in existing.split("\n"):
+            with open(exclude, "a", encoding="utf-8") as fh:
+                fh.write(("" if existing.endswith("\n") or not existing else "\n") + f"/{BRIEF_NAME}\n")
+        tracked = git_ok("ls-files", "--error-unmatch", BRIEF_NAME)
+        print(f"{BRIEF_NAME} is git-ignored for this clone only" + (
+            " — but it is already tracked; run `git rm --cached .ravenwatch.md` and commit to stop sharing it"
+            if tracked else ""))
+    print(f"approved {BRIEF_NAME} ({len(data)} bytes)")
+    print(f"- checks: {len(meta['checks'])}")
+    for c in meta["checks"]:
+        print(f"    {c['name']} ({'blocking' if c['blocking'] else 'non-blocking'}, {c['timeout']}s): {c['run']}")
+    print(f"- skipped reviewers: {', '.join(meta['skip']) or 'none'}")
+    accepted = re.search(r"^##\s*Accepted risks\s*$(.*?)(?=^##\s|\Z)", body, re.M | re.S | re.I)
+    n_acc = len(re.findall(r"^\s*[-*]\s+\S", accepted.group(1), re.M)) if accepted else 0
+    print(f"- accepted risks: {n_acc}")
+    return 0
+
+
+def brief_context_lines(st, top, cur, files):
+    """Lines for the context summary, and write the approved brief into the run directory."""
+    out = ["", "## Project brief", f"- status: {st['status']}"]
+    if st["status"] == "none":
+        out.append("- no .ravenwatch.md; reviewers work without project context. "
+                   "Suggest /ravenwatch:init-brief to the owner.")
+        return out, {"checks": [], "skip": []}
+    if not st["approved"]:
+        out.append("- the brief exists but the owner has not approved it, so it is NOT used: no checks, no skips, "
+                   "no accepted risks. Suggest the owner approves it (see /ravenwatch:init-brief).")
+        return out, {"checks": [], "skip": []}
+    meta, body, _ = parse_brief(st["data"].decode("utf-8", errors="replace"))
+    brief_copy = os.path.join(cur, "brief.md")
+    with open(brief_copy, "wb") as fh:
+        fh.write(st["data"])
+    out.append(f"- approved brief: {brief_copy} (approved {st['approved_at']}) — give it to every reviewer")
+    for k in ("audience", "distribution"):
+        if meta.get(k):
+            out.append(f"- {k}: {meta[k]}")
+    if meta["checks"]:
+        out.append("- checks:")
+        for c in meta["checks"]:
+            out.append(f"    - {c['name']} ({'blocking' if c['blocking'] else 'non-blocking'}): {c['run']}")
+    else:
+        out.append("- checks: none")
+    if meta["skip"]:
+        out.append(f"- skipped by the owner: {', '.join(meta['skip'])}")
+    if re.search(r"^##\s*Accepted risks\s*$", body, re.M | re.I):
+        out.append("- has an `Accepted risks` section: pass it to finding-verifier")
+        if any(p == BRIEF_NAME for _, p in files) or git_ok("ls-files", "--error-unmatch", BRIEF_NAME):
+            out.append("- note: the brief is committed, so its accepted risks are visible to anyone who can read "
+                       "the repository. For a public repo, suggest `trust-brief --private` and `git rm --cached`.")
+    if st["status"].startswith("changed"):
+        out.append("- note: the working .ravenwatch.md differs from the approved version; tell the owner so they "
+                   "can review and approve the change")
+    return out, meta
+
+
+# ------------------------------------------------------------------------- checks
+
+
+def redact_output(text):
+    out = []
+    for line in text.splitlines():
+        for name, rx in SECRET_PATTERNS:
+            if name == "Generic secret assignment":
+                continue
+            line = rx.sub(lambda m: redact(m.group(0)), line)
+        out.append(line)
+    return "\n".join(out)
+
+
+def run_check(cmd, cwd, timeout):
+    env = dict(os.environ, CI="1", FORCE_COLOR="0", NO_COLOR="1")
+    env.pop("RAVENWATCH_DISABLE", None)
+    start = _dt.datetime.now()
+    proc = subprocess.Popen(["/bin/sh", "-c", cmd], cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, env=env, start_new_session=True)
+    try:
+        raw, _ = proc.communicate(timeout=timeout)
+        status = "pass" if proc.returncode == 0 else "fail"
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, 9)
+        except OSError:
+            proc.kill()
+        raw, _ = proc.communicate()
+        status = "timeout"
+    secs = (_dt.datetime.now() - start).total_seconds()
+    text = raw.decode("utf-8", errors="replace")
+    tail = "\n".join(text.splitlines()[-CHECK_OUTPUT_LINES:])[-CHECK_OUTPUT_BYTES:]
+    return status, proc.returncode, secs, redact_output(tail)
+
+
+def cmd_checks(args):
+    top = git("rev-parse", "--show-toplevel")
+    os.chdir(top)
+    sdir = state_dir()
+    runs = os.path.join(sdir, "runs")
+    run_id = args.run or read_kv_first_line(os.path.join(runs, "latest"))
+    if not run_id or os.path.basename(run_id) != run_id:
+        raise RuntimeError("no prepared review run found; run `prepare` first")
+    prepared = read_kv(os.path.join(runs, run_id, "prepared"))
+    head = git("rev-parse", "HEAD")
+    if prepared.get("head") != head:
+        raise RuntimeError("HEAD moved since this review was prepared; prepare again before running checks")
+    data, _ = approved_brief(sdir)
+    if data is None:
+        raise RuntimeError("no approved project brief; checks only run from a brief the owner approved")
+    meta, _, _ = parse_brief(data.decode("utf-8", errors="replace"))
+    if not meta["checks"]:
+        print("the approved brief lists no checks")
+        return 0
+    _, wt = git("status", "--porcelain", check=False)
+    dirty = len([l for l in wt.splitlines() if l.strip()])
+    lines = [f"# Checks for run {run_id}", f"- head: {head}", f"- working tree: "
+             + (f"{dirty} uncommitted change(s) — checks ran against the working tree, not exactly the pushed commits"
+                if dirty else "clean (checks match the reviewed commits)"), ""]
+    summary = []
+    for c in meta["checks"]:
+        if args.only and c["name"] not in args.only:
+            continue
+        status, code, secs, tail = run_check(c["run"], top, c["timeout"])
+        kind = "blocking" if c["blocking"] else "non-blocking"
+        summary.append(f"{c['name']}: {status.upper()} ({kind}, exit {code}, {secs:.0f}s)")
+        lines += [f"## {c['name']} — {status.upper()} ({kind})", f"- command: `{c['run']}`",
+                  f"- exit code: {code}; duration: {secs:.0f}s", "", "```", tail or "(no output)", "```", ""]
+    out_path = os.path.join(runs, run_id, "checks.md")
+    with open(out_path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines))
+    print("checks:")
+    for s in summary:
+        print(f"- {s}")
+    if dirty:
+        print(f"- note: {dirty} uncommitted change(s); results reflect the working tree")
+    print(f"output: {out_path}")
+    return 0
+
+
 def read_kv_first_line(p):
     try:
         with open(p, encoding="utf-8") as fh:
@@ -708,6 +1058,7 @@ def cmd_status(_args):
     sdir = state_dir()
     st = read_status(sdir)
     print(f"git pre-push hook: {hook_state()}")
+    print(f"project brief: {brief_state(os.getcwd(), sdir)['status']}")
     if not st:
         print("no review recorded for this repository")
         return 1
@@ -735,13 +1086,19 @@ def main():
     m.add_argument("--report")
     m.add_argument("--note")
     sub.add_parser("status")
+    t = sub.add_parser("trust-brief", help="approve the current .ravenwatch.md (owner only)")
+    t.add_argument("--private", action="store_true", help="also git-ignore .ravenwatch.md for this clone")
+    c = sub.add_parser("checks", help="run the checks listed in the approved brief")
+    c.add_argument("--run", help="run id printed by prepare (default: the most recent run)")
+    c.add_argument("--only", nargs="+", help="run only these named checks")
     h = sub.add_parser("install-hook")
     h.add_argument("--uninstall", action="store_true")
     h.add_argument("--hooks-path-ok", action="store_true")
     args = ap.parse_args()
     try:
         return {"prepare": cmd_prepare, "mark": cmd_mark, "status": cmd_status,
-                "install-hook": cmd_install_hook}[args.cmd](args)
+                "install-hook": cmd_install_hook, "trust-brief": cmd_trust_brief,
+                "checks": cmd_checks}[args.cmd](args)
     except RuntimeError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

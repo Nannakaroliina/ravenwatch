@@ -8,7 +8,7 @@
     {
       "name": "ravenwatch",
       "source": ".",
-      "description": "Specialist agents review your unpushed commits for bugs, loopholes and security issues, plus blast radius, UX, tests and design, and a push gate holds git push until the review passes."
+      "description": "Specialist agents review your unpushed commits for bugs, loopholes and security issues, plus blast radius, privacy, UX, tests and design; runs your own checks; a push gate holds git push until the review passes."
     }
   ]
 }
