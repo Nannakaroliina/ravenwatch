@@ -81,12 +81,18 @@ Rules for **Accepted risks**: add an entry only when the owner explicitly says t
 
 ## 4. Ask for approval
 
-Show the owner the checks exactly as they will run, and the skip list, then ask them to approve by running:
+Approval is two steps, so the owner approves exactly the content they saw. First show what would take effect (this stores nothing):
 
 ```bash
 python3 ${CLAUDE_PLUGIN_ROOT}/scripts/ravenwatch.py trust-brief
 ```
 
-Add `--private` if they chose to keep it private. This command is deliberately not pre-approved: the owner's confirmation of this command is the approval. If they decline, leave the file as a draft and say that reviews will ignore it until it is approved.
+Relay its output to the owner **in full** — every check command, the skip list, the audience, and the full text of every accepted risk — and point out anything that came from someone other than the owner (for example entries already in a pulled `.ravenwatch.md`). Then, if they approve, run the command it printed:
+
+```bash
+python3 ${CLAUDE_PLUGIN_ROOT}/scripts/ravenwatch.py trust-brief --approve <sha256 it printed>
+```
+
+Add `--private` if they chose to keep it private. This command is deliberately not pre-approved: the owner's confirmation of it, with the hash of the content they were shown, is the approval. It refuses if the file changed after it was shown. If they decline, leave the file as a draft and say that reviews will ignore it until it is approved. Don't edit `.ravenwatch.md` between the two steps.
 
 Finish with one line: the brief's status, how many checks it has, and that `/ravenwatch:review` will now use it. If the brief is not private, remind them to commit it.

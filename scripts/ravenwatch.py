@@ -29,6 +29,7 @@ import datetime as _dt
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -37,6 +38,7 @@ import tempfile
 LARGE_FILE_BYTES = 5 * 1024 * 1024  # 5 MB
 ALLOWED = ("pass", "warn", "accepted")
 KEEP_RUNS = 20
+KEEP_VERDICTS = 50
 LARGE_HISTORY_COMMITS = 500
 PER_COMMIT_LIMIT = 200
 PATCH_MAX_BYTES = 20 * 1024 * 1024
@@ -158,8 +160,16 @@ def new_run_dir(sdir):
     os.makedirs(path)
     old = sorted(d for d in os.listdir(runs) if os.path.isdir(os.path.join(runs, d)))
     for d in old[:-KEEP_RUNS]:
+        remove_draft_dir(read_kv(os.path.join(runs, d, "prepared")).get("draft_dir", ""))
         shutil.rmtree(os.path.join(runs, d), ignore_errors=True)
     return run_id, path
+
+
+def remove_draft_dir(path):
+    """Remove a report-draft directory created by prepare (only ever one of ours in the temp dir)."""
+    if path and os.path.basename(path).startswith("ravenwatch-") and \
+            os.path.dirname(os.path.realpath(path)) == os.path.realpath(tempfile.gettempdir()):
+        shutil.rmtree(path, ignore_errors=True)
 
 
 # ------------------------------------------------------------------ range logic
@@ -517,7 +527,9 @@ def cmd_prepare(args):
         out.append(f"- note: {n_commits} commits; per-commit patches skipped (over {PER_COMMIT_LIMIT}). "
                    "Split the push or review with --base for per-commit detail.")
     out.append(f"- file list: {os.path.join(cur, 'files.txt')}")
-    out.append(f"- report draft: {report_draft_path(run_id)} (write the report here; `mark --report` files it)")
+    draft_dir = tempfile.mkdtemp(prefix="ravenwatch-")  # private (0700) and unpredictable
+    draft_path = os.path.join(draft_dir, "report.md")
+    out.append(f"- report draft: {draft_path} (write the report here; `mark --report` files it)")
     if mode == "first-push" and n_commits > LARGE_HISTORY_COMMITS:
         out.append(f"- warning: no remote-tracking branch shares history with HEAD, so all {n_commits} commits are "
                    "in range. If part of this history is already public, re-run with --base <ref>.")
@@ -604,8 +616,10 @@ def cmd_prepare(args):
     with open(os.path.join(cur, "context.md"), "w", encoding="utf-8") as fh:
         fh.write(text)
     # Only a run whose scan and context completed can be marked.
+    likely = sum(1 for h in uniq if not h[4])
     write_kv_atomic(os.path.join(cur, "prepared"), [
         f"head={head}", f"diff_base={base}", f"base={covered_base}", f"mode={mode}", f"range={label}",
+        f"likely_secrets={likely}", f"profile={'quick' if args.quick else 'standard'}", f"draft_dir={draft_dir}",
     ])
     write_kv_atomic(os.path.join(sdir, "runs", "latest"), [run_id])
     print(text)
@@ -618,32 +632,33 @@ def cmd_prepare(args):
 REPORT_MAX_BYTES = 2 * 1024 * 1024
 
 
-def report_draft_path(run_id):
-    """Where the review skill writes its report. Outside .git, because Claude Code protects writes there."""
-    return os.path.join(tempfile.gettempdir(), f"ravenwatch-report-{run_id}.md")
-
-
 def store_report(sdir, run_id, head, src):
     """Copy a report draft into <state>/reports/ and return the stored path. Accepts only a plain regular file."""
     src = os.path.abspath(src)
     reports = os.path.join(sdir, "reports")
     if os.path.dirname(src) == os.path.realpath(reports) or os.path.dirname(src) == reports:
         return src
-    st = os.lstat(src)  # raises if missing
-    if not stat.S_ISREG(st.st_mode):
-        raise RuntimeError(f"report {src} is not a regular file")
-    if st.st_size > REPORT_MAX_BYTES:
-        raise RuntimeError(f"report {src} is larger than {REPORT_MAX_BYTES // 1024 // 1024} MB")
+    # Open without following symlinks, then check the opened file itself (no lstat/open race).
+    fd = os.open(src, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    with os.fdopen(fd, "rb") as fh:
+        st = os.fstat(fh.fileno())
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+            raise RuntimeError(f"report {src} is not a plain regular file")
+        if hasattr(os, "getuid") and st.st_uid != os.getuid():
+            raise RuntimeError(f"report {src} is owned by another user")
+        if st.st_size > REPORT_MAX_BYTES:
+            raise RuntimeError(f"report {src} is larger than {REPORT_MAX_BYTES // 1024 // 1024} MB")
+        data = fh.read(REPORT_MAX_BYTES + 1)
     stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M")
     dest = os.path.join(reports, f"{stamp}-{head[:8]}-{run_id}.md")
-    with open(src, "rb") as fh:
-        data = fh.read(REPORT_MAX_BYTES + 1)
     tmp = dest + ".tmp"
     with open(tmp, "wb") as fh:
         fh.write(data)
     os.replace(tmp, dest)
     try:
         os.remove(src)
+        if os.path.basename(os.path.dirname(src)).startswith("ravenwatch-"):
+            os.rmdir(os.path.dirname(src))
     except OSError:
         pass
     return dest
@@ -663,11 +678,17 @@ def cmd_mark(args):
     if prepared["head"] != head:
         raise RuntimeError(f"HEAD moved since this review was prepared (reviewed {prepared['head'][:8]}, "
                            f"now {head[:8]}); the verdict would cover commits nobody reviewed. Review again.")
+    likely = int(prepared.get("likely_secrets", "0") or 0)
+    if args.verdict in ALLOWED and likely and not args.secrets_cleared:
+        raise RuntimeError(f"the deterministic scan found {likely} likely real secret(s) in this range. A push can't "
+                           "be unlocked until each is removed from history and rotated, or the owner confirms they "
+                           "are not credentials (pass --secrets-cleared).")
     lines = [
         f"head={head}",
         f"base={prepared.get('base', '')}",
         f"mode={prepared.get('mode', '')}",
         f"range={prepared.get('range', '')}",
+        f"profile={prepared.get('profile', 'standard')}",
         f"verdict={args.verdict}",
         f"reviewed_at={_dt.datetime.now().astimezone().isoformat(timespec='seconds')}",
         f"run={run_id}",
@@ -682,8 +703,22 @@ def cmd_mark(args):
         print(f"logged verdict '{args.verdict}' for the uncommitted changes; worktree reviews do not unlock the "
               "push gate (commit, then review the commits)")
         return 0
+    if likely and args.secrets_cleared:
+        lines.append(f"secrets_cleared={likely}")
     write_kv_atomic(os.path.join(sdir, "status"), lines)
-    print(f"recorded verdict '{args.verdict}' for {head[:8]} ({prepared.get('range', '')})")
+    # One verdict per reviewed commit, so reviewing another branch doesn't cancel this one.
+    verdicts = os.path.join(sdir, "verdicts")
+    os.makedirs(verdicts, exist_ok=True)
+    write_kv_atomic(os.path.join(verdicts, head), lines)
+    old = sorted(os.listdir(verdicts), key=lambda f: os.path.getmtime(os.path.join(verdicts, f)))
+    for f in old[:-KEEP_VERDICTS]:
+        try:
+            os.remove(os.path.join(verdicts, f))
+        except OSError:
+            pass
+    remove_draft_dir(prepared.get("draft_dir", ""))
+    print(f"recorded verdict '{args.verdict}' for {head[:8]} ({prepared.get('range', '')}, "
+          f"{prepared.get('profile', 'standard')} review)")
     report_line = next((l for l in lines if l.startswith("report=")), None)
     if report_line:
         print(f"report stored at {report_line[len('report='):]}")
@@ -705,8 +740,21 @@ CHECK_OUTPUT_LINES = 120
 CHECK_OUTPUT_BYTES = 20000
 
 
+def _strip_comment(v):
+    """Drop a trailing ` # comment` that is not inside quotes."""
+    quote = None
+    for i, ch in enumerate(v):
+        if quote:
+            quote = None if ch == quote else quote
+        elif ch in "\"'":
+            quote = ch
+        elif ch == "#" and (i == 0 or v[i - 1] in " \t"):
+            return v[:i].rstrip()
+    return v
+
+
 def _scalar(v):
-    v = v.strip()
+    v = _strip_comment(v).strip()
     if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
         return v[1:-1]
     if v.lower() in ("true", "yes"):
@@ -741,7 +789,7 @@ def parse_brief(text):
             if not m:
                 errors.append(f"line {n}: expected `key: value`")
                 continue
-            key, val = m.group(1), m.group(2)
+            key, val = m.group(1), _strip_comment(m.group(2))
             item = None
             if val.startswith("[") and val.endswith("]"):
                 meta[key] = [_scalar(x) for x in val[1:-1].split(",") if x.strip()]
@@ -752,7 +800,7 @@ def parse_brief(text):
         elif key is None:
             errors.append(f"line {n}: indented line outside a key")
         elif line.startswith("- "):
-            rest = line[2:].strip()
+            rest = _strip_comment(line[2:].strip())
             m = re.fullmatch(r"([A-Za-z_][\w-]*)\s*:\s*(.*)", rest)
             if not isinstance(meta.get(key), list):
                 meta[key] = []
@@ -859,6 +907,18 @@ def cmd_trust_brief(args):
     meta, body, errors = parse_brief(data.decode("utf-8", errors="replace"))
     if errors:
         raise RuntimeError("the brief has problems; fix them and approve again:\n  - " + "\n  - ".join(errors))
+    digest = sha256_bytes(data)
+    if not args.approve:
+        # Step 1: show exactly what would take effect. Nothing is stored.
+        print(f"{BRIEF_NAME} — NOT approved yet. This is what approving it would put into effect:")
+        print_brief_summary(meta, body)
+        print(f"\nsha256: {digest}")
+        print(f"To approve exactly this content, the owner runs: ravenwatch.py trust-brief --approve {digest}"
+              + (" --private" if args.private else ""))
+        return 0
+    if args.approve != digest:
+        raise RuntimeError(f"{BRIEF_NAME} changed since it was shown (expected sha256 {args.approve[:12]}…, now "
+                           f"{digest[:12]}…). Show it again with `trust-brief` and approve the new hash.")
     snap, trust = brief_paths(sdir)
     tmp = snap + ".tmp"
     with open(tmp, "wb") as fh:
@@ -877,15 +937,24 @@ def cmd_trust_brief(args):
         print(f"{BRIEF_NAME} is git-ignored for this clone only" + (
             " — but it is already tracked; run `git rm --cached .ravenwatch.md` and commit to stop sharing it"
             if tracked else ""))
-    print(f"approved {BRIEF_NAME} ({len(data)} bytes)")
-    print(f"- checks: {len(meta['checks'])}")
+    print(f"approved {BRIEF_NAME} ({len(data)} bytes, sha256 {digest[:12]}…)")
+    print_brief_summary(meta, body)
+    return 0
+
+
+def print_brief_summary(meta, body):
+    print(f"- checks: {len(meta['checks'])} (they run on your machine with your environment)")
     for c in meta["checks"]:
         print(f"    {c['name']} ({'blocking' if c['blocking'] else 'non-blocking'}, {c['timeout']}s): {c['run']}")
     print(f"- skipped reviewers: {', '.join(meta['skip']) or 'none'}")
+    for k in ("audience", "distribution"):
+        if meta.get(k):
+            print(f"- {k}: {meta[k]}")
     accepted = re.search(r"^##\s*Accepted risks\s*$(.*?)(?=^##\s|\Z)", body, re.M | re.S | re.I)
-    n_acc = len(re.findall(r"^\s*[-*]\s+\S", accepted.group(1), re.M)) if accepted else 0
-    print(f"- accepted risks: {n_acc}")
-    return 0
+    items = re.findall(r"^\s*[-*]\s+(.+)$", accepted.group(1), re.M) if accepted else []
+    print(f"- accepted risks: {len(items)}")
+    for it in items:
+        print(f"    - {it.strip()[:300]}")
 
 
 def brief_context_lines(st, top, cur, files):
@@ -929,6 +998,11 @@ def brief_context_lines(st, top, cur, files):
 # ------------------------------------------------------------------------- checks
 
 
+GENERIC_ASSIGNMENT = re.compile(
+    r"(?i)((?<![A-Za-z0-9_])[\w.-]{0,40}(?:key|secret|token|passw(?:or)?d|pwd|credential)s?[\w.-]{0,20}[\"']?\s*[:=]\s*[\"']?)"
+    r"([^\s\"',;]{6,})")
+
+
 def redact_output(text):
     out = []
     for line in text.splitlines():
@@ -936,29 +1010,69 @@ def redact_output(text):
             if name == "Generic secret assignment":
                 continue
             line = rx.sub(lambda m: redact(m.group(0)), line)
+        line = GENERIC_ASSIGNMENT.sub(lambda m: m.group(1) + redact(m.group(2)), line)
         out.append(line)
     return "\n".join(out)
 
 
-def run_check(cmd, cwd, timeout):
-    env = dict(os.environ, CI="1", FORCE_COLOR="0", NO_COLOR="1")
-    env.pop("RAVENWATCH_DISABLE", None)
-    start = _dt.datetime.now()
-    proc = subprocess.Popen(["/bin/sh", "-c", cmd], cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, env=env, start_new_session=True)
+GIT_SHIM = """#!/bin/sh
+# ravenwatch: git with push disabled, used while owner checks run.
+i=1
+for a in "$@"; do
+  case "$a" in
+    -C|-c|--git-dir|--work-tree|--namespace|--exec-path|--config-env) skip=1; continue ;;
+    -*) continue ;;
+  esac
+  if [ "${skip:-0}" = 1 ]; then skip=0; continue; fi
+  case "$a" in push|send-pack|http-push) echo "ravenwatch: git $a is disabled while checks run" >&2; exit 1 ;; esac
+  break
+done
+exec "%s" "$@"
+"""
+
+_running = {"proc": None}
+
+
+def _kill_group(proc):
     try:
-        raw, _ = proc.communicate(timeout=timeout)
-        status = "pass" if proc.returncode == 0 else "fail"
-    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
+def _on_signal(signum, _frame):
+    proc = _running.get("proc")
+    if proc is not None:
+        _kill_group(proc)
+    raise SystemExit(128 + signum)
+
+
+def run_check(cmd, cwd, timeout, env):
+    """Run one check in its own process group; output goes to a temp file so it can't fill memory."""
+    start = _dt.datetime.now()
+    with tempfile.TemporaryFile() as out:
+        proc = subprocess.Popen(["/bin/sh", "-c", cmd], cwd=cwd, stdin=subprocess.DEVNULL, stdout=out,
+                                stderr=subprocess.STDOUT, env=env, start_new_session=True)
+        _running["proc"] = proc
         try:
-            os.killpg(proc.pid, 9)
-        except OSError:
-            proc.kill()
-        raw, _ = proc.communicate()
-        status = "timeout"
+            proc.wait(timeout=timeout)
+            status = "pass" if proc.returncode == 0 else "fail"
+        except subprocess.TimeoutExpired:
+            status = "timeout"
+        finally:
+            _kill_group(proc)  # also ends background children of a finished check
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            _running["proc"] = None
+        size = out.seek(0, os.SEEK_END)
+        out.seek(max(0, size - CHECK_OUTPUT_BYTES))
+        text = out.read().decode("utf-8", errors="replace")
     secs = (_dt.datetime.now() - start).total_seconds()
-    text = raw.decode("utf-8", errors="replace")
-    tail = "\n".join(text.splitlines()[-CHECK_OUTPUT_LINES:])[-CHECK_OUTPUT_BYTES:]
+    tail = "\n".join(text.splitlines()[-CHECK_OUTPUT_LINES:])
+    if size > CHECK_OUTPUT_BYTES:
+        tail = f"[… {size // 1024} KB of output, last part shown]\n" + tail
     return status, proc.returncode, secs, redact_output(tail)
 
 
@@ -981,29 +1095,61 @@ def cmd_checks(args):
     if not meta["checks"]:
         print("the approved brief lists no checks")
         return 0
+    names = [c["name"] for c in meta["checks"]]
+    unknown = [n for n in (args.only or []) if n not in names]
+    if unknown:
+        raise RuntimeError(f"no approved check named {', '.join(unknown)} (approved: {', '.join(names)})")
+    # Checks run the code in the working tree; only run them on exactly the reviewed commits.
     _, wt = git("status", "--porcelain", check=False)
-    dirty = len([l for l in wt.splitlines() if l.strip()])
-    lines = [f"# Checks for run {run_id}", f"- head: {head}", f"- working tree: "
-             + (f"{dirty} uncommitted change(s) — checks ran against the working tree, not exactly the pushed commits"
-                if dirty else "clean (checks match the reviewed commits)"), ""]
-    summary = []
-    for c in meta["checks"]:
-        if args.only and c["name"] not in args.only:
-            continue
-        status, code, secs, tail = run_check(c["run"], top, c["timeout"])
-        kind = "blocking" if c["blocking"] else "non-blocking"
-        summary.append(f"{c['name']}: {status.upper()} ({kind}, exit {code}, {secs:.0f}s)")
-        lines += [f"## {c['name']} — {status.upper()} ({kind})", f"- command: `{c['run']}`",
-                  f"- exit code: {code}; duration: {secs:.0f}s", "", "```", tail or "(no output)", "```", ""]
+    if wt.strip():
+        raise RuntimeError("the working tree has uncommitted or untracked changes; checks run the files on disk, so "
+                           "commit or stash them first (checks must test exactly the commits being reviewed)")
+    shim_dir = tempfile.mkdtemp(prefix="ravenwatch-git-")
+    real_git = shutil.which("git") or "/usr/bin/git"
+    with open(os.path.join(shim_dir, "git"), "w", encoding="utf-8") as fh:
+        fh.write(GIT_SHIM % real_git)
+    os.chmod(os.path.join(shim_dir, "git"), 0o755)
+    env = dict(os.environ, CI="1", FORCE_COLOR="0", NO_COLOR="1",
+               PATH=shim_dir + os.pathsep + os.environ.get("PATH", ""))
+    env.pop("RAVENWATCH_DISABLE", None)
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, _on_signal)
+
     out_path = os.path.join(runs, run_id, "checks.md")
-    with open(out_path, "w", encoding="utf-8") as fh:
-        fh.write("\n".join(lines))
+    # Each result is appended as soon as it is known; a check that never reports finished must be
+    # treated as failed (the review skill says so). A re-run with --only appends, never erases.
+    fresh = not args.only or not os.path.exists(out_path)
+    with open(out_path, "w" if fresh else "a", encoding="utf-8") as fh:
+        if fresh:
+            fh.write(f"# Checks for run {run_id}\n- head: {head}\n- working tree: clean\n"
+                     "- a check listed as STARTED without a result did not finish: treat it as FAILED\n\n")
+        else:
+            fh.write(f"\n# Run ({_dt.datetime.now().strftime('%H:%M:%S')}): {', '.join(args.only)}\n\n")
+    summary = []
+    try:
+        for c in meta["checks"]:
+            if args.only and c["name"] not in args.only:
+                continue
+            kind = "blocking" if c["blocking"] else "non-blocking"
+            with open(out_path, "a", encoding="utf-8") as fh:
+                fh.write(f"## {c['name']} — STARTED ({kind}, timeout {c['timeout']}s)\n")
+            status, code, secs, tail = run_check(c["run"], top, c["timeout"], env)
+            summary.append(f"{c['name']}: {status.upper()} ({kind}, exit {code}, {secs:.0f}s)")
+            with open(out_path, "a", encoding="utf-8") as fh:
+                fh.write("\n".join([f"## {c['name']} — {status.upper()} ({kind})", f"- command: `{c['run']}`",
+                                    f"- exit code: {code}; duration: {secs:.0f}s", "", "```",
+                                    tail or "(no output)", "```", "", ""]))
+    finally:
+        shutil.rmtree(shim_dir, ignore_errors=True)
     print("checks:")
-    for s in summary:
-        print(f"- {s}")
-    if dirty:
-        print(f"- note: {dirty} uncommitted change(s); results reflect the working tree")
+    for line in summary:
+        print(f"- {line}")
     print(f"output: {out_path}")
+    failed_blocking = [c["name"] for c in meta["checks"] if c["blocking"]
+                       and any(x.startswith(c["name"] + ":") and " PASS " not in x for x in summary)]
+    if failed_blocking:
+        print(f"BLOCKING CHECKS FAILED: {', '.join(failed_blocking)}")
+        return 1
     return 0
 
 
@@ -1116,13 +1262,17 @@ def main():
     p.add_argument("--quick", action="store_true",
                    help="only the core reviewers (bugs, security, loopholes, plus config/dependency checks)")
     m = sub.add_parser("mark")
-    m.add_argument("--verdict", required=True, choices=["pass", "warn", "block", "accepted"])
+    m.add_argument("--verdict", required=True, choices=list(ALLOWED) + ["block"])
     m.add_argument("--run", help="run id printed by prepare (default: the most recent run)")
     m.add_argument("--report")
     m.add_argument("--note")
+    m.add_argument("--secrets-cleared", action="store_true",
+                   help="owner confirms the scan's likely secrets are not credentials (or were removed and rotated)")
     sub.add_parser("status")
     t = sub.add_parser("trust-brief", help="approve the current .ravenwatch.md (owner only)")
     t.add_argument("--private", action="store_true", help="also git-ignore .ravenwatch.md for this clone")
+    t.add_argument("--approve", metavar="SHA256",
+                   help="approve the brief only if its content still has this hash (shown by trust-brief)")
     c = sub.add_parser("checks", help="run the checks listed in the approved brief")
     c.add_argument("--run", help="run id printed by prepare (default: the most recent run)")
     c.add_argument("--only", nargs="+", help="run only these named checks")

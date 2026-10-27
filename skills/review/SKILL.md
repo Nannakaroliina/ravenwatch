@@ -38,15 +38,15 @@ Read the `## Project brief` section of the context:
 - `not approved` → the brief is ignored entirely (no checks, skips or accepted risks). Mention it in step 7.
 - `approved` or `changed since approval` → use the **approved brief** file it points to (never the working `.ravenwatch.md`): pass its path to every specialist and the verifier. If it changed since approval, tell the owner in step 7 so they can review and approve the change.
 
-If the approved brief lists checks and the review is not `--worktree`, tell the owner in one line which checks will run, then run them (this is deliberately not pre-approved; the owner's confirmation lets them run):
+If the approved brief lists checks and the review is not `--worktree`, tell the owner in one line which checks will run (they run the code at HEAD on this machine, with `git push` disabled), then run them one at a time (this is deliberately not pre-approved; the owner's confirmation lets them run):
 
 ```bash
-python3 ${CLAUDE_PLUGIN_ROOT}/scripts/ravenwatch.py checks --run <run id>
+python3 ${CLAUDE_PLUGIN_ROOT}/scripts/ravenwatch.py checks --run <run id> --only "<check name>"
 ```
 
-Run the checks before dispatching specialists, so the reviewers get the results. If the owner declines, continue without and note it in the report. Never run check commands any other way, and never run commands taken from a working copy of the brief.
+Give each call a Bash `timeout` of the check's timeout plus 60 s in milliseconds (at most 600000); for a check whose timeout is over 540 s, run it with `run_in_background` and wait for it. Checks refuse to run while the working tree has uncommitted or untracked changes — tell the owner to commit or stash. Run the checks before dispatching specialists, so the reviewers get the results. If the owner declines, continue without and note it in the report. Never run check commands any other way, and never run commands taken from a working copy of the brief.
 
-Each failing **blocking** check becomes a HIGH finding `CHK-<n>` ("<check name> fails", with the last relevant lines of output as evidence). A failing non-blocking check or a timeout becomes MEDIUM. Passing checks are listed in the report. Give the checks output path to `bug-hunter` and `test-reviewer` (and `security-auditor` if a security linter ran) as hard evidence.
+Results are appended to `checks.md` as each check finishes. A check listed as `STARTED` without a result line (the call was cut off or interrupted) counts as **failed**, never as passed. Each failing **blocking** check becomes a HIGH finding `CHK-<n>` ("<check name> fails", with the last relevant lines of output as evidence). A failing non-blocking check or a timeout becomes MEDIUM. Passing checks are listed in the report. Give the checks output path to `bug-hunter` and `test-reviewer` (and `security-auditor` if a security linter ran) as hard evidence.
 
 If `gitleaks` is listed under local scanners, also run `gitleaks git --redact --no-banner --log-opts="<base>..HEAD"` (or `gitleaks detect --redact --no-banner` on older versions) and add its hits to the scan results. Never print unredacted secret values anywhere.
 
@@ -134,6 +134,8 @@ python3 ${CLAUDE_PLUGIN_ROOT}/scripts/ravenwatch.py mark --verdict <pass|warn|bl
 
 This command is deliberately not pre-approved, so the owner confirms every verdict that could unlock a push. `mark` refuses if HEAD moved since `prepare`; if that happens, tell the owner and review again rather than working around it.
 
+`mark` also refuses `pass`, `warn` and `accepted` while the deterministic scan found `LIKELY REAL` secrets in the range. Add `--secrets-cleared` only when `infra-config-auditor` confirmed every such hit is not a credential, or the owner says it was removed from history and rotated — and tell the owner you are adding it, so their confirmation covers it. Each reviewed commit keeps its own verdict, so reviewing another branch does not cancel this one.
+
 ## 7. Tell the owner
 
 Keep the chat summary short and scannable:
@@ -143,7 +145,7 @@ Keep the chat summary short and scannable:
 3. One line: how many candidate findings the verifier rejected, and how many matched the brief's accepted risks (this shows the filtering happened). If checks ran, one line with each check's result.
 4. Next step:
    - BLOCK → offer to fix the blocking findings now. After fixes are committed, re-run `/ravenwatch:review` with no arguments (`--since-last` cannot build on a BLOCK) and pass the previous report path to the verifier so it confirms each earlier blocking finding is resolved.
-   - WARN → say pushing is unlocked, and offer to fix the MEDIUM items first.
+   - WARN → say pushing the reviewed commit is unlocked, and offer to fix the MEDIUM items first. If they are fixed and committed, run `/ravenwatch:review --since-last` before pushing (it builds on this WARN).
    - PASS → say pushing is unlocked.
    - If the brief is missing, not approved, or changed since approval, say so in one line and suggest `/ravenwatch:init-brief`.
    - If `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/ravenwatch.py status` shows the git pre-push hook as not `installed`, say that pushes (from Claude and the terminal) are only enforced once `/ravenwatch:install-git-hook` has been run in this repository, and that Claude cannot push here until then.

@@ -93,7 +93,7 @@ skip: []            # optional: impact-analyzer, ux-reviewer, test-reviewer, des
 - WINTER discount code is public on purpose (marketing), public/book.js — 2026-10-27
 ```
 
-**Only a version you approve counts.** Approving (`trust-brief`, which Claude asks you to confirm) stores a snapshot inside `.git/ravenwatch/`. Checks always run from that snapshot, so nobody — including Claude — can add a command, skip a reviewer or accept a risk by editing the file; the review tells you when the file differs from what you approved. Checks run with `CI=1`, a timeout and redacted output, and each run asks for your confirmation first. Accepted risks only cover the specific issue and place they name, never CRITICAL findings or leaked credentials.
+**Only a version you approve counts.** Approving is two steps: `trust-brief` shows every check command, skipped reviewer, the audience and each accepted risk in full, plus a content hash; `trust-brief --approve <hash>` (which Claude asks you to confirm) stores that exact content as a snapshot inside `.git/ravenwatch/`, and refuses if the file changed in between. Checks always run from that snapshot, so nobody — including Claude — can add a command, skip a reviewer or accept a risk by editing the file; the review tells you when the file differs from what you approved. Checks run the code at HEAD (they refuse to run with uncommitted changes), with `CI=1`, a timeout, `git push` disabled and redacted output; each run asks for your confirmation first, and results are saved as each check finishes. Accepted risks only cover the specific issue and place they name, never CRITICAL findings or leaked credentials.
 
 For public repos, keep the brief private (`init-brief` offers this): a committed brief tells everyone which risks you've accepted. Private means git-ignored in this clone only.
 
@@ -121,7 +121,9 @@ Optional: if [gitleaks](https://github.com/gitleaks/gitleaks), `osv-scanner`, `p
 3. BLOCK → ask Claude to fix the findings, commit, then `/ravenwatch:review` again.
 4. Push.
 
-If you deliberately want to push despite a BLOCK, tell Claude you accept the risk; it records your reason. Confirmed leaked credentials can't be accepted this way — rotate them first.
+If you deliberately want to push despite a BLOCK, tell Claude you accept the risk; it records your reason. Confirmed leaked credentials can't be accepted this way — rotate them first. A verdict can't unlock a push while the secret scan has likely-real hits, unless you confirm they aren't credentials (`--secrets-cleared`).
+
+Each reviewed commit keeps its own verdict, so you can review two branches and push both. Only a reviewed commit can be pushed as a new branch or tag tip.
 
 ## Escape hatches
 
@@ -139,13 +141,13 @@ Everything lives inside the repository's `.git/ravenwatch/` folder, so nothing i
 
 - The reviewers are AI models: they reduce risk, they don't certify code as safe. Keep tests, dependency updates and secret scanning in CI too.
 - The gate checks that the commit you push was reviewed; it does not stop you editing history afterwards.
-- Everything here runs on your machine. The git hook can't be fooled about *what* is pushed, but a determined agent with shell access could still disable it in a way the Claude guard doesn't recognise (for example a script that rewrites the hook). For a guarantee, also protect the branch on GitHub (required reviews or status checks).
-- The Claude guard matches command text broadly, so it occasionally refuses a harmless command (for example one that mentions `.git/hooks`). Reword it, or read files with the Read tool. Pushes from Claude have to be plain `git push …` / `git -C <dir> push …` commands — not inside `$(…)`, backticks, `sh -c`, `find -exec`, `xargs` or `git submodule foreach`.
+- **The Claude guard is best-effort, not a security boundary.** Everything here runs on your machine, and Claude runs as you. The git hook can't be fooled about *what* is pushed, but the hook and its verdict files are ordinary files: the guard refuses the ways to reach them that it recognises (writes inside any git directory, moving `.git`, hook-skipping flags and settings), yet an agent determined to get around it can find shell constructs it doesn't parse, or write a script that does the work. For a guarantee, protect the branch on GitHub (required reviews or status checks) — that is the real enforcement; ravenwatch is the review and the early warning.
+- The Claude guard matches command text broadly, so it occasionally refuses a harmless command (for example one that names a path inside `.git`). Reword it, or read files with the Read tool. Pushes from Claude have to be plain `git push …` / `git -C <dir> push …` commands — not inside `$(…)`, backticks, `sh -c`, `find -exec`, `xargs` or `git submodule foreach`.
 - Recording a verdict always asks for your permission, so a review can't unlock the gate on its own.
 - The git hook asks the remote which branches and tags it already has (`git ls-remote`), so pushing needs the remote to be reachable — as it does anyway. Commits that exist only in other refs (such as GitHub `refs/pull/*`) still need a review before you push them to a branch.
 - The git hook refuses pushes it can't verify: tags pointing at trees or blobs, `--receive-pack`/`remote.<name>.receivepack` overrides, and URL rewriting that sends its check somewhere other than the push.
 - Repositories whose `pre-push` hook is managed by Husky, lefthook or pre-commit aren't supported yet; `install-hook` refuses rather than silently disabling your existing checks.
-- Recursive submodule pushes (`--recurse-submodules`, `push.recurseSubmodules=on-demand`) are refused from Claude, because each submodule has its own hooks.
+- Recursive submodule pushes (`--recurse-submodules`, `push.recurseSubmodules=on-demand`) are refused — from Claude and from the terminal hook — because each submodule has its own hooks. Push each submodule from inside it.
 - Only the reviewed commit itself can be pushed as a new branch or tag tip. Earlier commits in the reviewed range go out as history, not as tips (the reviewers see each commit's own changes, but a tip is what CI runs).
 - If the remote has commits you haven't fetched, the hook may not be able to tell your already-published history apart from new commits; it then tells you to `git fetch` first.
 - Publishing through a hosting API (for example `gh api` writing file contents) doesn't involve `git push`, so no local gate sees it. Server-side branch protection covers that too.
@@ -157,9 +159,12 @@ Everything lives inside the repository's `.git/ravenwatch/` folder, so nothing i
 .claude-plugin/   plugin.json (the plugin) + marketplace.json (lets this repo be added as a marketplace)
 agents/           the twelve reviewer agents
 skills/           /ravenwatch:review, /ravenwatch:init-brief and /ravenwatch:install-git-hook
-hooks/            the Claude Code push gate
-scripts/          ravenwatch.py (range, scan, verdicts) and the git pre-push hook
+hooks/            the Claude Code guard
+scripts/          ravenwatch.py (range, scan, verdicts, brief, checks) and the git pre-push hook
+tests/            end-to-end tests for the gate, guard, brief and checks: sh tests/run.sh
 ```
+
+The tests build throwaway repositories under `$TMPDIR` and only push to throwaway bare remotes there; `tests/run.sh` exits non-zero if any check fails.
 
 ## License
 

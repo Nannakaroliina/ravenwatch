@@ -19,6 +19,7 @@ command, a miss costs an unreviewed push. Set RAVENWATCH_DISABLE=1 in Claude
 Code's environment to turn the gate off.
 """
 
+import glob
 import json
 import os
 import re
@@ -44,8 +45,8 @@ BYPASS = [
     (re.compile(r"receive-?pack|upload-?pack|insteadof", re.I),
      "overriding how git reaches the remote can make the review hook check a different repository"),
     (re.compile(r"RAVENWATCH_DISABLE", re.I), "RAVENWATCH_DISABLE is for the owner to set, not for a command"),
-    (re.compile(r"-{1,2}(?:separate-)?git-dir|GIT_DIR|GIT_COMMON_DIR|--work-tree|GIT_WORK_TREE|absorbgitdirs"
-                r"|worktree\s+move", re.I),
+    (re.compile(r"(?i:-{1,2}(?:separate-)?git-dir|--work-tree|absorbgitdirs|worktree\s+move)"
+                r"|\bGIT_(?:DIR|COMMON_DIR|WORK_TREE)\b"),
      "pointing git at, or moving, a git directory puts its hooks and verdict state out of the gate's sight"),
     (re.compile(r"include\.path|includeif", re.I), "git config includes can pull in aliases or settings that skip the hook"),
     (re.compile(r"config\b(?![^\n;&|]*--get)[^\n;&|]*\balias\.|(?:^|\s)-c\s*alias\.", re.I),
@@ -74,7 +75,13 @@ REDIRECT = re.compile(r"^[<>&]+$")
 # Programs that run a command given to them as a string or argument list.
 EXECUTORS = {"sh", "bash", "zsh", "dash", "ksh", "fish", "env", "xargs", "eval", "exec", "command", "nohup", "time",
              "timeout", "watch", "find", "parallel", "sudo", "doas", "nice", "stdbuf", "script", "builtin"}
-CAT_HEREDOC = re.compile(r"\bcat\s+<<-?\s*(['\"]?)(\w+)\1[^\n]*\n.*?\n[ \t]*\2[ \t]*(?=\n|\)|$)", re.S)
+# A `cat` heredoc. Its body is only dropped when the rest of its first line is just redirections:
+# `cat <<EOF | sh` or `cat <<EOF && git push` keep the body, which is then checked as commands.
+CAT_HEREDOC = re.compile(r"\bcat\s+<<-?\s*(['\"]?)(\w+)\1([^\n]*)\n.*?\n[ \t]*\2[ \t]*(?=\n|\)|$)", re.S)
+HARMLESS_REST = re.compile(r"[\s\"')]*(?:\d*>>?\s*[^\s;&|()]+[\s\"')]*)*")
+REPORTS_PATH = re.compile(r"/ravenwatch/reports(?:/|$)")
+# ravenwatch state file names, wherever they are written (a directory may become a git dir later).
+STATE_NAME = re.compile(r"/ravenwatch/(?:status|latest|brief-approved\.md|brief-trust|verdicts/|runs/[^/]+/prepared$)")
 # git subcommands that can run arbitrary commands (and so a push the gate can't see).
 RUNS_COMMANDS = {"submodule", "bisect", "rebase", "filter-branch", "filter-repo", "for-each-repo", "difftool",
                  "mergetool", "worktree"}
@@ -134,49 +141,63 @@ def recurses_into_submodules(repo):
 
 
 def git_dir_of(path):
-    """The git directory that path is inside of (not a work tree: the git directory itself), else None."""
-    d = os.path.realpath(path)
-    while not os.path.isdir(d):
+    """The git directory that path is (or would be) inside of, else None. Filesystem only, no git calls:
+    a `.git` path component (even if it doesn't exist yet), or an existing ancestor that has a git
+    directory's layout (HEAD, objects/, refs/) — which also covers bare, moved and separate git dirs."""
+    full = os.path.realpath(path)
+    m = GIT_DIR_PATH.search(full)
+    if m:
+        return full[:m.start() + 5]
+    d = full
+    while True:
+        if os.path.isfile(os.path.join(d, "HEAD")) and os.path.isdir(os.path.join(d, "objects")) \
+                and os.path.isdir(os.path.join(d, "refs")):
+            return d
         parent = os.path.dirname(d)
         if parent == d:
             return None
         d = parent
-    if GIT_DIR_PATH.search(d):
-        return d
-    try:
-        code, inside = git(d, "rev-parse", "--is-inside-git-dir")
-        if code == 0 and inside == "true":
-            return git(d, "rev-parse", "--absolute-git-dir")[1] or d
-    except (OSError, subprocess.SubprocessError):
-        return d  # can't tell: treat as inside
-    return None
 
 
 def segments(command):
-    """Split a command into simple commands (token lists), honouring quotes. None if it can't be parsed."""
-    out, quote, escaped = [], None, False
-    for ch in command:  # unquoted newlines separate commands too
+    """Split a command into simple commands (token lists) and redirect targets, honouring quotes,
+    comments and line continuations like the shell does. None if it can't be parsed."""
+    out, quote, escaped, i, n = [], None, False, 0, len(command)
+    while i < n:
+        ch = command[i]
         if escaped:
             escaped = False
         elif ch == "\\" and quote != "'":
+            if command[i + 1:i + 2] == "\n":  # line continuation: the shell joins the lines
+                i += 2
+                continue
             escaped = True
         elif quote:
             quote = None if ch == quote else quote
         elif ch in "'\"":
             quote = ch
+        elif ch == "#" and (not out or out[-1] in " \t;&|()"):
+            i = command.find("\n", i)  # a comment runs to the end of its line only
+            if i < 0:
+                break
+            continue
         elif ch == "\n":
-            ch = ";"
+            ch = ";"  # unquoted newlines separate commands
         out.append(ch)
+        i += 1
     lexer = shlex.shlex("".join(out), posix=True, punctuation_chars=True)
     lexer.whitespace_split = True
+    lexer.commenters = ""
     try:
         tokens = list(lexer)
     except ValueError:
         return None
-    segs, cur, skip = [], [], False
+    segs, cur, redirects, skip = [], [], [], False
     for tok in tokens:
         if skip:
             skip = False
+            if not tok.isdigit():
+                redirects.append(tok)
             continue
         if tok in SEPARATORS:
             if cur:
@@ -190,7 +211,7 @@ def segments(command):
             cur.append(tok)
     if cur:
         segs.append(cur)
-    return segs
+    return segs, redirects
 
 
 def parse_git(seg):
@@ -212,11 +233,34 @@ def parse_git(seg):
     return cdir, globs, sub, seg[i + 1:]
 
 
-def resolve(base, target):
-    if base is None or any(ch in target for ch in "$`*?") or target.startswith("-"):
+def expand(base, target):
+    """All paths a shell word could refer to, relative to base (globs expanded). None if unknowable."""
+    if base is None or any(ch in target for ch in "$`") or target.startswith("-"):
         return None
     target = os.path.expanduser(target)
-    return target if os.path.isabs(target) else os.path.normpath(os.path.join(base, target))
+    full = target if os.path.isabs(target) else os.path.join(base, target)
+    if any(ch in target for ch in "*?["):
+        # Like the shell: a pattern that matches nothing is passed on literally.
+        return [os.path.normpath(p) for p in glob.glob(full)] or [os.path.normpath(full)]
+    return [os.path.normpath(full)]
+
+
+def resolve(base, target):
+    """The single directory a `cd` target refers to, or None if it is unknowable or ambiguous."""
+    paths = expand(base, target)
+    return paths[0] if paths is not None and len(paths) == 1 else None
+
+
+def touches_git_dir(base, words):
+    """The first word (path or redirect target) that refers to something inside a git directory."""
+    for w in words:
+        if "/" not in w and not any(ch in w for ch in "*?[") and w not in (".git", ".GIT"):
+            continue
+        for p in expand(base, w) or []:
+            gdir = git_dir_of(p)
+            if gdir and not REPORTS_PATH.search(p):
+                return w
+    return None
 
 
 def alias_of(repo, sub):
@@ -239,17 +283,23 @@ def check_bash(command, cwd):
     if git_dir_of(cwd) and not PLAIN_CD.match(command):
         return ("the shell's working directory is inside a git directory, where commands can reach the hooks and "
                 "verdict state. `cd` back to the work tree first.")
-    if not (may_push(command) or GIT_WORD.search(command)):
-        return None
-
-    # The body of a `cat` heredoc is data (Claude's usual way to pass a commit message), not commands.
-    command = CAT_HEREDOC.sub("cat", command)
+    # The body of a `cat` heredoc is data (Claude's usual way to pass a commit message), not commands —
+    # unless the rest of its first line feeds it somewhere or chains another command.
+    command = CAT_HEREDOC.sub(
+        lambda m: "cat" + m.group(3) if HARMLESS_REST.fullmatch(m.group(3)) else m.group(0), command)
     pushing = may_push(command)
     if pushing and re.search(r"`|\$\(|<\(|>\(", command):
         return "a push inside command substitution can't be checked. Run `git push` as its own command."
-    segs = segments(command)
-    if segs is None:
+    parsed_cmd = segments(command)
+    if parsed_cmd is None:
         return "could not parse this command. Run `git push` as its own plain command." if pushing else None
+    segs, redirects = parsed_cmd
+    if touches_git_dir(cwd, redirects):
+        return ("this command writes inside a git directory (hooks, config or ravenwatch state). "
+                "Install or remove the hook with /ravenwatch:install-git-hook.")
+    if not (pushing or GIT_WORD.search(command) or any("/" in w or "*" in w or ".git" in w.lower()
+                                                       for s in segs for w in s)):
+        return None
 
     here = cwd
     for seg in segs:
@@ -263,7 +313,15 @@ def check_bash(command, cwd):
         if head in ("cd", "pushd"):
             args = [a for a in seg[1:] if a != "--"]
             here = resolve(here, args[0] if args else "~") if len(args) <= 1 else None
+            if here is not None and git_dir_of(here):
+                return ("this command changes into a git directory, where it can reach the hooks and verdict "
+                        "state. Read files there with the Read tool.")
             continue
+        # Paths given to other programs (cp, printf >, rm …); git's own arguments may name repositories.
+        word = None if os.path.basename(seg[0]) == "git" else touches_git_dir(here, seg[1:])
+        if word:
+            return (f"`{word}` is inside a git directory (hooks, config or ravenwatch state). Read files there with "
+                    "the Read tool; install or remove the hook with /ravenwatch:install-git-hook.")
         parsed = parse_git(seg)
         seg_text = " ".join(seg)
         if parsed is None:
@@ -329,9 +387,8 @@ def check_write(path, texts, cwd):
     if GITCONFIG_FILE.search(full):
         return "this is a git config file; changes there could skip or redirect the review hook. Ask the owner."
     gdir = git_dir_of(full)
-    if gdir:
-        parent = os.path.dirname(full)
-        if os.path.basename(parent) == "reports" and os.path.basename(os.path.dirname(parent)) == "ravenwatch":
+    if gdir or STATE_NAME.search(full):
+        if REPORTS_PATH.search(os.path.dirname(full)):
             return None  # review reports are records, not state the hook reads
         return ("this file is inside a git directory (hooks, config or ravenwatch verdict state). Verdicts are "
                 "recorded only by the review skill; hooks are managed with /ravenwatch:install-git-hook.")
@@ -360,9 +417,11 @@ def main():
         else:
             reason = None
     except Exception as exc:
-        # Fail closed only for pushes and writes; never brick unrelated commands.
+        # Fail closed only for pushes and for writes to git-looking paths; never brick unrelated tools.
         reason = None
-        if tool != "Bash" or may_push(inp.get("command") or ""):
+        target = str(inp.get("file_path") or inp.get("notebook_path") or "")
+        if (tool == "Bash" and may_push(inp.get("command") or "")) or \
+                (tool != "Bash" and re.search(r"(?i)\.git\b|ravenwatch|hooks", target)):
             reason = (f"internal error while checking this ({type(exc).__name__}: {exc}). "
                       "Start Claude Code with RAVENWATCH_DISABLE=1 to bypass the gate if this persists.")
     if reason:
