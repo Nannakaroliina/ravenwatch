@@ -1,0 +1,19 @@
+{
+  "name": "ravenwatch",
+  "version": "0.1.0",
+  "description": "Pre-push code review for solo developers: a team of specialist agents hunts for bugs, loopholes and security issues in your unpushed commits, a skeptical verifier filters out false alarms, and a push gate stops git push until the review passes.",
+  "author": {
+    "name": "Nanna Karoliina"
+  },
+  "license": "MIT",
+  "keywords": [
+    "code-review",
+    "security",
+    "pre-push",
+    "git",
+    "bugs",
+    "secrets"
+  ],
+  "homepage": "https://github.com/Nannakaroliina/ravenwatch",
+  "repository": "https://github.com/Nannakaroliina/ravenwatch"
+}

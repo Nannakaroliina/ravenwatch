@@ -1,0 +1,17 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+
+# Editors
+.vscode/
+.idea/
+*.swp
+
+# Local secrets and env files (never commit these)
+.env
+.env.*
+*.pem
+*.key

@@ -1,0 +1,12 @@
+{
+  "name": "ravenwatch",
+  "description": "Pre-push code review for solo developers.",
+  "owner": { "name": "Nanna Karoliina" },
+  "plugins": [
+    {
+      "name": "ravenwatch",
+      "source": ".",
+      "description": "A team of specialist agents reviews your unpushed commits for bugs, loopholes and security issues, and a push gate holds git push until the review passes."
+    }
+  ]
+}
