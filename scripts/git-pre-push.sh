@@ -64,9 +64,10 @@ check_target() {
   done
   args=$(ps -ww -o args= -p "$PPID" 2>/dev/null)
   [ -n "$args" ] || fail "could not inspect the push command (ps is unavailable), so the push target cannot be verified."
-  # git accepts abbreviations: --rece[ive-pack], --ex[ec].
-  if printf '%s\n' "$args" | grep -Eq -- '(^|[[:space:]])--(rece[a-z-]*|exe?c?)([=[:space:]]|$)'; then
-    fail "this push overrides the receive-pack command, so it may not go to $shown_url; the gate cannot check it."
+  # git accepts abbreviations: --e[xec], --rec[eive-pack], and --rec[urse-submodules] pushes submodules
+  # through their own hooks.
+  if printf '%s\n' "$args" | grep -Eq -- '(^|[[:space:]])--(e[a-z]*|rec[a-z-]*)([=[:space:]]|$)'; then
+    fail "this push overrides the receive command or recurses into submodules, so the gate cannot check it."
   fi
   listed=$(git ls-remote --get-url "$remote_url" 2>/dev/null)
   if [ "$listed" != "$remote_url" ]; then
@@ -74,7 +75,9 @@ check_target() {
   fi
   path=${remote_url#file://}
   if [ -d "$path" ]; then
-    theirs=$(git -C "$path" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
+    # git exports GIT_DIR to hooks in worktrees and submodules; it would override -C.
+    theirs=$(unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE GIT_PREFIX
+      git -C "$path" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
     ours=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
     [ -n "$theirs" ] && [ "$theirs" = "$ours" ] && fail "the push target $shown_url is this repository itself."
   fi

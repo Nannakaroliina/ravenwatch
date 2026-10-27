@@ -52,7 +52,7 @@ A code reviewer for people who work alone. Before anything reaches GitHub, a tea
 | `/ravenwatch:init-brief` | Drafts the project brief from your repo (stack, commands, routes, data), asks you a few questions, and asks you to approve it. `--update` edits an existing brief, e.g. to accept a risk permanently. |
 | `/ravenwatch:install-git-hook` | Installs the git `pre-push` hook in the current repo. This hook is the real gate: git hands it the exact commits being pushed, it asks the remote what it already has, and it requires every new commit to be covered by a PASS, WARN or owner-accepted review. Works for pushes from Claude, the terminal or any app. `--uninstall` removes it. |
 | 12 agents | The eleven specialists above plus `finding-verifier`. All are read-only and never run your code; only the checks you approve in the brief are run. |
-| Claude guard hook | Keeps Claude from getting around the git hook: refuses Claude's pushes in repos where the hook isn't installed, refuses `--no-verify`, hooks-path overrides, `send-pack` and similar, and refuses edits to `.git/hooks`, `.git/config` and the verdict state. |
+| Claude guard hook | Keeps Claude from getting around the git hook: a push must be a plain `git push` command of its own, in a repo where the hook is installed; refuses `--no-verify`, hooks-path overrides, `send-pack`, receive-pack overrides and similar; refuses writes inside any git directory (except review reports), moving a `.git` directory, and edits to git config files. |
 
 ## What blocks a push
 
@@ -140,7 +140,7 @@ Everything lives inside the repository's `.git/ravenwatch/` folder, so nothing i
 - The reviewers are AI models: they reduce risk, they don't certify code as safe. Keep tests, dependency updates and secret scanning in CI too.
 - The gate checks that the commit you push was reviewed; it does not stop you editing history afterwards.
 - Everything here runs on your machine. The git hook can't be fooled about *what* is pushed, but a determined agent with shell access could still disable it in a way the Claude guard doesn't recognise (for example a script that rewrites the hook). For a guarantee, also protect the branch on GitHub (required reviews or status checks).
-- The Claude guard matches command text broadly, so it occasionally refuses a harmless command (for example one that mentions `.git/hooks`). Reword it, or read files with the Read tool.
+- The Claude guard matches command text broadly, so it occasionally refuses a harmless command (for example one that mentions `.git/hooks`). Reword it, or read files with the Read tool. Pushes from Claude have to be plain `git push …` / `git -C <dir> push …` commands — not inside `$(…)`, backticks, `sh -c`, `find -exec`, `xargs` or `git submodule foreach`.
 - Recording a verdict always asks for your permission, so a review can't unlock the gate on its own.
 - The git hook asks the remote which branches and tags it already has (`git ls-remote`), so pushing needs the remote to be reachable — as it does anyway. Commits that exist only in other refs (such as GitHub `refs/pull/*`) still need a review before you push them to a branch.
 - The git hook refuses pushes it can't verify: tags pointing at trees or blobs, `--receive-pack`/`remote.<name>.receivepack` overrides, and URL rewriting that sends its check somewhere other than the push.

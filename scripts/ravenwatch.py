@@ -39,6 +39,10 @@ ALLOWED = ("pass", "warn", "accepted")
 KEEP_RUNS = 20
 LARGE_HISTORY_COMMITS = 500
 PER_COMMIT_LIMIT = 200
+PATCH_MAX_BYTES = 20 * 1024 * 1024
+# Generated lockfiles: huge, rarely reviewable line by line; manifests still show dependency changes.
+LOCKFILES = ["package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml", "bun.lockb", "poetry.lock",
+             "Pipfile.lock", "uv.lock", "Cargo.lock", "Gemfile.lock", "composer.lock", "go.sum"]
 
 # --------------------------------------------------------------------------- git
 
@@ -61,6 +65,21 @@ def git_ok(*args):
     return code == 0
 
 
+def write_capped(path, max_bytes, lines):
+    """Write lines to path until max_bytes; return True if the output was cut short."""
+    written = 0
+    with open(path, "w", encoding="utf-8") as fh:
+        for line in lines:
+            data = line + "\n"
+            written += len(data.encode("utf-8"))
+            if written > max_bytes:
+                fh.write(f"\n[ravenwatch: truncated at {max_bytes // 1024 // 1024} MB]\n")
+                lines.close()
+                return True
+            fh.write(data)
+    return False
+
+
 def git_to_file(path, *args):
     """Stream git output straight to a file instead of holding it in memory."""
     with open(path, "w", encoding="utf-8") as fh:
@@ -78,11 +97,16 @@ def git_lines(*args):
         try:
             for line in proc.stdout:
                 yield line.rstrip("\n")
-        finally:
+        except GeneratorExit:
+            # The caller stopped early (e.g. a size cap): end git quietly instead of reporting a failure.
+            proc.kill()
             proc.stdout.close()
-            if proc.wait() != 0:
-                err.seek(0)
-                raise RuntimeError(f"git {' '.join(args)} failed: {err.read().strip()[:500]}")
+            proc.wait()
+            raise
+        proc.stdout.close()
+        if proc.wait() != 0:
+            err.seek(0)
+            raise RuntimeError(f"git {' '.join(args)} failed: {err.read().strip()[:500]}")
 
 
 def state_dir():
@@ -180,8 +204,14 @@ def upstream_exists():
     _, merge = git("config", "--get", f"branch.{branch}.merge", check=False)
     if not (branch and remote and merge) or remote == ".":
         return True
-    code, out = git("ls-remote", "--heads", remote, merge, check=False)
-    return code != 0 or bool(out)
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+    try:
+        res = subprocess.run(["git", "ls-remote", "--heads", remote, merge], capture_output=True, text=True,
+                             stdin=subprocess.DEVNULL, env=env, timeout=15)
+    except subprocess.TimeoutExpired:
+        print(f"note: {remote} did not answer within 15s; assuming the upstream branch still exists.")
+        return True
+    return res.returncode != 0 or bool(res.stdout.strip())
 
 
 def push_range():
@@ -387,6 +417,7 @@ def cmd_prepare(args):
     # Diff, file list, commits
     n_commits = 0
     commits_path = None
+    patch_truncated = False
     touched = ""
     if mode == "worktree":
         git_to_file(diff_path, "diff", "HEAD", "--no-color", "--no-ext-diff", "-U8")
@@ -401,11 +432,13 @@ def cmd_prepare(args):
         rng = "HEAD" if base == empty_tree() else f"{base}..HEAD"
         n_commits = int(git("rev-list", "--count", rng))
         commits = git("log", "--no-color", "--format=%h %s", "-n", "50", rng)
-        touched = git("log", "--format=%H", "-n", "1", rng, "--", ".")
+        # --full-history: changes made and undone on a merged side branch still count.
+        touched = git("log", "--full-history", "--format=%H", "-n", "1", rng, "--", ".")
         if 1 < n_commits <= PER_COMMIT_LIMIT:
             commits_path = os.path.join(cur, "commits.patch")
-            git_to_file(commits_path, "log", "-p", "--reverse", "--no-color", "--no-ext-diff",
-                        "--format=commit %H%n%s%n", rng)
+            patch_truncated = write_capped(commits_path, PATCH_MAX_BYTES, git_lines(
+                "log", "-p", "--reverse", "--no-color", "--no-ext-diff", "--format=commit %H%n%s%n", rng,
+                "--", ".", *(f":(exclude,glob)**/{p}" for p in LOCKFILES)))
 
     files = []
     for line in names.splitlines():
@@ -477,7 +510,9 @@ def cmd_prepare(args):
     out.append(f"- diff file: {diff_path}")
     if commits_path:
         out.append(f"- per-commit patches: {commits_path} (changes made and later undone inside the range "
-                   "only show up here)")
+                   "only show up here; lockfiles left out"
+                   + (f"; truncated at {PATCH_MAX_BYTES // 1024 // 1024} MB — split the push for full detail)"
+                      if patch_truncated else ")"))
     elif n_commits > PER_COMMIT_LIMIT:
         out.append(f"- note: {n_commits} commits; per-commit patches skipped (over {PER_COMMIT_LIMIT}). "
                    "Split the push or review with --base for per-commit detail.")
