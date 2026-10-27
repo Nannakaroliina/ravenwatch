@@ -23,6 +23,7 @@ import datetime as _dt
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -252,6 +253,25 @@ def classify(path):
     return "other"
 
 
+# Secondary tags used to decide which reviewers run. A file can carry several.
+SIGNAL_RULES = [
+    ("ui", re.compile(r"\.(jsx|tsx|vue|svelte|astro|html?|css|scss|sass|less|styl|hbs|handlebars|njk|ejs|erb|liquid|mjml|"
+                      r"twig|jinja2?|swift|xib|storyboard)$|(^|/)(components?|pages|views|templates|layouts|screens|ui|"
+                      r"styles?|emails?|public|static|locales?|i18n)/", re.I)),
+    ("migration", re.compile(r"(^|/)(migrations?|migrate|alembic|drizzle|prisma)/|schema\.(sql|prisma|graphql|gql)$|"
+                             r"\.migration\.[a-z]+$|(^|/)db/schema\.rb$", re.I)),
+    ("api", re.compile(r"(^|/)(routes?|api|handlers?|controllers?|endpoints?|resolvers?|webhooks?|functions)/|"
+                       r"openapi|swagger|\.proto$|\.graphql$|\.gql$|(^|/)(server|worker|index|app|main)\.(js|ts|mjs|py|go)$",
+                       re.I)),
+    ("env", re.compile(r"(^|/)(\.env\.example|\.env\.sample|\.dev\.vars\.example|wrangler\.(toml|jsonc?)|"
+                       r"serverless\.ya?ml|docker-compose[^/]*\.ya?ml)$", re.I)),
+]
+
+
+def signals_for(path):
+    return [name for name, rx in SIGNAL_RULES if rx.search(path)]
+
+
 # ------------------------------------------------------------------ secret scan
 
 SECRET_PATTERNS = [
@@ -434,6 +454,7 @@ def cmd_prepare(args):
         out.append(f"- note: {n_commits} commits; per-commit patches skipped (over {PER_COMMIT_LIMIT}). "
                    "Split the push or review with --base for per-commit detail.")
     out.append(f"- file list: {os.path.join(cur, 'files.txt')}")
+    out.append(f"- report draft: {report_draft_path(run_id)} (write the report here; `mark --report` files it)")
     if mode == "first-push" and n_commits > LARGE_HISTORY_COMMITS:
         out.append(f"- warning: no remote-tracking branch shares history with HEAD, so all {n_commits} commits are "
                    "in range. If part of this history is already public, re-run with --base <ref>.")
@@ -447,6 +468,7 @@ def cmd_prepare(args):
             out.append("- note: untracked files are not in the diff; read them directly if relevant: "
                        + ", ".join(untracked.splitlines()[:20]))
     out.append(f"- local scanners available: {', '.join(tools) if tools else 'none'}")
+    out.append(f"- profile: {'quick (core security/bug/loophole reviewers only)' if args.quick else 'standard'}")
     out.append("")
     out.append("## Files by category")
     for c in ["code", "test", "manifest", "config", "ci", "container", "iac", "secret-file", "docs", "asset", "other"]:
@@ -454,6 +476,35 @@ def cmd_prepare(args):
             shown = cats[c][:40]
             more = f" … and {len(cats[c]) - 40} more" if len(cats[c]) > 40 else ""
             out.append(f"- {c} ({len(cats[c])}): " + ", ".join(shown) + more)
+
+    # Signals for reviewer triage
+    sig = {}
+    for status, path in files:
+        for s in signals_for(path):
+            sig.setdefault(s, []).append(path)
+    deleted = [p for s, p in files if s == "D"]
+    code_changed = len(cats.get("code", []))
+    tests_changed = len(cats.get("test", []))
+    code_lines = sum(int(sizes.get(p, ("0", "0"))[0]) + int(sizes.get(p, ("0", "0"))[1])
+                     for p in cats.get("code", []) if sizes.get(p, ("-",))[0].isdigit())
+    out.append("")
+    out.append("## Signals")
+    labels = {"ui": "ui / user-facing", "migration": "schema / migration", "api": "api / routes / entry points",
+              "env": "environment / deploy config"}
+    for s in ["ui", "migration", "api", "env"]:
+        if s in sig:
+            shown = sig[s][:20]
+            more = f" … and {len(sig[s]) - 20} more" if len(sig[s]) > 20 else ""
+            out.append(f"- {labels[s]} ({len(sig[s])}): " + ", ".join(shown) + more)
+    if deleted:
+        out.append(f"- deleted files ({len(deleted)}): " + ", ".join(deleted[:20]))
+    new_code = [p for s, p in files if s == "A" and classify(p) == "code"]
+    if new_code:
+        out.append(f"- new code files ({len(new_code)}): " + ", ".join(new_code[:20]))
+    out.append(f"- code lines changed: {code_lines}; code files: {code_changed}; test files: {tests_changed}"
+               + (" (code changed without any test changes)" if code_changed and not tests_changed else ""))
+    if not (sig or deleted or code_changed):
+        out.append("- none")
     if commits:
         out.append("")
         out.append("## Commits")
@@ -496,6 +547,40 @@ def cmd_prepare(args):
 # -------------------------------------------------------------------- mark/status
 
 
+REPORT_MAX_BYTES = 2 * 1024 * 1024
+
+
+def report_draft_path(run_id):
+    """Where the review skill writes its report. Outside .git, because Claude Code protects writes there."""
+    return os.path.join(tempfile.gettempdir(), f"ravenwatch-report-{run_id}.md")
+
+
+def store_report(sdir, run_id, head, src):
+    """Copy a report draft into <state>/reports/ and return the stored path. Accepts only a plain regular file."""
+    src = os.path.abspath(src)
+    reports = os.path.join(sdir, "reports")
+    if os.path.dirname(src) == os.path.realpath(reports) or os.path.dirname(src) == reports:
+        return src
+    st = os.lstat(src)  # raises if missing
+    if not stat.S_ISREG(st.st_mode):
+        raise RuntimeError(f"report {src} is not a regular file")
+    if st.st_size > REPORT_MAX_BYTES:
+        raise RuntimeError(f"report {src} is larger than {REPORT_MAX_BYTES // 1024 // 1024} MB")
+    stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M")
+    dest = os.path.join(reports, f"{stamp}-{head[:8]}-{run_id}.md")
+    with open(src, "rb") as fh:
+        data = fh.read(REPORT_MAX_BYTES + 1)
+    tmp = dest + ".tmp"
+    with open(tmp, "wb") as fh:
+        fh.write(data)
+    os.replace(tmp, dest)
+    try:
+        os.remove(src)
+    except OSError:
+        pass
+    return dest
+
+
 def cmd_mark(args):
     os.chdir(git("rev-parse", "--show-toplevel"))
     sdir = state_dir()
@@ -520,7 +605,7 @@ def cmd_mark(args):
         f"run={run_id}",
     ]
     if args.report:
-        lines.append(f"report={clean_value(os.path.abspath(args.report))}")
+        lines.append(f"report={clean_value(store_report(sdir, run_id, head, args.report))}")
     if args.note:
         lines.append("note=" + clean_value(args.note)[:300])
     with open(os.path.join(sdir, "history.log"), "a", encoding="utf-8") as fh:
@@ -531,6 +616,9 @@ def cmd_mark(args):
         return 0
     write_kv_atomic(os.path.join(sdir, "status"), lines)
     print(f"recorded verdict '{args.verdict}' for {head[:8]} ({prepared.get('range', '')})")
+    report_line = next((l for l in lines if l.startswith("report=")), None)
+    if report_line:
+        print(f"report stored at {report_line[len('report='):]}")
     return 0
 
 
@@ -639,6 +727,8 @@ def main():
     p.add_argument("--since-last", action="store_true")
     p.add_argument("--worktree", action="store_true")
     p.add_argument("--full", action="store_true")
+    p.add_argument("--quick", action="store_true",
+                   help="only the core reviewers (bugs, security, loopholes, plus config/dependency checks)")
     m = sub.add_parser("mark")
     m.add_argument("--verdict", required=True, choices=["pass", "warn", "block", "accepted"])
     m.add_argument("--run", help="run id printed by prepare (default: the most recent run)")

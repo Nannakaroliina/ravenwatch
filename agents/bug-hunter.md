@@ -56,7 +56,7 @@ For each changed function or block:
 - Time: timezones, DST, month/leap-year edges, comparing dates as strings, expiry checks in the wrong unit (seconds vs milliseconds).
 - Text: encoding, case-sensitivity, Unicode normalisation, unanchored or greedy regexes, splitting on the wrong delimiter.
 - Data flow: wrong field mapped, serialisation/deserialisation mismatch, lost precision, default values hiding missing data.
-- Tests: new tests that cannot fail (no assertion, asserting the mock, swallowed exceptions).
+- Leave test quality and missing tests to test-reviewer; report a test only if the test code itself has a bug that breaks the build or corrupts shared state.
 
 ## Output format
 

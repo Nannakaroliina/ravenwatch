@@ -36,6 +36,17 @@ You are the skeptic on the review team. Specialists are rewarded for finding pro
 5. **Is it a duplicate?** Merge findings from different specialists about the same root cause; keep the clearest one and list the merged IDs.
 6. **Is it in scope?** Pre-existing issues stay only if HIGH/CRITICAL and in touched code.
 
+## Extra checks by finding type
+
+The questions above are written for bugs and vulnerabilities. For the other reviewers, also check:
+
+- **UX-** — Is the component or page actually rendered by a route (not dead or storybook-only)? Does the project already handle the "missing" state elsewhere (a global error boundary, a shared form component with built-in labels and errors, a CSS reset that restores focus outlines)? Contrast claims need the actual colour values. Downgrade findings that are taste rather than a user being blocked or misled.
+- **IMP-** — Grep yourself for the dependent the finding says breaks: does it exist, and was it really not updated? Is the API actually consumed outside this repo, or versioned? Is the migration really destructive on the data that exists, and is there a backfill or expand/contract step in another commit of the range?
+- **TEST-** — Grep the test directories for the behaviour by function name, route and key strings before accepting "untested"; integration and end-to-end tests count. For "weakened test" findings, check the per-commit patches for the justification.
+- **DES-** — Does the project already use the criticised pattern consistently elsewhere? If yes, REJECT (consistency is not a defect). Is the claimed future cost concrete and likely? If it is taste, REJECT.
+
+Severity caps apply after your adjustments: TEST- and DES- findings are at most MEDIUM, UX- findings at most HIGH. Never raise one above its cap.
+
 ## Verdicts
 
 - `CONFIRMED` — survives all checks.

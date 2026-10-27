@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.0 — 2026-10-27
+
+- Four new reviewers, run when relevant and skipped with `--quick`:
+  - `impact-analyzer`: blast radius of a change — dependents of changed exports, routes and schemas, breaking API changes, migration safety, new env vars, deploy order and rollback. Can block.
+  - `ux-reviewer`: user flows, loading/error/empty states, accessibility (WCAG 2.2 AA), mobile layouts, copy and visual consistency. Can block only when a user can't complete a core task.
+  - `test-reviewer`: risky changed behaviour without tests, tests that can't fail, weakened or skipped tests, flaky patterns. Warns, never blocks.
+  - `design-reviewer`: architecture fit, duplication, coupling, data modelling and over-engineering. Warns, never blocks.
+- `prepare` now reports triage signals (UI, schema/migration, API/entry points, deploy config, deleted files, code changed without tests).
+- `--quick` runs only the core reviewers.
+- finding-verifier has type-specific checks for the new reviewers; chat summaries tag each finding with its area.
+
 ## 0.1.0 — 2026-10-27
 
 First release.
