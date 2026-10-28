@@ -85,16 +85,18 @@ check_target() {
     fail "this push overrides the receive command or recurses into submodules, so the gate cannot check it." \
       "Push again without --exec/--receive-pack/--recurse-submodules (push submodules from inside each one)."
   fi
-  # The same recursion, switched on in git config (only matters when the repository has submodules).
+  # The same recursion, switched on in git config. git finds submodules from the commits and the index, not
+  # the .gitmodules file on disk; and whichever of the two settings git reads last wins, so either counts.
   top=$(git rev-parse --show-toplevel 2>/dev/null)
-  if [ -n "$top" ] && [ -f "$top/.gitmodules" ]; then
+  if [ -n "$top" ] && { [ -f "$top/.gitmodules" ] || git cat-file -e HEAD:.gitmodules 2>/dev/null ||
+    git ls-files -s 2>/dev/null | grep -q '^160000 '; }; then
     mode=$(git config --get push.recurseSubmodules 2>/dev/null | tr 'A-Z' 'a-z')
-    [ -n "$mode" ] || { [ "$(git config --type=bool --get submodule.recurse 2>/dev/null)" = true ] && mode=on-demand; }
-    case "$mode" in
-      on-demand | only)
-        fail "push.recurseSubmodules / submodule.recurse makes git push submodules through their own hooks, which the gate cannot check." \
-          "Set push.recurseSubmodules to check (git config push.recurseSubmodules check) and push submodules from inside each one." ;;
-    esac
+    case "$mode" in on-demand | only) recurse=1 ;; *) recurse=0 ;; esac
+    [ "$(git config --type=bool --get submodule.recurse 2>/dev/null)" = true ] && recurse=1
+    if [ "$recurse" = 1 ] && ! printf '%s\n' "$args" | grep -Eq -- '(^|[[:space:]])--no-recurse-submodules([[:space:]]|$)'; then
+      fail "push.recurseSubmodules / submodule.recurse makes git push submodules through their own hooks, which the gate cannot check." \
+        "Set push.recurseSubmodules to check and submodule.recurse to false (or push with --no-recurse-submodules), and push submodules from inside each one."
+    fi
   fi
   listed=$(git ls-remote --get-url "$remote_url" 2>/dev/null)
   if [ "$listed" != "$remote_url" ]; then

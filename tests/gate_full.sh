@@ -93,19 +93,28 @@ echo "$out" | grep "personal data" | grep -q node_modules && bad "vendored file 
 echo "$out" | grep -q "vendored/generated, by top-level path: dist/ (1), gen/ (1), node_modules/ (1)" && ok \
   || bad "vendored directories not all listed"
 
-# An extension-less file replaced by a FIFO in the working tree must not hang prepare. (A tracked file
-# changed on disk makes a full audit refuse, which is fine too; `timeout` isn't on macOS, so use python.)
-echo plain > bin/tool; git add bin/tool; git commit -qm tool
-rm bin/tool; mkfifo bin/tool
-fifo_out=$(python3 -c 'import subprocess,sys
+# An extension-less file replaced by a FIFO in the working tree must not hang prepare. A normal review
+# reads it (to look for a #! line) despite the dirty tree; a full audit refuses the dirty tree first.
+# (`timeout` isn't on macOS, so python times the call.)
+within30() {
+  python3 -c 'import subprocess,sys
 try:
     r = subprocess.run(sys.argv[1:], capture_output=True, text=True, timeout=30)
     print("exit", r.returncode, r.stdout + r.stderr)
 except subprocess.TimeoutExpired:
-    print("hung")' python3 "$RV" prepare --full)
+    print("hung")' "$@"
+}
+echo plain > bin/tool; git add bin/tool; git commit -qm tool
+rm bin/tool; mkfifo bin/tool
+fifo_out=$(within30 python3 "$RV" prepare)
 case "$fifo_out" in
-  "exit 0"*|*"uncommitted changes"*) ok ;;
-  *) bad "prepare --full hung or failed on a FIFO: $(echo "$fifo_out" | head -n 3)" ;;
+  "exit 0"*) ok ;;
+  *) bad "prepare hung or failed on a FIFO: $(echo "$fifo_out" | head -n 3)" ;;
+esac
+fifo_out=$(within30 python3 "$RV" prepare --full)
+case "$fifo_out" in
+  *"uncommitted changes"*) ok ;;
+  *) bad "prepare --full over a FIFO didn't refuse the dirty tree: $(echo "$fifo_out" | head -n 3)" ;;
 esac
 rm bin/tool; git checkout -q -- bin/tool
 

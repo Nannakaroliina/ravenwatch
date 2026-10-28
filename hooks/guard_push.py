@@ -19,6 +19,7 @@ command, a miss costs an unreviewed push. Set RAVENWATCH_DISABLE=1 in Claude
 Code's environment to turn the gate off.
 """
 
+import codecs
 import glob
 import json
 import os
@@ -101,11 +102,22 @@ EXECUTORS = {"sh", "bash", "zsh", "dash", "ksh", "fish", "env", "xargs", "eval",
              "timeout", "watch", "find", "parallel", "sudo", "doas", "nice", "stdbuf", "script", "builtin"}
 # Programs that write to files named in their arguments: a path there that the guard can't work out
 # (a variable set from command output, `read` …) is refused rather than assumed harmless.
-WRITERS = {"cp", "mv", "tee", "dd", "install", "rsync", "ln", "touch", "mkdir", "truncate", "ditto", "rename", "sed",
-           "perl", "unzip", "tar", "patch", "chmod", "chown", "rm", "rmdir", "curl", "wget"}
+WRITERS = {"cp", "mv", "tee", "dd", "install", "rsync", "ln", "touch", "mkdir", "truncate", "ditto", "rename",
+           "patch", "chmod", "chown", "rm", "rmdir"}
+# Programs that only write where an option says (other arguments are URLs, headers, archive members …).
+OUTPUT_OPTS = {
+    "curl": {"-o", "--output", "-D", "--dump-header", "-c", "--cookie-jar", "--trace", "--trace-ascii",
+             "--output-dir", "--stderr"},
+    "wget": {"-O", "--output-document", "-P", "--directory-prefix", "-o", "--output-file", "-a", "--append-output"},
+    "tar": {"-f", "--file", "-C", "--directory"},
+    "unzip": {"-d"},
+}
+# Programs that write their file arguments only when editing in place (sed -i, perl -pi).
+IN_PLACE = {"sed", "perl"}
 # A `cat` heredoc. Its body is only dropped when the rest of its first line is just redirections:
-# `cat <<EOF | sh` or `cat <<EOF && git push` keep the body, which is then checked as commands.
-CAT_HEREDOC = re.compile(r"\bcat\s+<<-?\s*(['\"]?)(\w+)\1([^\n]*)\n.*?\n[ \t]*\2[ \t]*(?=\n|\)|$)", re.S)
+# `cat <<EOF | sh` or `cat <<EOF && git push` keep the body, which is then checked as commands. The body
+# may be empty (the delimiter on the very next line); it ends at the first line that is the delimiter.
+CAT_HEREDOC = re.compile(r"\bcat\s+<<-?\s*(['\"]?)(\w+)\1([^\n]*)\n(?:.*?\n)??[ \t]*\2[ \t]*(?=\n|\)|$)", re.S)
 HARMLESS_REST = re.compile(r"[\s\"')]*(?:(?:(?<=\s)\d+)?>>?\s*[^\s;&|()<>\"']+[\s\"')]*)*")
 REPORTS_PATH = re.compile(r"/ravenwatch/reports(?:/|$)")
 # ravenwatch state file names, wherever they are written (a directory may become a git dir later).
@@ -131,12 +143,25 @@ UNKNOWN_ASSIGN = re.compile(r"(?:^|[\s;&|(])(?:read|mapfile|readarray|getopts)\b
 ASSIGNMENT = re.compile(r"(?:^|[\s;&|(])(?:(?:export|declare|typeset|readonly|local)\s+(?:-\w+\s+)*)?"
                         r"([A-Za-z_][A-Za-z0-9_]*)=(\$\([^)]*\)|`[^`]*`|\"[^\"]*\"|'[^']*'|[^\s;&|()<>]*)")
 FOR_LOOP = re.compile(r"\bfor\s+([A-Za-z_][A-Za-z0-9_]*)\s+in\s+([^;\n]*)")
-MKTEMP = re.compile(r"^\$\(\s*mktemp\b[^)`$]*\)$")
+MKTEMP = re.compile(r"^\$\(\s*mktemp\b([^)`]*)\)$")
+TMPDIR_REF = re.compile(r"\$\{?TMPDIR(?::?-[^}]*)?\}?")
+# ANSI-C ($'…') and locale ($"…") quoting: the shell decodes escapes inside them.
+ANSI_QUOTE = re.compile(r"\$'((?:[^'\\]|\\.)*)'")
 
 
 def may_push(text):
     """True if `push` appears as a word, after removing quotes and backslashes (so `pu''sh` counts)."""
     return bool(PUSH_WORD.search(re.sub(r"[\"'\\]", "", text)))
+
+
+def decode_ansi(text):
+    """Text with each $'…' replaced by what the shell makes of it (`$'--no-\\x76erify'` → `--no-verify`)."""
+    def decoded(m):
+        try:
+            return codecs.decode(m.group(1), "unicode_escape")
+        except (UnicodeDecodeError, ValueError):
+            return m.group(1)
+    return ANSI_QUOTE.sub(decoded, text).replace('$"', '"')
 
 
 def allow():
@@ -175,14 +200,20 @@ def hook_installed(repo):
 
 
 def recurses_into_submodules(repo):
-    """True if a plain push here also pushes submodules (through their own, unchecked hooks)."""
+    """True if a plain push here may also push submodules (through their own, unchecked hooks). git finds
+    submodules from the commits and the index, not the .gitmodules file on disk; and whichever of
+    push.recurseSubmodules and submodule.recurse git reads last wins, so either one switched on counts."""
     code, top = git(repo, "rev-parse", "--show-toplevel")
-    if code != 0 or not os.path.exists(os.path.join(top, ".gitmodules")):
+    if code != 0:
+        return False
+    has_submodules = os.path.exists(os.path.join(top, ".gitmodules")) \
+        or git(repo, "cat-file", "-e", "HEAD:.gitmodules")[0] == 0 \
+        or any(line.startswith("160000 ") for line in git(repo, "ls-files", "-s")[1].splitlines())
+    if not has_submodules:
         return False
     mode = git(repo, "config", "--get", "push.recurseSubmodules")[1].lower()
-    if not mode:
-        mode = "on-demand" if git(repo, "config", "--type=bool", "--get", "submodule.recurse")[1] == "true" else ""
-    return mode in ("on-demand", "only")
+    recurse = git(repo, "config", "--type=bool", "--get", "submodule.recurse")[1] == "true"
+    return mode in ("on-demand", "only") or recurse
 
 
 def git_dir_of(path):
@@ -326,17 +357,29 @@ def shell_vars(command):
     found = {}
 
     def add(name, values):
-        found[name] = None if values is None or found.get(name, []) is None else found.get(name, []) + values
+        # An assignment may not run (`false && X=…`) or may only apply to one command (`X=… cmd`), so the
+        # value from the environment stays possible too.
+        if name not in found:
+            found[name] = [os.environ[name]] if name in os.environ else []
+        found[name] = None if values is None or found[name] is None else found[name] + values
 
     for m in ASSIGNMENT.finditer(command):
         raw = m.group(2)
-        if MKTEMP.match(raw):
-            add(m.group(1), [os.path.join(tempfile.gettempdir(), "tmp.XXXXXXXXXX")])
-        elif raw.startswith("'") and raw.endswith("'") and len(raw) >= 2:
+        if raw.startswith("'") and raw.endswith("'") and len(raw) >= 2:
             add(m.group(1), [raw[1:-1]])
+            continue
+        raw = raw[1:-1] if raw.startswith('"') and raw.endswith('"') and len(raw) >= 2 else raw
+        temp = MKTEMP.match(raw)
+        if temp:
+            # A new temp path, unless the template points somewhere the guard can't see or into git internals.
+            rest = TMPDIR_REF.sub("", temp.group(1))
+            safe = "$" not in rest and not re.search(r"(?i)\.git\b|hooks|ravenwatch", rest)
+            add(m.group(1), [os.path.join(tempfile.gettempdir(), "tmp.XXXXXXXXXX")] if safe else None)
         else:
-            raw = raw[1:-1] if raw.startswith('"') and raw.endswith('"') and len(raw) >= 2 else raw
             add(m.group(1), expand_vars(raw, {}))
+    if re.search(r"(?:^|[\s;&|(])(?:cd|pushd|popd)\b", command):
+        # The shell's $PWD follows its `cd`s; the guard's environment doesn't.
+        found["PWD"] = found["OLDPWD"] = None
     for m in FOR_LOOP.finditer(command):
         try:
             words = shlex.split(m.group(2).split(" do ")[0])
@@ -358,17 +401,27 @@ def shell_vars(command):
 
 def expand_vars(word, variables):
     """The words a shell word may become once its variables are filled in (from variables, else the
-    environment), or None when a part can't be known: command output, an unset variable, `${x:-…}`, $1 …"""
+    environment), or None when a part can't be known: command output, an unset variable, $1 …
+    `${X:-word}` is X or word; `${X%…}` and `${X#…}` trim X (counted as X, unless the pattern has a `/`)."""
     if "`" in word or "$(" in word:
         return None
     results, pos = [""], 0
     for m in EXPANSION.finditer(word):
         tok = m.group(0)
-        name = tok[2:-1] if tok.startswith("${") else tok[1:]
-        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+        inner = tok[2:-1] if tok.startswith("${") and tok.endswith("}") else (None if tok.startswith("${") else tok[1:])
+        if inner is None:
             return None
+        op = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)(?:(:?[-=])(.*)|(%%?|##?)([^/]*))?", inner)
+        if not op:
+            return None
+        name = op.group(1)
         values = variables[name] if name in variables else (
             [os.environ[name]] if name in os.environ else None)
+        if op.group(2):  # ${X:-word}: X when set (and non-empty), else word
+            fallback = expand_vars(op.group(3), variables)
+            if fallback is None or (name in variables and variables[name] is None):
+                return None
+            values = (values or []) + fallback
         if values is None:
             return None
         results = [r + word[pos:m.start()] + v for r in results for v in values][:64]
@@ -376,10 +429,13 @@ def expand_vars(word, variables):
     return [r + word[pos:] for r in results]
 
 
-def names_sensitive(word):
-    """True if the literal parts of a word (variables removed) point at git internals or ravenwatch files."""
+def names_sensitive(word, writes=True):
+    """True if the literal parts of a word (variables removed) point at git internals or ravenwatch files.
+    For a read, only `.git` and `ravenwatch` count (config/, hooks/ are common project directories)."""
     literal = EXPANSION.sub("/", word.replace("`", "/"))
     parts = [p.lower() for p in literal.split("/") if p]
+    if not writes:
+        return any(p in (".git", "ravenwatch") for p in parts)
     return any(p in (".git", "hooks", "ravenwatch") or p in SENSITIVE_NAMES for p in parts)
 
 
@@ -444,7 +500,7 @@ def touches_git_dir(bases, words, protect_plugin=False, variables=None, writes=F
         if "$" in w or "`" in w:
             filled = expand_vars(w, variables or {})
             if filled is None:
-                if writes or names_sensitive(w):
+                if writes or names_sensitive(w, writes=False):
                     return w, "var"
                 continue
             hit = touches_git_dir(bases, filled, protect_plugin, None, writes, check_lost)
@@ -524,11 +580,16 @@ def helper_refusal():
 def check_bash(command, cwd):
     if "\n" not in command and "\r" not in command and OWN_HELPER.match(re.sub(r"/{2,}", "/", command)):
         return helper_refusal()
-    stripped = re.sub(r"[\"'\\]", "", command)
+    # What the shell sees: line continuations joined and $'…' escapes decoded (`--no-\<newline>verify`).
+    joined = re.sub(r"\\\r?\n", "", command)
+    decoded = decode_ansi(joined)
+    if may_push(decoded) and re.search(r"\$['\"]", joined):
+        return "$'…' and $\"…\" quoting in a pushing command can't be checked. Write the arguments out plainly."
+    stripped = re.sub(r"[\"'\\]", "", decoded)
     # `RAVENWATCH_DIS${X}ABLE`: the name only exists once the shell has expanded the variable.
-    collapsed = re.sub(r"[\"'\\]", "", EXPANSION.sub("", command))
+    collapsed = re.sub(r"[\"'\\]", "", EXPANSION.sub("", decoded))
     for rx, why in BYPASS:
-        if rx.search(command) or rx.search(stripped) or rx.search(collapsed):
+        if any(rx.search(t) for t in (command, joined, stripped, collapsed)):
             return f"{why}. Run the command without it."
     if PROTECTED_TEXT.search(command) or PROTECTED_TEXT.search(stripped):
         return ("this command touches the git hooks, git config or ravenwatch state inside .git/. Read files there "
@@ -548,13 +609,15 @@ def check_bash(command, cwd):
     pushing = may_push(command)
     if pushing and re.search(r"`|\$\(|<\(|>\(", command):
         return "a push inside command substitution can't be checked. Run `git push` as its own command."
-    if pushing and EXPANSION.search(command):
-        return ("a pushing command that uses shell variables can't be checked (a variable can disable the hook or "
-                "change what runs). Write the values out, and run `git push` as its own command.")
     parsed_cmd = segments(command)
     if parsed_cmd is None:
         return "could not parse this command. Run `git push` as its own plain command." if pushing else None
     segs = parsed_cmd
+    # The words as the shell splits them, checked once more (quoting can hide a flag from the text checks).
+    words = " ".join(" ".join(seg + redirects) for seg, redirects, _ in segs)
+    for rx, why in BYPASS:
+        if rx.search(words) or rx.search(re.sub(r"[\"'\\]", "", EXPANSION.sub("", words))):
+            return f"{why}. Run the command without it."
     protect_plugin = not developing_plugin(cwd)
     variables = shell_vars(command)
 
@@ -570,9 +633,11 @@ def check_bash(command, cwd):
         hit = touches_git_dir(heres, redirects, protect_plugin, variables, writes=True)
         if hit:
             return path_refusal(*hit)
+        dynamic_prefix = False  # `X=$Y git push`: an environment setting the guard can't read
         while seg and (re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", seg[0]) or seg[0] in CD_PREFIXES):
             if seg[0].startswith("CDPATH="):
                 cdpath = True
+            dynamic_prefix = dynamic_prefix or "$" in seg[0] or "`" in seg[0]
             drop = 2 if seg[0] in ("command", "time") and seg[1:2] == ["-p"] else 1
             seg = seg[drop:]
         if not seg:
@@ -620,8 +685,17 @@ def check_bash(command, cwd):
             outputs += [args[i + 1] for i, a in enumerate(args[:-1]) if a in GIT_OUTPUT_OPTS]
             word = touches_git_dir(heres, outputs, False, variables, writes=False, check_lost=False)
         else:
-            word = touches_git_dir(heres, args, protect_plugin and head not in READERS, variables,
-                                   writes=head in WRITERS)
+            protect = protect_plugin and head not in READERS
+            if head in OUTPUT_OPTS:
+                # Only option values are files written to; URLs, headers and members are just checked as text.
+                outputs = [args[i + 1] for i, a in enumerate(args[:-1]) if a in OUTPUT_OPTS[head]]
+                outputs += [a for a in args if a.startswith("--") and a.split("=", 1)[0] in OUTPUT_OPTS[head]]
+                word = (touches_git_dir(heres, outputs, protect, variables, writes=True)
+                        or touches_git_dir(heres, args, protect, variables, writes=False))
+            else:
+                in_place = head in IN_PLACE and any(re.match(r"^-[a-zA-Z]*i", a) or a.startswith("--in-place")
+                                                    for a in args)
+                word = touches_git_dir(heres, args, protect, variables, writes=head in WRITERS or in_place)
         if word:
             return path_refusal(*word)
         if not (pushing or GIT_WORD.search(" ".join(seg))):
@@ -678,6 +752,9 @@ def check_bash(command, cwd):
                 return (f"`push` appears in this git command after `{sub}`, so the guard can't tell whether it "
                         "pushes. Run `git push` as its own plain command.")
             continue
+        if dynamic_prefix or any(EXPANSION.search(t) or "`" in t for t in seg):
+            return ("a git push that uses shell variables can't be checked (a variable can disable the hook or "
+                    "change what runs). Write the remote, branch and settings out.")
         if "-c" in globs:
             return "per-command git settings (-c) on a push can change where it goes or skip the hook. Run it without -c."
         for a in args:
@@ -698,10 +775,11 @@ def check_bash(command, cwd):
                         "push could not be checked. Run /ravenwatch:install-git-hook in that repository first. (If "
                         "the repository uses Husky or lefthook, ravenwatch can't install there yet: the owner pushes "
                         "from their own terminal.)")
-            if recurses_into_submodules(repo):
+            if "--no-recurse-submodules" not in args and recurses_into_submodules(repo):
                 return ("this repository is configured to push submodules too (push.recurseSubmodules / "
-                        "submodule.recurse), and their hooks cannot be checked. Push submodules yourself, or set "
-                        "push.recurseSubmodules to check.")
+                        "submodule.recurse), and their hooks cannot be checked. Push submodules yourself, and set "
+                        "push.recurseSubmodules to check and submodule.recurse to false (or push with "
+                        "--no-recurse-submodules).")
     return None
 
 

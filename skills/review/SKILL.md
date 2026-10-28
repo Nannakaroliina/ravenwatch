@@ -66,7 +66,7 @@ Decide which specialists to dispatch from the file categories and the `## Signal
 | `loophole-hunter` | code changes touch user-facing behaviour: routes, handlers, forms, auth, payments, limits, quotas, workflows, permissions (skip for pure tooling/test-only changes) |
 | `resilience-reviewer` | code does network calls, database or file writes, async/background work, queues, caching |
 | `supply-chain-auditor` | `manifest`, `container` or `ci` files changed, or fonts, images, audio or other media were added (`asset` files with status A) |
-| `infra-config-auditor` | `config`, `ci`, `container`, `iac` or `secret-file` files changed, the deterministic scan has any hit, or mode is `first-push`/`full` |
+| `infra-config-auditor` | `config`, `ci`, `container`, `iac` or `secret-file` files changed, an `infrastructure as code / framework config` signal, the deterministic scan has any hit, or mode is `first-push`/`full` |
 
 **Broader reviewers** (skipped when the profile is `quick`, and individually when the approved brief lists them under `skip`):
 

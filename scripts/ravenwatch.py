@@ -43,7 +43,8 @@ KEEP_VERDICTS = 50
 LARGE_HISTORY_COMMITS = 500
 PER_COMMIT_LIMIT = 200
 PATCH_MAX_BYTES = 20 * 1024 * 1024
-SCAN_SECONDS = 240  # history secret scan budget; `prepare` must finish within the review skill's Bash timeout
+SCAN_SECONDS = 240  # secret scan budget (history, then HEAD); `prepare` must finish within the skill's Bash timeout
+MAX_SCAN_LINE = 1024 * 1024  # longer lines (binary blobs under --text) are scanned up to this many characters
 # Generated lockfiles: huge, rarely reviewable line by line; manifests still show dependency changes.
 LOCKFILES = ["package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml", "bun.lockb", "poetry.lock",
              "Pipfile.lock", "uv.lock", "Cargo.lock", "Gemfile.lock", "composer.lock", "go.sum"]
@@ -107,25 +108,38 @@ def hidden_tracked_files():
     res = subprocess.run(["git", "ls-files", "-v", "-z"], capture_output=True, text=True, errors="surrogateescape")
     if res.returncode != 0:
         raise RuntimeError(f"git ls-files failed: {res.stderr.strip()[:200]}")
-    hidden = []
-    for entry in res.stdout.split("\0"):
-        if len(entry) > 2 and (entry[0] == "S" or entry[0].islower()) and os.path.lexists(entry[2:]):
-            hidden.append(entry[2:])
-    return hidden
+    flagged = [e[2:] for e in res.stdout.split("\0")
+               if len(e) > 2 and (e[0] == "S" or e[0].islower()) and os.path.isfile(e[2:])]
+    if not flagged:
+        return []
+    # A local override that matches the commit is harmless; only content that differs is hidden.
+    staged = subprocess.run(["git", "ls-files", "-s", "-z", "--", *flagged], capture_output=True, text=True,
+                            errors="surrogateescape")
+    blobs = {}
+    for e in staged.stdout.split("\0"):
+        if "\t" in e:
+            meta, path = e.split("\t", 1)
+            blobs[path] = meta.split()[1]
+    disk = subprocess.run(["git", "hash-object", "--stdin-paths"], input="\n".join(flagged) + "\n",
+                          capture_output=True, text=True, errors="surrogateescape")
+    if staged.returncode != 0 or disk.returncode != 0:
+        return flagged
+    return [f for f, h in zip(flagged, disk.stdout.split()) if blobs.get(f) != h]
 
 
 def refuse_hidden_files():
     hidden = hidden_tracked_files()
     if hidden:
-        raise RuntimeError("these tracked files are marked skip-worktree or assume-unchanged, so what is on disk may "
-                           f"not be what is committed: {', '.join(hidden[:5])}{' …' if len(hidden) > 5 else ''}. "
-                           "Clear the flag (git update-index --no-skip-worktree --no-assume-unchanged <file>) first.")
+        raise RuntimeError("these tracked files are marked skip-worktree or assume-unchanged and differ on disk from "
+                           f"what is committed: {', '.join(hidden[:5])}{' …' if len(hidden) > 5 else ''}. Reviewers "
+                           "and checks would read the version on disk. Clear the flag (git update-index "
+                           "--no-skip-worktree --no-assume-unchanged <file>) and commit or stash the change first.")
 
 
 def tracked_changes():
     """Tracked files whose content on disk differs from HEAD (untracked files are left out)."""
-    res = subprocess.run(["git", "status", "--porcelain=v1", "-z", "--untracked-files=no", "--ignore-submodules=none"],
-                         capture_output=True, text=True, errors="surrogateescape")
+    res = subprocess.run(["git", "status", "--porcelain=v1", "-z", "--untracked-files=no",
+                          "--ignore-submodules=untracked"], capture_output=True, text=True, errors="surrogateescape")
     if res.returncode != 0:
         raise RuntimeError("could not tell whether the working tree matches HEAD (`git status` failed: "
                            f"{res.stderr.strip()[:200]})")
@@ -161,13 +175,21 @@ def git_to_file(path, *args):
         raise RuntimeError(f"git {' '.join(args)} failed: {res.stderr.strip()}")
 
 
-def git_lines(*args):
-    """Yield git output line by line (stderr goes to a temp file so a failure can say why)."""
+def git_lines(*args, max_line=None):
+    """Yield git output line by line (stderr goes to a temp file so a failure can say why). With max_line,
+    longer lines are cut to that many characters and the rest of them is skipped."""
     with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as err:
         proc = subprocess.Popen(["git", "-c", "core.quotePath=false", *args], stdout=subprocess.PIPE, stderr=err, text=True,
                                 encoding="utf-8", errors="replace")
         try:
-            for line in proc.stdout:
+            while True:
+                line = proc.stdout.readline(max_line or -1)
+                if not line:
+                    break
+                if max_line and len(line) >= max_line and not line.endswith("\n"):
+                    rest = line
+                    while rest and not rest.endswith("\n"):
+                        rest = proc.stdout.readline(max_line)
                 yield line.rstrip("\n")
         except GeneratorExit:
             # The caller stopped early (e.g. a size cap): end git quietly instead of reporting a failure.
@@ -392,6 +414,10 @@ SIGNAL_RULES = [
                        re.I)),
     ("env", re.compile(r"(^|/)(\.env\.example|\.env\.sample|\.dev\.vars\.example|wrangler\.(toml|jsonc?)|"
                        r"serverless\.ya?ml|docker-compose[^/]*\.ya?ml)$", re.I)),
+    # Infrastructure written as code (CDK, SST, Pulumi) and framework config: code, but infra-config-auditor's too.
+    ("infra", re.compile(r"^(infra|infrastructure|terraform|cdk|pulumi|sst|deploy)/|-stack\.(ts|js|py)$|"
+                         r"(^|/)(sst|pulumi|cdk)\.[a-z.]+$|(^|/)Pulumi(\.[^/]+)?\.ya?ml$|"
+                         r"\.config\.(js|ts|mjs|cjs|mts|cts)$", re.I)),
 ]
 
 
@@ -695,16 +721,19 @@ def cmd_prepare(args):
     # replaced by a scan of the files at HEAD, and the context says so.
     scan = {"commits": 0, "cut": False}
     text_opts = ("--no-color", "--no-ext-diff", "--text", "--no-textconv")
+    started = time.monotonic()
     if rng:
+        # Two thirds of the budget for the history; the rest (at least) for the files at HEAD if it runs out.
         hits = scan_added_lines(budgeted(git_lines(*ATTR_FREE, "log", "-p", "--cc", *text_opts, "--format=commit %H",
-                                                   rng), SCAN_SECONDS, scan))
+                                                   rng, max_line=MAX_SCAN_LINE), SCAN_SECONDS * 2 / 3, scan))
         if scan["cut"]:
             tree = {"commits": 0, "cut": False}
-            hits += scan_added_lines(budgeted(git_lines(*ATTR_FREE, "diff", empty_tree(), "HEAD", *text_opts),
-                                              SCAN_SECONDS, tree), "HEAD")
+            left = max(SCAN_SECONDS - (time.monotonic() - started), SCAN_SECONDS / 3)
+            hits += scan_added_lines(budgeted(git_lines(*ATTR_FREE, "diff", empty_tree(), "HEAD", *text_opts,
+                                                        max_line=MAX_SCAN_LINE), left, tree), "HEAD")
             scan["tree_cut"] = tree["cut"]
     else:
-        hits = scan_added_lines(git_lines(*ATTR_FREE, "diff", "HEAD", *text_opts))
+        hits = scan_added_lines(git_lines(*ATTR_FREE, "diff", "HEAD", *text_opts, max_line=MAX_SCAN_LINE))
     # One entry per distinct value (by hash), so two different keys with the same prefix are both listed.
     seen, uniq, repeats = {}, [], {}
     for h in hits:
@@ -715,7 +744,8 @@ def cmd_prepare(args):
         else:
             repeats[seen[key]] = repeats.get(seen[key], 0) + 1
 
-    sensitive = [p for s, p in files if s != "D" and classify(p) == "secret-file"]
+    secret_rule, code_rule = dict(CATEGORY_RULES)["secret-file"], dict(CATEGORY_RULES)["code"]
+    sensitive = [p for s, p in files if s != "D" and secret_rule.search(p) and not code_rule.search(p)]
     large = []
     for s, p in files:
         if s != "D" and os.path.isfile(p) and os.path.getsize(p) > LARGE_FILE_BYTES:
@@ -798,15 +828,15 @@ def cmd_prepare(args):
     out.append("")
     out.append("## Signals")
     labels = {"ui": "ui / user-facing", "migration": "schema / migration", "api": "api / routes / entry points",
-              "env": "environment / deploy config"}
-    for s in ["ui", "migration", "api", "env"]:
+              "env": "environment / deploy config", "infra": "infrastructure as code / framework config"}
+    for s in ["ui", "migration", "api", "env", "infra"]:
         if s in sig:
             shown = sig[s][:20]
             more = f" … and {len(sig[s]) - 20} more" if len(sig[s]) > 20 else ""
             out.append(f"- {labels[s]} ({len(sig[s])}): " + ", ".join(shown) + more)
     if deleted:
         out.append(f"- deleted files ({len(deleted)}): " + ", ".join(deleted[:20]))
-    new_code = [p for s, p in files if s == "A" and classify(p) == "code"]
+    new_code = [p for s, p in files if s == "A" and classify_file(p) == "code"]
     if new_code and mode != "full":
         out.append(f"- new code files ({len(new_code)}): " + ", ".join(new_code[:20]))
     if mode == "full":
@@ -881,7 +911,7 @@ def cmd_prepare(args):
     out.append("## Deterministic scan")
     if scan["cut"]:
         out.append(f"- WARNING: history scan incomplete: stopped after {scan['commits']} of {n_commits} commit(s) "
-                   f"({SCAN_SECONDS} s budget); the files at HEAD were scanned instead"
+                   f"({SCAN_SECONDS * 2 // 3} s budget); the files at HEAD were scanned instead"
                    + (" (that scan was cut short too)" if scan.get("tree_cut") else "")
                    + ". Secrets added and later removed in the rest of the history were not checked; run gitleaks "
                    "on the full history.")
@@ -1003,7 +1033,7 @@ def cmd_mark(args):
     if prepared["head"] != head:
         raise RuntimeError(f"HEAD moved since this review was prepared (reviewed {prepared['head'][:8]}, "
                            f"now {head[:8]}); the verdict would cover commits nobody reviewed. Review again.")
-    if args.verdict in ALLOWED and prepared.get("mode") != "worktree":
+    if args.verdict in ("pass", "warn") and prepared.get("mode") != "worktree":
         # Reviewers and checks read the files on disk; they must be the commit the verdict unlocks.
         refuse_hidden_files()
         if prepared.get("mode") == "full" and tracked_changes():

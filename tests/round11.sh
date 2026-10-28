@@ -161,14 +161,101 @@ git rm -q keys.py .gitattributes; git commit -qm unkeys
 echo "print(1)" > "työkalut.py"; git add "työkalut.py"; git commit -qm uml
 python3 "$RV" prepare | grep "^- code" | grep -q "työkalut.py" && ok || bad "non-ASCII code file misclassified"
 
-# --- LOOP-3: skip-worktree files and dirty trees in a full audit
+# --- LOOP-3 / IMP-2: skip-worktree files block only when their content differs from the commit
 git update-index --skip-worktree a
-python3 "$RV" prepare >/dev/null 2>"$T/err" && bad "prepare ignored a skip-worktree file" || ok
+python3 "$RV" prepare >/dev/null 2>"$T/err" && ok || bad "an unchanged skip-worktree file blocked prepare: $(cat "$T/err")"
+echo changed >> a
+python3 "$RV" prepare >/dev/null 2>"$T/err" && bad "prepare ignored a changed skip-worktree file" || ok
 grep -q "skip-worktree" "$T/err" && ok || bad "skip-worktree refusal unclear: $(cat "$T/err")"
-git update-index --no-skip-worktree a
+git update-index --no-skip-worktree a; git checkout -q -- a
 echo changed >> a
 python3 "$RV" prepare --full >/dev/null 2>"$T/err" && bad "full audit ran over uncommitted tracked changes" || ok
+grep -q "uncommitted changes" "$T/err" && ok || bad "dirty full-audit refusal unclear: $(cat "$T/err")"
 git checkout -q -- a
+
+# --- TEST-2: mark refuses pass/warn over a changed skip-worktree file or a full audit changed on disk
+python3 "$RV" prepare >/dev/null
+git update-index --skip-worktree a; echo changed >> a
+python3 "$RV" mark --verdict pass --secrets-cleared >/dev/null 2>"$T/err" && bad "mark passed over a hidden change" || ok
+grep -q "skip-worktree" "$T/err" && ok || bad "mark's skip-worktree refusal unclear: $(cat "$T/err")"
+python3 "$RV" mark --verdict block >/dev/null 2>&1 && ok || bad "mark refused block over a hidden change"
+git update-index --no-skip-worktree a; git checkout -q -- a
+python3 "$RV" prepare --full >/dev/null
+echo changed >> a
+python3 "$RV" mark --verdict pass --secrets-cleared >/dev/null 2>"$T/err" && bad "mark passed a full audit changed on disk" || ok
+grep -q "changed on disk" "$T/err" && ok || bad "mark's dirty full-audit refusal unclear: $(cat "$T/err")"
+git checkout -q -- a
+
+# --- round 2 (SEC-1): line continuations and $'…' quoting can't hide a hook-skipping flag
+bash_gate deny  "$R" "git $P --no-\\
+verify origin main" "no-verify"
+bash_gate deny  "$R" "git $P \$'--no-\\x76erify' origin main"
+
+# --- round 2 (SEC-2): an empty-body cat heredoc ends at the next delimiter line
+bash_gate deny  "$R" "cat <<EOF
+EOF
+git -C $N $P
+EOF" "not installed"
+bash_gate allow "$R" "cat <<EOF > /tmp/rw-notes.txt
+EOF"
+
+# --- round 2 (BUG-2): $PWD after a cd, and assignments that may not apply
+mkdir -p sub
+bash_gate deny  "$R" 'cd sub && cp a $PWD/../.gi?/hooks/pre-'$P "can't tell where"
+bash_gate deny  "$R" 'PWD=/tmp cp a $PWD/.gi?/hooks/pre-'$P "inside a git directory"
+rmdir sub
+
+# --- round 2 (UX-1/2/3, sed, reads): ordinary commands with variables
+bash_gate allow "$R" 'docker '$P' "$IMAGE"'
+bash_gate allow "$R" 'grep -rn '$P' src | awk -F: '"'"'{print $1}'"'"
+bash_gate allow "$R" 'git stash '$P' -m "wip $B"'
+bash_gate deny  "$R" 'git '$P' origin "$B"' "uses shell variables"
+bash_gate allow "$R" 'D="$(mktemp -d)"; cp a "$D/x"'
+bash_gate allow "$R" 'mkdir -p "${TMPDIR:-/tmp}/build"'
+bash_gate allow "$R" 'for f in *.md; do cp "$f" "${f%.md}.txt"; done'
+bash_gate deny  "$R" 'd=$(mktemp -d .git/x.XXXX); cp a $d/y' "inside a git directory"
+bash_gate deny  "$R" 'd=$(mktemp -d "$X/y.XXXX"); cp a $d/y' "can't tell where"
+bash_gate allow "$R" 'curl -s -H "Authorization: Bearer $TOKEN" https://example.com/api'
+bash_gate deny  "$R" 'curl -s -o "$(echo .)/x" https://example.com' "can't tell where"
+bash_gate allow "$R" 'sed -n "$(echo 1)p" a'
+bash_gate deny  "$R" 'sed -i "" $UNKNOWN_DIR/x' "can't tell where"
+bash_gate allow "$R" 'cat "$(git rev-parse --show-toplevel)/config/x.yml"'
+
+# --- round 2 (BUG-3 / LOOP-1): submodules found from git, either setting counts
+printf '[submodule "s"]\n\tpath = s\n\turl = ./s\n' > .gitmodules
+git add .gitmodules; git commit -qm gitmodules
+git config push.recurseSubmodules check; git config submodule.recurse true
+bash_gate deny  "$R" "git $P origin main" "push submodules too"
+bash_gate allow "$R" "git $P --no-recurse-submodules origin main"
+git config --unset submodule.recurse
+git config push.recurseSubmodules on-demand; rm .gitmodules
+bash_gate deny  "$R" "git $P origin main" "push submodules too"
+git $P -q origin main 2>"$T/err" && bad "hook let a recursive push through without .gitmodules on disk" || ok
+git checkout -q -- .gitmodules; git config --unset push.recurseSubmodules
+git rm -q .gitmodules; git commit -qm nogitmodules
+
+# --- round 2 (BUG-1 / IMP-1): sensitive files whatever category wins; infrastructure code is signalled
+mkdir -p terraform tests infra
+k=pass; printf 'db_%sword = "x"\n' "$k" > terraform/prod.tfvars
+echo "X=1" > tests/.env
+echo "export const app = 1" > infra/app.ts
+echo "module.exports = {}" > next.config.js
+git add -f terraform tests/.env infra next.config.js; git commit -qm infra
+ctx=$(python3 "$RV" prepare)
+echo "$ctx" | grep -q "SENSITIVE FILE in push: terraform/prod.tfvars" && ok || bad ".tfvars not reported as sensitive"
+echo "$ctx" | grep -q "SENSITIVE FILE in push: tests/.env" && ok || bad "tests/.env not reported as sensitive"
+echo "$ctx" | grep "infrastructure as code" | grep -q "infra/app.ts" && ok || bad "infra code not signalled"
+echo "$ctx" | grep "infrastructure as code" | grep -q "next.config.js" && ok || bad "framework config not signalled"
+git rm -rq terraform tests/.env infra next.config.js; git commit -qm noinfra
+
+# --- round 2 (RES-1): over-long lines are cut, and the lines after them still arrive
+python3 -c 'print("x" * 5000); print("tail")' > long.txt; git add long.txt; git commit -qm long
+python3 - "$RW/scripts" <<'EOF' && ok || bad "long lines not capped"
+import sys; sys.path.insert(0, sys.argv[1]); import ravenwatch as r
+lines = list(r.git_lines("show", "--format=", "HEAD", max_line=1000))
+sys.exit(0 if "+tail" in lines and max(map(len, lines)) <= 1000 else 1)
+EOF
+git rm -q long.txt; git commit -qm nolong
 
 # --- RES-1: the history scan stops at its time budget and says so
 python3 - "$RW/scripts" <<'EOF' && ok || bad "scan budget"
