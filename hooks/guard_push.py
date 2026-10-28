@@ -46,6 +46,8 @@ PATTERN_OPTION = re.compile(r"exclude|include|ignore|filter|pattern|regex|glob|m
 CD_PREFIXES = {"builtin", "command", "exec", "time", "!", "if", "elif", "then", "else", "do", "while", "until"}
 # More matches than this and a glob is treated as unknowable (checking them all could take too long).
 GLOB_LIMIT = 2000
+# More magic (`*?[`) path components than this: the pattern is uncheckable (deep globs can overflow glob).
+GLOB_DEPTH = 24
 # Longer values are not trimmed (${X%pat} tries every cut): the word counts as unknowable instead.
 TRIM_LIMIT = 4096
 # File names that matter when the directory a command runs in is unknown.
@@ -123,7 +125,10 @@ OUTPUT_OPTS = {
 # `cat > file <<'EOF'` writes the same body as `cat <<'EOF' > file`; the redirect is kept (and checked).
 CAT_HEREDOC = re.compile(r"\bcat\s+((?:\d?>>?\s*[^\s;&|<>()\"'`$]+\s+)?)<<-?\s*(['\"]?)(\w+)\2([^\n]*)\n"
                          r"(?:.*?\n)??[ \t]*\3[ \t]*(?=\n|\)|$)", re.S)
-HARMLESS_REST = re.compile(r"[\s\"')]*(?:(?:(?<=\s)\d+)?>>?\s*[^\s;&|()<>\"']+[\s\"')]*)*")
+HARMLESS_REST = re.compile(r"[\s)]*(?:(?:(?<=\s)\d+)?>>?\s*[^\s;&|()<>\"'`]+[\s)]*)*")
+# Ways to make `cat` run the heredoc body instead of copying it (a function, alias, or a different cat on
+# PATH): then the body is commands, not data, so it must not be dropped.
+CAT_REDEFINED = re.compile(r"\bcat\s*\(\s*\)|\bfunction\s+cat\b|\balias\s+cat=|(?:^|[\s;&|(])PATH=|\b(?:hash|enable)\b")
 REPORTS_PATH = re.compile(r"/ravenwatch/reports(?:/|$)")
 # ravenwatch state file names, wherever they are written (a directory may become a git dir later).
 STATE_NAME = re.compile(r"/ravenwatch/(?:status|latest|brief-approved\.md|brief-trust|verdicts/|checks/"
@@ -170,14 +175,20 @@ def quoting(command):
     once more at the end, where context is None (plain), "'", '"', "$'" (ANSI-C), "#" (comment) or "\\"
     (escaped). `$(…)` and backticks start a fresh context, even inside double quotes. The one quote
     scanner: segments() aside, everything that asks "is this quoted?" uses it."""
-    stack = [[None, None]]  # [open quote, what opened this level: None, "(" or "`"]
+    # Each stack level: [open quote char or None, what opened the level: None (top), "$(" , "(" or "`"].
+    # A plain unquoted "(" opens its own level, so only the ")" that matches "$(" pops the substitution —
+    # a subshell's or case pattern's ")" closes its own "(" level instead.
+    stack = [[None, None]]
     escaped = comment = False
+    prev_was_space = True  # a "#" starts a comment only after real whitespace/operator, never after "\ "
     i, n = 0, len(command)
     while i < n:
         ch, quote = command[i], stack[-1][0]
         yield i, "#" if comment else "\\" if escaped else quote
+        was_space, prev_was_space = prev_was_space, False
         if comment:
             comment = ch != "\n"
+            prev_was_space = ch == "\n"
         elif escaped:
             escaped = False
         elif quote == "'":
@@ -190,7 +201,7 @@ def quoting(command):
         elif ch == "\\":
             escaped = True
         elif ch == "$" and command[i + 1:i + 2] == "(":
-            stack.append([None, "("])
+            stack.append([None, "$("])
             i += 2
             continue
         elif ch == "`":
@@ -206,10 +217,14 @@ def quoting(command):
             continue
         elif ch in "'\"":
             stack[-1][0] = ch
-        elif ch == ")" and len(stack) > 1 and stack[-1][1] == "(":
+        elif ch == "(":
+            stack.append([None, "("])
+        elif ch == ")" and len(stack) > 1 and stack[-1][1] in ("$(", "("):
             stack.pop()
-        elif ch == "#" and (i == 0 or command[i - 1] in " \t\n;&|()"):
+        elif ch == "#" and was_space:
             comment = True
+        else:
+            prev_was_space = ch in " \t\n;&|()"
         i += 1
     yield n, "#" if comment else "\\" if escaped else stack[-1][0]
 
@@ -583,6 +598,10 @@ def expand(base, target):
         return None
     full = target if os.path.isabs(target) else os.path.join(base, target)
     if any(ch in target for ch in "*?["):
+        # Each magic path component makes glob recurse one level; too many would overflow the stack
+        # (and glob that many directories), so treat it as uncheckable rather than risk a crash.
+        if sum(1 for part in full.split(os.sep) if any(ch in part for ch in "*?[")) > GLOB_DEPTH:
+            raise TooManyMatches(target)
         # Like the shell: a pattern that matches nothing is passed on literally — but it is checked
         # against every existing directory its leading part matches, since the file may be created there.
         return [os.path.normpath(p) for p in glob_existing(full)] or [os.path.normpath(full)]
@@ -669,7 +688,7 @@ def path_refusal(word, kind):
     if kind == "var":
         return (f"the guard can't tell where `{word}` points (a variable set from command output, `read`, a "
                 "loop, or not set at all), and this command writes there or names git internals. Use a literal "
-                "path, or set the variable to a literal value in the same command.")
+                "path or a literal file list (`for f in a.md b.md`), or the Edit tool for in-place edits.")
     if kind == "lost":
         return (f"the guard can't tell which directory `{word}` is in, because an earlier `cd` uses a variable, an "
                 "option or `-`. Use absolute paths, or `cd` to a plain absolute path first.")
@@ -719,11 +738,16 @@ def helper_refusal():
 
 def drop_cat_heredocs(command):
     """The command with the bodies of `cat` heredocs left out: they are data (Claude's usual way to pass a
-    commit message), not commands — unless the rest of the first line feeds the body somewhere or chains
-    another command, the `cat` isn't really a command (inside quotes, or inside the body of an earlier
-    heredoc), or the delimiter is unquoted and the body has command substitutions (the shell runs those)."""
+    commit message), not commands. A body is kept (and so checked as commands) unless every one of these
+    holds: the rest of the first line is only redirections, with no quote that could swallow the body
+    (BUG-2); the `cat` is really a command at an unquoted command start, not inside quotes or an earlier
+    heredoc (BUG-1); the delimiter is quoted or the body has no command substitution the shell would run;
+    and nothing in the command redefines `cat` so it would run the body (BUG-3)."""
+    if CAT_REDEFINED.search(command):
+        return command
     return CAT_HEREDOC.sub(
         lambda m: "cat " + m.group(1) + m.group(4) if len(m.group(4)) <= 500 and HARMLESS_REST.fullmatch(m.group(4))
+        and not re.search(r"""["'`]""", m.group(4))
         and "<<" not in command[:m.start()] and unquoted_command_start(command, m.start())
         and (m.group(2) or not re.search(r"`|\$\(", m.group(0).split("\n", 1)[-1]))
         else m.group(0), command)
@@ -743,9 +767,10 @@ def check_bash(command, cwd):
                 "all its digits) can't be checked. Use printf (`printf '\\t'`) or a quoted literal instead.")
     views = shell_views(command)
     if dollar_quotes and any(PUSH_WORD.search(v) or GIT_WORD.search(v) for v in shell_views(data)):
-        return ("$'…' and $\"…\" quoting in a command that mentions git can't be checked. Put the text in a variable "
-                "in an earlier command (`T=$(printf '\\t')`), use printf, or for a commit message write it to a file "
-                "and use `git commit -F <file>`.")
+        return ("$'…' and $\"…\" quoting in a command that mentions git can't be checked. Use git's own escapes "
+                "(`--format=%h%x09%s`), `-z` with `xargs -0` or `read -r -d ''`, `while IFS= read -r f`, a literal "
+                "newline inside single quotes, or set a variable earlier in the same command "
+                "(`T=$(printf '\\t'); git …`). For a commit message, write it to a file and use `git commit -F <file>`.")
     why = bypass_reason(command)
     if why:
         return f"{why}. Run the command without it."
@@ -1019,12 +1044,15 @@ def main():
         else:
             reason = None
     except Exception as exc:
-        # Fail closed only for pushes and for writes to git-looking paths; never brick unrelated tools.
+        # Fail closed for pushes, for writes to git-looking paths, and for any command that could write a
+        # file (a writer, an output option, or a redirect) — a crash while checking one of those must not
+        # let it through (RES-1). Never brick unrelated tools.
         reason = None
         target = str(inp.get("file_path") or inp.get("notebook_path") or "")
         command = inp.get("command") or ""
-        if (tool == "Bash" and (may_push(command) or isinstance(exc, (TimeoutError, subprocess.TimeoutExpired))
-                                and re.search(r"(?i)\.git|ravenwatch|hooks|>", command))) or \
+        writes = re.search(r"(?i)\.git|ravenwatch|hooks|[>$`*?\[]|\b(?:"
+                           + "|".join(map(re.escape, sorted(WRITERS | set(OUTPUT_OPTS)))) + r")\b", command)
+        if (tool == "Bash" and (may_push(command) or writes)) or \
                 (tool != "Bash" and re.search(r"(?i)\.git\b|ravenwatch|hooks", target)):
             reason = (f"internal error while checking this ({type(exc).__name__}: {exc}). "
                       "Start Claude Code with RAVENWATCH_DISABLE=1 to bypass the gate if this persists.")

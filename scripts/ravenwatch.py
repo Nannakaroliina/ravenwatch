@@ -45,6 +45,8 @@ LARGE_HISTORY_COMMITS = 500
 PER_COMMIT_LIMIT = 200
 PATCH_MAX_BYTES = 20 * 1024 * 1024
 SCAN_SECONDS = 240  # secret scan budget (history, then HEAD); `prepare` must finish within the skill's Bash timeout
+# Prefix git_lines puts on each later piece of an over-long line (never the start of a real diff line).
+CONTINUATION = "\x00\x00rw-cont\x00"
 HISTORY_SCAN_SECONDS = 180  # the history's share; the files at HEAD get the rest, and at least a minute
 MAX_SCAN_LINE = 1024 * 1024  # longer lines (binary blobs under --text) are scanned in overlapping pieces this big
 # Generated lockfiles: huge, rarely reviewable line by line; manifests still show dependency changes.
@@ -104,8 +106,9 @@ def budgeted(lines, seconds, state):
 
 
 def hidden_tracked_files():
-    """Tracked files that git status doesn't compare with HEAD (skip-worktree, assume-unchanged, or left out
-    by a sparse checkout) and that are missing from disk or differ there from what is committed."""
+    """{"missing": [...], "changed": [...]} for tracked files git status doesn't compare with HEAD
+    (skip-worktree, assume-unchanged, or left out by a sparse checkout): "missing" are not on disk,
+    "changed" are present but differ from the commit. A present file matching the commit is harmless."""
     res = subprocess.run(["git", "ls-files", "-v", "-s", "-z"], capture_output=True, text=True,
                          errors="surrogateescape")
     if res.returncode != 0:
@@ -117,33 +120,41 @@ def hidden_tracked_files():
         parts = meta.split()
         if tab and len(parts) == 4 and (parts[0] == "S" or parts[0].islower()):
             flagged[path] = parts[2]
-    # A flagged file missing from disk (deleted, or left out by a sparse checkout) hides a change just as
-    # much as an edited one: checks and reviewers would run without it.
-    hidden, present = [], []
+    # Split the flagged files into "missing" (deleted or left out by a sparse checkout) and "changed"
+    # (present on disk but different from the commit). A matching local override is harmless and dropped.
+    missing, present = [], []
     for p in flagged:
-        (hidden if not os.path.isfile(p) or os.path.islink(p) or "\n" in p else present).append(p)
-    if not present:
-        return hidden
-    # A local override that matches the commit is harmless; only content that differs is hidden.
-    disk = subprocess.run(["git", "hash-object", "--stdin-paths"], input="\n".join(present) + "\n",
-                          capture_output=True, text=True, errors="surrogateescape")
-    if disk.returncode != 0:
-        return hidden + present
-    return hidden + [p for p, h in zip(present, disk.stdout.split()) if flagged[p] != h]
+        (missing if not os.path.isfile(p) or os.path.islink(p) or "\n" in p else present).append(p)
+    changed = present
+    if present:
+        disk = subprocess.run(["git", "hash-object", "--stdin-paths"], input="\n".join(present) + "\n",
+                              capture_output=True, text=True, errors="surrogateescape")
+        if disk.returncode == 0:
+            changed = [p for p, h in zip(present, disk.stdout.split()) if flagged[p] != h]
+    return {"missing": missing, "changed": changed}
 
 
 def refuse_hidden_files(paths=None):
-    """Refuse while hidden files (above) could change what is reviewed or tested. paths: only these count —
-    a diff review reads the reviewed files, so a sparse checkout or a local override elsewhere is fine.
-    None (checks, full audits): every hidden file counts, because those read the whole tree."""
-    hidden = [p for p in hidden_tracked_files() if paths is None or p in paths]
-    if hidden:
-        raise RuntimeError("these tracked files are marked skip-worktree or assume-unchanged (or left out by a sparse "
-                           "checkout) and are missing or differ on disk from what is committed: "
-                           f"{', '.join(hidden[:5])}{' …' if len(hidden) > 5 else ''}. Reviewers and checks would "
-                           "read what is on disk. Clear the flag (git update-index --no-skip-worktree "
-                           "--no-assume-unchanged <file>, or git sparse-checkout disable) and commit or stash any "
+    """Refuse while hidden files could change what is reviewed or tested.
+    A changed file (present on disk but different from the commit) is refused in every mode: it can show
+    reviewers code that isn't in the commit. A missing file is refused only when it is in `paths` (the
+    reviewed files of a diff review) or when `paths` is None (checks and full audits read the whole tree),
+    so an ordinary sparse checkout still works for a normal review."""
+    flagged = hidden_tracked_files()
+    changed = flagged["changed"]
+    missing = [p for p in flagged["missing"] if paths is None or p in paths]
+    if changed:
+        raise RuntimeError("these tracked files are marked skip-worktree or assume-unchanged and differ on disk from "
+                           f"what is committed: {', '.join(changed[:5])}{' …' if len(changed) > 5 else ''}. Reviewers "
+                           "and checks would read the version on disk, not the commit. Clear the flag (git "
+                           "update-index --no-skip-worktree --no-assume-unchanged <file>) and commit or stash the "
                            "change first.")
+    if missing:
+        raise RuntimeError("these tracked files are missing from disk but are marked skip-worktree/assume-unchanged "
+                           f"or left out by a sparse checkout: {', '.join(missing[:5])}{' …' if len(missing) > 5 else ''}. "
+                           "Reviewers and checks would run without them. Restore them (git update-index "
+                           "--no-skip-worktree <file> && git checkout -- <file>, or git sparse-checkout add <dir>), "
+                           "or review from a full checkout.")
 
 
 def reviewed_paths(base):
@@ -196,8 +207,9 @@ def git_to_file(path, *args):
 
 def git_lines(*args, max_line=None, deadline=None, state=None):
     """Yield git output line by line (stderr goes to a temp file so a failure can say why).
-    max_line: a longer line comes out in pieces of that size, each starting with the line's first character
-    (the diff's `+`) and overlapping the previous piece, so a pattern across a cut is still seen.
+    max_line: a longer line comes out in pieces of that size. The first piece keeps the line's real start
+    (the diff's marker columns); each later piece is prefixed with CONTINUATION and carries the previous
+    piece's tail, so scan_added_lines reuses the line's marker and a pattern across a cut is still seen.
     deadline (time.monotonic()): git is stopped then, even if it is busy without output, and
     state["cut"] is set instead of reporting a failure."""
     overlap = 512
@@ -215,14 +227,13 @@ def git_lines(*args, max_line=None, deadline=None, state=None):
                 if not line:
                     break
                 if max_line and len(line) >= max_line and not line.endswith("\n"):
-                    marker, piece = line[:1], line
-                    yield piece
+                    yield line  # first piece: real marker columns intact
+                    piece = line
                     while piece and not piece.endswith("\n"):
                         more = proc.stdout.readline(max_line)
                         if not more:
                             break
-                        piece = marker + piece[-overlap:] + more
-                        yield piece.rstrip("\n")
+                        yield CONTINUATION + piece[-overlap:] + more.rstrip("\n")
                         piece = more
                     continue
                 yield line.rstrip("\n")
@@ -640,8 +651,30 @@ def scan_added_lines(lines, commit_label=None):
     # `+++ b/file` is a header only between `diff …` and the first `@@`; inside a hunk every line is content,
     # even one that starts with `++` (so text can't pass itself off as a header and go unscanned). Combined
     # diffs of merges (`@@@`) have one marker column per parent.
-    in_hunk, columns = False, 1
+    in_hunk, columns, scanning_added = False, 1, False
+
+    def scan(line):
+        # Every pattern and every match: an example key earlier on a line must not hide a real one.
+        for name, rx in SECRET_PATTERNS:
+            for m in rx.finditer(line):
+                val = m.group(1) if name in VALUE_GROUP else m.group(0)
+                if name == "Generic secret assignment" and not looks_secret(val):
+                    continue
+                # The value decides; for `name = value` pairs a test-ish name (test_api_key) also counts.
+                placeholder = is_placeholder(val)
+                if name == "Generic secret assignment":
+                    placeholder = placeholder or bool(TESTISH_NAME.search(line[m.start():m.start(1)]))
+                digest = sha256_bytes(val.encode("utf-8", "surrogateescape"))[:16]
+                hits.append((current_file, new_line, name, redact(val), placeholder, commit, digest))
+
     for raw in lines:
+        if raw.startswith(CONTINUATION):
+            # A later piece of an over-long line: same file and line number as the piece it continues,
+            # scanned only if that line was an added line (its marker already decided that).
+            if scanning_added:
+                scan(raw[len(CONTINUATION):])
+            continue
+        scanning_added = False
         if raw.startswith("commit ") and len(raw.split()) >= 2 and re.fullmatch(r"[0-9a-f]{40}", raw.split()[1]):
             commit, in_hunk = raw.split()[1][:8], False
             continue
@@ -662,19 +695,8 @@ def scan_added_lines(lines, commit_label=None):
         marker = raw[:columns]
         if "+" in marker and "-" not in marker:
             new_line += 1
-            line = raw[columns:]
-            # Every pattern and every match: an example key earlier on a line must not hide a real one.
-            for name, rx in SECRET_PATTERNS:
-                for m in rx.finditer(line):
-                    val = m.group(1) if name in VALUE_GROUP else m.group(0)
-                    if name == "Generic secret assignment" and not looks_secret(val):
-                        continue
-                    # The value decides; for `name = value` pairs a test-ish name (test_api_key) also counts.
-                    placeholder = is_placeholder(val)
-                    if name == "Generic secret assignment":
-                        placeholder = placeholder or bool(TESTISH_NAME.search(line[m.start():m.start(1)]))
-                    digest = sha256_bytes(val.encode("utf-8", "surrogateescape"))[:16]
-                    hits.append((current_file, new_line, name, redact(val), placeholder, commit, digest))
+            scanning_added = True
+            scan(raw[columns:])
         elif "-" not in marker:
             new_line += 1
     return hits

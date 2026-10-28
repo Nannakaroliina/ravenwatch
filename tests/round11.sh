@@ -160,18 +160,27 @@ git rm -q keys.py .gitattributes; git commit -qm unkeys
 echo "print(1)" > "työkalut.py"; git add "työkalut.py"; git commit -qm uml
 python3 "$RV" prepare | grep "^- code" | grep -q "työkalut.py" && ok || bad "non-ASCII code file misclassified"
 
-# --- LOOP-3 / IMP-2 (round 4: IMP-1): a skip-worktree file blocks a diff review only when it is one of the
-# reviewed files and differs from the commit; a full audit counts every one. `a` is already pushed, U is not.
+# --- LOOP-3 / IMP-2 / LOOP-2 (round 4-5): a skip-worktree file that is present but DIFFERS from the commit
+# is refused in every mode (it can show reviewers code that isn't committed), whether or not it is in the
+# reviewed range. A MISSING one is refused only when reviewed, or in a full audit. `a` is committed and not
+# changed on the branch (out of range); U is added on the branch (in range).
 U=src/documents/upload.ts
 git update-index --skip-worktree "$U"
 python3 "$RV" prepare >/dev/null 2>"$T/err" && ok || bad "an unchanged skip-worktree file blocked prepare: $(cat "$T/err")"
 echo changed >> "$U"
 python3 "$RV" prepare >/dev/null 2>"$T/err" && bad "prepare ignored a changed, reviewed skip-worktree file" || ok
-grep -q "skip-worktree" "$T/err" && ok || bad "skip-worktree refusal unclear: $(cat "$T/err")"
+grep -q "differ on disk" "$T/err" && ok || bad "changed skip-worktree refusal unclear: $(cat "$T/err")"
 git update-index --no-skip-worktree "$U"; git checkout -q -- "$U"
+# A changed file OUTSIDE the reviewed range is still refused (LOOP-2): reviewers may read it.
 git update-index --skip-worktree a; echo override >> a
-python3 "$RV" prepare >/dev/null 2>"$T/err" && ok || bad "a local override outside the reviewed files blocked prepare: $(cat "$T/err")"
-python3 "$RV" prepare --full >/dev/null 2>"$T/err" && bad "full audit ignored a changed skip-worktree file" || ok
+python3 "$RV" prepare >/dev/null 2>"$T/err" && bad "a changed skip-worktree file outside the range was allowed" || ok
+grep -q "differ on disk" "$T/err" && ok || bad "out-of-range changed refusal unclear: $(cat "$T/err")"
+git update-index --no-skip-worktree a; git checkout -q -- a
+# A MISSING file outside the reviewed range is allowed in a diff review (sparse checkout), refused in --full.
+git update-index --skip-worktree a; rm a
+python3 "$RV" prepare >/dev/null 2>"$T/err" && ok || bad "a missing file outside the range blocked a diff review: $(cat "$T/err")"
+python3 "$RV" prepare --full >/dev/null 2>"$T/err" && bad "full audit ignored a missing skip-worktree file" || ok
+grep -q "missing from disk" "$T/err" && ok || bad "missing-file refusal unclear: $(cat "$T/err")"
 git update-index --no-skip-worktree a; git checkout -q -- a
 echo changed >> a
 python3 "$RV" prepare --full >/dev/null 2>"$T/err" && bad "full audit ran over uncommitted tracked changes" || ok
@@ -182,7 +191,7 @@ git checkout -q -- a
 python3 "$RV" prepare >/dev/null
 git update-index --skip-worktree "$U"; echo changed >> "$U"
 python3 "$RV" mark --verdict pass --secrets-cleared >/dev/null 2>"$T/err" && bad "mark passed over a hidden change" || ok
-grep -q "skip-worktree" "$T/err" && ok || bad "mark's skip-worktree refusal unclear: $(cat "$T/err")"
+grep -q "differ on disk" "$T/err" && ok || bad "mark's skip-worktree refusal unclear: $(cat "$T/err")"
 python3 "$RV" mark --verdict block >/dev/null 2>&1 && ok || bad "mark refused block over a hidden change"
 git update-index --no-skip-worktree "$U"; git checkout -q -- "$U"
 python3 "$RV" prepare --full >/dev/null
@@ -262,6 +271,23 @@ bash_gate deny  "$R" 'cp /tmp/f $PWD/.gi?/ravenwatch/status' "inside a git direc
 bash_gate deny  "$R" "cat <<EOF
 \$(git -C $N $P)
 EOF" "command substitution"
+
+# --- round 5 (BUG-2): a quote after the delimiter opens a string that swallows the body — keep the body
+bash_gate deny  "$R" "cat <<'EOF' \"
+\$(git -C $N $P)
+EOF
+\"" "command substitution"
+
+# --- round 5 (BUG-3): cat redefined in the same command runs the body, so it is not dropped
+bash_gate deny  "$R" "cat() { sh; }; cat <<'EOF'
+git -C $N $P origin main
+EOF" "not installed"
+bash_gate deny  "$R" "alias cat=sh; cat <<'EOF'
+git -C $N $P origin main
+EOF" "not installed"
+
+# --- round 5 (DES-1): a # after an escaped space is not a comment, so a later $'…' is still seen
+bash_gate deny  "$R" "echo a\\ #x; git \$'pu\\x73h' origin main" "mentions git"
 
 # --- round 2-4 (BUG-3 / LOOP-1 / IMP-1): of the two settings, the one git reads last wins …
 git config push.recurseSubmodules check; git config submodule.recurse true
@@ -343,10 +369,25 @@ python3 - "$RW/scripts" <<'EOF' && ok || bad "long lines not scanned in bounded 
 import sys; sys.path.insert(0, sys.argv[1]); import ravenwatch as r
 lines = list(r.git_lines("show", "--format=", "HEAD", max_line=1000))
 hits = r.scan_added_lines(lines)
-sys.exit(0 if "+tail" in lines and max(map(len, lines)) <= 1000 + 513
+cap = 1000 + 512 + len(r.CONTINUATION)
+sys.exit(0 if "+tail" in lines and max(map(len, lines)) <= cap
          and any(h[2] == "AWS access key ID" for h in hits) else print(len(lines), hits) or 1)
 EOF
 git rm -q long.txt; git commit -qm nolong
+
+# --- round 5 (LOOP-1): a long `++` line in a combined (merge) diff is scanned in full, so a `-` placed at a
+# piece boundary can't make a continuation look like a deletion and skip a key after the first MiB.
+python3 - "$RW/scripts" <<'EOF' && ok || bad "a long ++ merge line hid a key from the scan"
+import sys; sys.path.insert(0, sys.argv[1]); import ravenwatch as r
+k = "AKIA" + "Q7RTYU2X9ZPLM4KD"
+# Build the combined-diff lines git_lines would yield for a 2-column `++` line over the cap: a first piece
+# whose tail is `-` (so a naive 2-col marker would read `+-`), then the key in a continuation.
+first = "++" + "y" * 1500 + "-"
+cont = r.CONTINUATION + "-x KEY=" + k
+lines = ["diff --cc x.js", "--- a/x.js", "+++ b/x.js", "@@@ -1,1 -1,1 +1,2 @@@", first, cont, "++ok"]
+hits = r.scan_added_lines(lines)
+sys.exit(0 if any(h[2] == "AWS access key ID" and h[0] == "x.js" for h in hits) else print(hits) or 1)
+EOF
 
 # --- round 4 (LOOP-2): a piece that starts with `++` (or an added line that does) is still scanned
 python3 - "$RW/scripts" <<'EOF' && ok || bad "a ++ line or piece hid a key from the scan"
@@ -364,7 +405,7 @@ EOF
 git update-index --skip-worktree a; rm a
 python3 "$RV" prepare >/dev/null 2>"$T/err" && ok || bad "a missing file outside the reviewed ones blocked prepare: $(cat "$T/err")"
 python3 "$RV" prepare --full >/dev/null 2>"$T/err" && bad "full audit ignored a deleted skip-worktree file" || ok
-grep -q "missing or differ" "$T/err" && ok || bad "deleted skip-worktree refusal unclear: $(cat "$T/err")"
+grep -q "missing from disk" "$T/err" && ok || bad "deleted skip-worktree refusal unclear: $(cat "$T/err")"
 git update-index --no-skip-worktree a; git checkout -q -- a
 printf -- '---\nchecks:\n  - name: ok\n    run: "true"\n---\n# P\n' > .ravenwatch.md
 sha=$(python3 "$RV" trust-brief --private 2>&1 | sed -n 's/^sha256: //p')
@@ -372,7 +413,7 @@ python3 "$RV" trust-brief --private --approve "$sha" >/dev/null 2>&1 || bad "app
 python3 "$RV" prepare >/dev/null
 git update-index --skip-worktree a; rm a
 python3 "$RV" checks >/dev/null 2>"$T/err" && bad "checks ran with a deleted skip-worktree file" || ok
-grep -q "missing or differ" "$T/err" && ok || bad "checks' skip-worktree refusal unclear: $(cat "$T/err")"
+grep -q "missing from disk" "$T/err" && ok || bad "checks skip-worktree refusal unclear: $(cat "$T/err")"
 git update-index --no-skip-worktree a; git checkout -q -- a
 U=src/documents/upload.ts
 git update-index --skip-worktree "$U"; rm "$U"
