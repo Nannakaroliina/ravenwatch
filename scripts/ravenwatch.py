@@ -43,6 +43,7 @@ KEEP_VERDICTS = 50
 LARGE_HISTORY_COMMITS = 500
 PER_COMMIT_LIMIT = 200
 PATCH_MAX_BYTES = 20 * 1024 * 1024
+SCAN_SECONDS = 240  # history secret scan budget; `prepare` must finish within the review skill's Bash timeout
 # Generated lockfiles: huge, rarely reviewable line by line; manifests still show dependency changes.
 LOCKFILES = ["package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml", "bun.lockb", "poetry.lock",
              "Pipfile.lock", "uv.lock", "Cargo.lock", "Gemfile.lock", "composer.lock", "go.sum"]
@@ -64,7 +65,7 @@ HIGH_RISK = re.compile(r"auth|login|logout|sign_?in|sign_?up|session|token|oauth
 
 
 def git(*args, check=True):
-    res = subprocess.run(["git", *args], capture_output=True, text=True,
+    res = subprocess.run(["git", "-c", "core.quotePath=false", *args], capture_output=True, text=True,
                          encoding="utf-8", errors="replace")
     if check and res.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)} failed: {res.stderr.strip()}")
@@ -74,6 +75,61 @@ def git(*args, check=True):
 def empty_tree():
     """The empty tree's id in this repository's hash (SHA-1 or SHA-256)."""
     return git("hash-object", "-t", "tree", "/dev/null")
+
+
+# Global git options for diffs and logs that must show every file's real content: the repository's own
+# .gitattributes (`-diff`, `binary`, textconv drivers) are ignored. Set by `prepare` (needs git 2.42+).
+ATTR_FREE = []
+
+
+def ignore_repo_attributes():
+    opt = f"--attr-source={empty_tree()}"
+    ATTR_FREE[:] = [opt] if git_ok(opt, "rev-parse", "HEAD") else []
+
+
+def budgeted(lines, seconds, state):
+    """Pass lines through until the time budget runs out; count commits and record whether it was cut short."""
+    deadline = time.monotonic() + seconds
+    for line in lines:
+        if line.startswith("commit "):
+            state["commits"] += 1
+        if time.monotonic() > deadline:
+            state["cut"] = True
+            lines.close()
+            return
+        yield line
+
+
+def hidden_tracked_files():
+    """Tracked files on disk that git status doesn't compare with HEAD (skip-worktree or assume-unchanged),
+    so their content on disk may differ from the commit being reviewed. Sparse-checkout files that aren't on
+    disk don't count."""
+    res = subprocess.run(["git", "ls-files", "-v", "-z"], capture_output=True, text=True, errors="surrogateescape")
+    if res.returncode != 0:
+        raise RuntimeError(f"git ls-files failed: {res.stderr.strip()[:200]}")
+    hidden = []
+    for entry in res.stdout.split("\0"):
+        if len(entry) > 2 and (entry[0] == "S" or entry[0].islower()) and os.path.lexists(entry[2:]):
+            hidden.append(entry[2:])
+    return hidden
+
+
+def refuse_hidden_files():
+    hidden = hidden_tracked_files()
+    if hidden:
+        raise RuntimeError("these tracked files are marked skip-worktree or assume-unchanged, so what is on disk may "
+                           f"not be what is committed: {', '.join(hidden[:5])}{' …' if len(hidden) > 5 else ''}. "
+                           "Clear the flag (git update-index --no-skip-worktree --no-assume-unchanged <file>) first.")
+
+
+def tracked_changes():
+    """Tracked files whose content on disk differs from HEAD (untracked files are left out)."""
+    res = subprocess.run(["git", "status", "--porcelain=v1", "-z", "--untracked-files=no", "--ignore-submodules=none"],
+                         capture_output=True, text=True, errors="surrogateescape")
+    if res.returncode != 0:
+        raise RuntimeError("could not tell whether the working tree matches HEAD (`git status` failed: "
+                           f"{res.stderr.strip()[:200]})")
+    return [e[3:] for e in res.stdout.split("\0") if len(e) > 3 and e[2] == " "]
 
 
 def git_ok(*args):
@@ -99,7 +155,7 @@ def write_capped(path, max_bytes, lines):
 def git_to_file(path, *args):
     """Stream git output straight to a file instead of holding it in memory."""
     with open(path, "w", encoding="utf-8") as fh:
-        res = subprocess.run(["git", *args], stdout=fh, stderr=subprocess.PIPE, text=True,
+        res = subprocess.run(["git", "-c", "core.quotePath=false", *args], stdout=fh, stderr=subprocess.PIPE, text=True,
                              encoding="utf-8", errors="replace")
     if res.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)} failed: {res.stderr.strip()}")
@@ -108,7 +164,7 @@ def git_to_file(path, *args):
 def git_lines(*args):
     """Yield git output line by line (stderr goes to a temp file so a failure can say why)."""
     with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as err:
-        proc = subprocess.Popen(["git", *args], stdout=subprocess.PIPE, stderr=err, text=True,
+        proc = subprocess.Popen(["git", "-c", "core.quotePath=false", *args], stdout=subprocess.PIPE, stderr=err, text=True,
                                 encoding="utf-8", errors="replace")
         try:
             for line in proc.stdout:
@@ -285,24 +341,29 @@ def decide_range(args, sdir):
 
 # -------------------------------------------------------------- classification
 
+# First match wins. Code is recognised by its extension before the path-based buckets, so
+# src/documents/upload.ts, src/auth/credentials.ts or infra/repository.ts still reach the code reviewers.
 CATEGORY_RULES = [
-    ("secret-file", re.compile(r"(^|/)(\.env(\..*)?|\.dev\.vars|.*\.pem|.*\.key|.*\.p12|.*\.pfx|id_rsa|id_ed25519|"
-                               r".*credentials.*|.*\.tfstate(\.backup)?|.*\.tfvars|service[-_]account.*\.json|"
-                               r".*\.sqlite3?|.*\.db|\.npmrc|\.pypirc|\.netrc)$", re.I)),
     ("ci", re.compile(r"(^|/)(\.github/workflows/|\.gitlab-ci\.yml|\.circleci/|azure-pipelines|bitbucket-pipelines)", re.I)),
     ("container", re.compile(r"(^|/)(Dockerfile[^/]*|docker-compose[^/]*\.ya?ml|compose\.ya?ml|\.dockerignore)$", re.I)),
-    ("iac", re.compile(r"(\.tf$|\.tfvars$|(^|/)cdk\.json$|(^|/)lib/.*-stack\.(ts|js|py)$|cloudformation|template\.ya?ml$|"
-                       r"serverless\.ya?ml$|samconfig|(^|/)infra/|(^|/)terraform/|policy.*\.json$)", re.I)),
     ("manifest", re.compile(r"(^|/)(package\.json|package-lock\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|bun\.lockb?|"
                             r"requirements[^/]*\.txt|Pipfile(\.lock)?|pyproject\.toml|poetry\.lock|uv\.lock|setup\.(py|cfg)|"
                             r"Cargo\.(toml|lock)|go\.(mod|sum)|Gemfile(\.lock)?|composer\.(json|lock)|pom\.xml|build\.gradle(\.kts)?)$", re.I)),
-    ("config", re.compile(r"(^|/)(wrangler\.(toml|jsonc?)|\.gitignore|.*\.config\.(js|ts|mjs|cjs)|.*\.(ya?ml|toml|ini|conf|cfg)|"
-                          r"nginx.*|\.htaccess|_headers|_redirects|vercel\.json|netlify\.toml|firebase\.json)$", re.I)),
+    ("iac", re.compile(r"(\.tf$|\.tfvars$|(^|/)cdk\.json$|(^|/)lib/[^/]*-stack\.(ts|js|py)$|cloudformation|template\.ya?ml$|"
+                       r"serverless\.ya?ml$|samconfig|policy[^/]*\.json$)", re.I)),
     ("test", re.compile(r"(^|/)(tests?|__tests__|spec|e2e)/|\.(test|spec)\.[a-z]+$|_test\.(go|py)$|(^|/)test_[^/]+\.py$", re.I)),
-    ("docs", re.compile(r"\.(md|mdx|rst|txt|adoc)$|(^|/)(docs?|LICENSE|CHANGELOG)", re.I)),
+    ("code", re.compile(r"\.(js|jsx|ts|tsx|mjs|cjs|mts|cts|py|rb|go|rs|java|kt|kts|swift|php|cs|c|cc|cpp|h|hpp|m|mm|sh|"
+                        r"bash|zsh|ps1|psm1|bat|cmd|pl|pm|sql|html?|vue|svelte|astro|lua|dart|scala|groovy|ex|exs|erl|hs|"
+                        r"clj|cljs|fs|r|jl|sol|ejs|erb|hbs|njk|twig|liquid|j2|jinja2?)$", re.I)),
+    ("secret-file", re.compile(r"(^|/)(\.env(\..*)?|\.dev\.vars|.*\.pem|.*\.key|.*\.p12|.*\.pfx|id_rsa|id_ed25519|"
+                               r".*credentials.*|.*\.tfstate(\.backup)?|.*\.tfvars|service[-_]account.*\.json|"
+                               r".*\.sqlite3?|.*\.db|\.npmrc|\.pypirc|\.netrc)$", re.I)),
+    ("iac", re.compile(r"(^|/)(infra|terraform)/", re.I)),
+    ("config", re.compile(r"(^|/)(wrangler\.(toml|jsonc?)|\.gitignore|\.gitattributes|.*\.(ya?ml|toml|ini|conf|cfg)|"
+                          r"\.htaccess|_headers|_redirects|vercel\.json|netlify\.toml|firebase\.json)$", re.I)),
+    ("docs", re.compile(r"\.(md|mdx|rst|txt|adoc)$|(^|/)docs?/|(^|/)(LICENSE|LICENCE|COPYING|NOTICE|AUTHORS|CHANGELOG)"
+                        r"([.-][^/]*)?$", re.I)),
     ("asset", re.compile(r"\.(png|jpe?g|gif|webp|svg|ico|woff2?|ttf|otf|mp[34]|wav|pdf|zip|gz)$", re.I)),
-    ("code", re.compile(r"\.(js|jsx|ts|tsx|mjs|cjs|py|rb|go|rs|java|kt|swift|php|cs|c|cc|cpp|h|hpp|sh|bash|zsh|sql|"
-                        r"html?|vue|svelte|astro|lua|dart|scala|ex|exs)$", re.I)),
 ]
 
 
@@ -311,6 +372,12 @@ def classify(path):
         if rx.search(path):
             return name
     return "other"
+
+
+def classify_file(path):
+    """classify(), plus extension-less scripts in the working tree (bin/deploy with a #! line) count as code."""
+    c = classify(path)
+    return "code" if c == "other" and has_shebang(path) else c
 
 
 # Secondary tags used to decide which reviewers run. A file can carry several.
@@ -390,7 +457,7 @@ def audit_inventory(files, sizes):
     generated = marked_generated(paths)
     code, skipped = [], {}
     for p in paths:
-        c = classify(p)
+        c = classify_file(p)
         added = sizes.get(p, ("-", "-"))[0]
         if os.path.basename(p) in LOCKFILES:
             skipped[p] = "lockfile"
@@ -398,7 +465,7 @@ def audit_inventory(files, sizes):
             skipped[p] = "vendored/generated"
         elif not added.isdigit():
             skipped[p] = "binary"
-        elif c == "code" or (c == "other" and has_shebang(p)):
+        elif c == "code":
             high = bool(HIGH_RISK.search(p)) or bool({"api", "migration"} & set(signals_for(p)))
             code.append((p, int(added), high))
         else:
@@ -545,6 +612,15 @@ def cmd_prepare(args):
         return 0
     head = git("rev-parse", "HEAD")
     base, label, mode, covered_base = decide_range(args, sdir)
+    ignore_repo_attributes()
+    if mode != "worktree":
+        refuse_hidden_files()
+    if mode == "full":
+        changed = tracked_changes()
+        if changed:
+            raise RuntimeError("a full audit has its reviewers read the files on disk, so they must match HEAD, but "
+                               f"these tracked files have uncommitted changes: {', '.join(changed[:5])}"
+                               f"{' …' if len(changed) > 5 else ''}. Commit or stash them first.")
     run_id, cur = new_run_dir(sdir)
     diff_path = os.path.join(cur, "diff.patch")
 
@@ -554,17 +630,17 @@ def cmd_prepare(args):
     patch_truncated = False
     touched = ""
     if mode == "worktree":
-        git_to_file(diff_path, "diff", "HEAD", "--no-color", "--no-ext-diff", "-U8")
-        names = git("diff", "HEAD", "--name-status", "--no-renames")
-        numstat = git("diff", "HEAD", "--numstat", "--no-renames")
+        git_to_file(diff_path, *ATTR_FREE, "diff", "HEAD", "--no-color", "--no-ext-diff", "--no-textconv", "-U8")
+        names = git(*ATTR_FREE, "diff", "HEAD", "--name-status", "--no-renames")
+        numstat = git(*ATTR_FREE, "diff", "HEAD", "--numstat", "--no-renames")
         commits = ""
         rng = None
     else:
         # A full audit has no diff to read: the reviewers read the files at HEAD, group by group.
         if mode != "full":
-            git_to_file(diff_path, "diff", base, "HEAD", "--no-color", "--no-ext-diff", "-U8")
-        names = git("diff", base, "HEAD", "--name-status", "--no-renames")
-        numstat = git("diff", base, "HEAD", "--numstat", "--no-renames")
+            git_to_file(diff_path, *ATTR_FREE, "diff", base, "HEAD", "--no-color", "--no-ext-diff", "--no-textconv", "-U8")
+        names = git(*ATTR_FREE, "diff", base, "HEAD", "--name-status", "--no-renames")
+        numstat = git(*ATTR_FREE, "diff", base, "HEAD", "--numstat", "--no-renames")
         rng = "HEAD" if base == empty_tree() else f"{base}..HEAD"
         n_commits = int(git("rev-list", "--count", rng))
         commits = git("log", "--no-color", "--format=%h %s", "-n", "50", rng)
@@ -573,7 +649,8 @@ def cmd_prepare(args):
         if 1 < n_commits <= PER_COMMIT_LIMIT and mode != "full":
             commits_path = os.path.join(cur, "commits.patch")
             patch_truncated = write_capped(commits_path, PATCH_MAX_BYTES, git_lines(
-                "log", "-p", "--reverse", "--no-color", "--no-ext-diff", "--format=commit %H%n%s%n", rng,
+                *ATTR_FREE, "log", "-p", "--reverse", "--no-color", "--no-ext-diff", "--no-textconv",
+                "--format=commit %H%n%s%n", rng,
                 "--", ".", *(f":(exclude,glob)**/{p}" for p in LOCKFILES)))
 
     files = []
@@ -604,7 +681,7 @@ def cmd_prepare(args):
     cats = {}
     with open(os.path.join(cur, "files.txt"), "w", encoding="utf-8") as fh:
         for status, path in files:
-            c = classify(path)
+            c = classify_file(path)
             cats.setdefault(c, []).append(path)
             a, d = sizes.get(path, ("-", "-"))
             extra = ""
@@ -612,14 +689,22 @@ def cmd_prepare(args):
                 extra = "\t" + (in_group.get(path) or f"not grouped: {skipped.get(path, c)}")
             fh.write(f"{status}\t{c}\t+{a}/-{d}\t{path}{extra}\n")
 
-    # Scan: committed history (catches secrets added then removed), or the diff for worktree/full mode.
-    # Both are streamed so a long history never has to fit in memory.
+    # Scan: committed history (catches secrets added then removed), or the uncommitted diff for worktree
+    # mode. Streamed so a long history never has to fit in memory; --text so neither `-diff`/`binary`
+    # attributes nor a NUL byte can hide a file's lines. A history too big for the time budget is
+    # replaced by a scan of the files at HEAD, and the context says so.
+    scan = {"commits": 0, "cut": False}
+    text_opts = ("--no-color", "--no-ext-diff", "--text", "--no-textconv")
     if rng:
-        hits = scan_added_lines(git_lines("log", "-p", "--cc", "--no-color", "--no-ext-diff",
-                                          "--format=commit %H", rng))
+        hits = scan_added_lines(budgeted(git_lines(*ATTR_FREE, "log", "-p", "--cc", *text_opts, "--format=commit %H",
+                                                   rng), SCAN_SECONDS, scan))
+        if scan["cut"]:
+            tree = {"commits": 0, "cut": False}
+            hits += scan_added_lines(budgeted(git_lines(*ATTR_FREE, "diff", empty_tree(), "HEAD", *text_opts),
+                                              SCAN_SECONDS, tree), "HEAD")
+            scan["tree_cut"] = tree["cut"]
     else:
-        with open(diff_path, encoding="utf-8", errors="replace") as fh:
-            hits = scan_added_lines(line.rstrip("\n") for line in fh)
+        hits = scan_added_lines(git_lines(*ATTR_FREE, "diff", "HEAD", *text_opts))
     # One entry per distinct value (by hash), so two different keys with the same prefix are both listed.
     seen, uniq, repeats = {}, [], {}
     for h in hits:
@@ -705,7 +790,7 @@ def cmd_prepare(args):
         for s in signals_for(path):
             sig.setdefault(s, []).append(path)
     deleted = [p for s, p in files if s == "D"]
-    own_code = [p for _, p in own if classify(p) == "code"]
+    own_code = [p for _, p in own if classify_file(p) == "code"]
     code_changed = len(own_code)
     tests_changed = sum(1 for _, p in own if classify(p) == "test")
     code_lines = sum(int(sizes.get(p, ("0", "0"))[0]) + int(sizes.get(p, ("0", "0"))[1])
@@ -727,7 +812,7 @@ def cmd_prepare(args):
     if mode == "full":
         out.append(f"- code lines: {code_lines}; code files: {code_changed}; test files: {tests_changed}"
                    + (" (the repository has no tests)" if code_changed and not tests_changed else ""))
-        found = personal_data_files(git_lines("diff", base, "HEAD", "--no-color", "--no-ext-diff", "--", ".",
+        found = personal_data_files(git_lines(*ATTR_FREE, "diff", base, "HEAD", "--no-color", "--no-ext-diff", "--", ".",
                                               *(f":(exclude,glob)**/{p}" for p in LOCKFILES)))
     else:
         out.append(f"- code lines changed: {code_lines}; code files: {code_changed}; test files: {tests_changed}"
@@ -753,6 +838,14 @@ def cmd_prepare(args):
         if reasons:
             out.append("- not in any group (still secret-scanned): "
                        + ", ".join(f"{r} {n}" for r, n in sorted(reasons.items())))
+        # Files with a code extension or #! line that no group reviews: repository content (.gitattributes,
+        # a NUL byte) can put them there, so name each one.
+        codeish = sorted(p for p, r in skipped.items() if r in ("binary", "vendored/generated")
+                         and (dict(CATEGORY_RULES)["code"].search(p) or has_shebang(p)))
+        if codeish:
+            out.append(f"- code-like files in no group ({len(codeish)}): " + ", ".join(codeish[:30])
+                       + (f" … and {len(codeish) - 30} more" if len(codeish) > 30 else "")
+                       + " — tell the owner; if any is their own source, add it to a group")
         # Repository content (paths, .gitattributes) decides what counts as vendored, so show all of it.
         by_dir = {}
         for p, r in skipped.items():
@@ -786,7 +879,17 @@ def cmd_prepare(args):
             out.append(f"- … and {n_commits - 50} more")
     out.append("")
     out.append("## Deterministic scan")
-    if not (uniq or sensitive or large or gitignore_gaps):
+    if scan["cut"]:
+        out.append(f"- WARNING: history scan incomplete: stopped after {scan['commits']} of {n_commits} commit(s) "
+                   f"({SCAN_SECONDS} s budget); the files at HEAD were scanned instead"
+                   + (" (that scan was cut short too)" if scan.get("tree_cut") else "")
+                   + ". Secrets added and later removed in the rest of the history were not checked; run gitleaks "
+                   "on the full history.")
+    binary = sorted(p for s, p in files if s != "D" and sizes.get(p, ("0",))[0] == "-")
+    if binary and mode != "full":
+        out.append(f"- binary in the diff ({len(binary)}; reviewers can't read them there, the secret scan does): "
+                   + ", ".join(binary[:20]) + (f" … and {len(binary) - 20} more" if len(binary) > 20 else ""))
+    if not (uniq or sensitive or large or gitignore_gaps or scan["cut"]):
         out.append("- clean: no secret patterns, sensitive files, large files or .gitignore gaps detected")
     for i, (f, ln, name, red, ph, cm, _) in enumerate(uniq):
         tag = "possible placeholder" if ph else "LIKELY REAL"
@@ -820,6 +923,7 @@ def cmd_prepare(args):
         f"blocking_checks={','.join(blocking)}",
         f"head={head}", f"diff_base={base}", f"base={covered_base}", f"mode={mode}", f"range={label}",
         f"likely_secrets={likely}", f"profile={'quick' if args.quick else 'standard'}", f"draft_dir={draft_dir}",
+        f"scan_incomplete={1 if scan['cut'] else 0}",
     ])
     write_kv_atomic(os.path.join(sdir, "runs", "latest"), [run_id])
     print(text)
@@ -899,6 +1003,12 @@ def cmd_mark(args):
     if prepared["head"] != head:
         raise RuntimeError(f"HEAD moved since this review was prepared (reviewed {prepared['head'][:8]}, "
                            f"now {head[:8]}); the verdict would cover commits nobody reviewed. Review again.")
+    if args.verdict in ALLOWED and prepared.get("mode") != "worktree":
+        # Reviewers and checks read the files on disk; they must be the commit the verdict unlocks.
+        refuse_hidden_files()
+        if prepared.get("mode") == "full" and tracked_changes():
+            raise RuntimeError("tracked files changed on disk since this full audit was prepared, so the reviewers may "
+                               "not have read what HEAD contains. Commit or stash, then review again.")
     brief_sha = current_brief_sha(sdir)
     if args.verdict in ALLOWED and prepared.get("brief_sha", "") != brief_sha:
         raise RuntimeError("the approved project brief changed since this review was prepared, so its checks, "
@@ -1483,6 +1593,7 @@ def cmd_checks(args):
         raise RuntimeError("checks run the files on disk, so they need exactly the reviewed commits, but there are "
                            f"uncommitted or untracked files: {listed}. Commit them, `git stash -u`, or add them to "
                            ".gitignore — then prepare the review again if you committed.")
+    refuse_hidden_files()
     shim_dir = tempfile.mkdtemp(prefix="ravenwatch-git-")
     real_git = shutil.which("git") or "/usr/bin/git"
     with open(os.path.join(shim_dir, "git"), "w", encoding="utf-8") as fh:

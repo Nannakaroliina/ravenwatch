@@ -1,0 +1,186 @@
+#!/bin/sh
+# Regression tests for the full-audit findings (0.4.1): the helper shortcut with a second line, variables
+# that build names or paths, heredocs inside heredocs or quotes, git output options into .git, comments
+# after escaped spaces, unknown git options and alias chains; the CDPATH, submodule-config and modified-hook
+# gaps in the tests; the file classifier, .gitattributes that hide content, quoted non-ASCII paths,
+# skip-worktree files and the history scan's time budget.
+# Pushes only to throwaway bare remotes under $T.
+set -u
+RW=$(cd "$(dirname "$0")/.." && pwd)
+T=$(mktemp -d "${TMPDIR:-/tmp}/rwtest11.XXXXXX")
+# Test a private copy of the plugin, so the results never depend on this checkout's state.
+mkdir -p "$T/plugin" && cp -R "$RW/scripts" "$RW/hooks" "$T/plugin/"
+RW="$T/plugin"
+G="$RW/hooks/guard_push.py"
+unset RAVENWATCH_DISABLE RAVENWATCH_CHECKS_RUNNING XDG_CONFIG_HOME GIT_DIR GIT_WORK_TREE CDPATH
+export GIT_CONFIG_NOSYSTEM=1
+trap 'rm -rf "$T"' EXIT
+export HOME="$T/home"; mkdir -p "$HOME"
+P=push
+cd "$T"
+git init -q --bare -b main remote.git
+git init -q -b main r && cd r
+git config user.email t@example.com; git config user.name t
+echo a > a; git add .; git commit -qm a
+git remote add origin "$T/remote.git"
+git $P -q -u origin main
+R="$T/r"
+RV="$RW/scripts/ravenwatch.py"
+python3 "$RV" install-hook >/dev/null
+N="$T/nohook"; git init -q "$N"
+
+pass=0; failn=0
+ok() { pass=$((pass+1)); }
+bad() { failn=$((failn+1)); echo "FAIL: $*"; }
+bash_gate() { # expect cwd command [text the reason must contain]
+  out=$(python3 -c 'import json,sys; print(json.dumps({"tool_name":"Bash","cwd":sys.argv[1],"tool_input":{"command":sys.argv[2]}}))' "$2" "$3" | python3 "$G")
+  [ -n "$out" ] && got=deny || got=allow
+  [ "$got" = "$1" ] && ok || bad "expected $1 got $got: $3 $out"
+  if [ $# -ge 4 ] && [ "$1" = deny ]; then
+    echo "$out" | grep -q -- "$4" && ok || bad "reason for '$3' lacks '$4': $out"
+  fi
+}
+commit() { echo "$1" > "$1"; git add "$1"; git commit -qm "$1"; }
+
+# --- BUG-1: the helper shortcut only covers a single line
+bash_gate deny  "$R" "python3 $RV
+git -C $N $P" "not installed"
+bash_gate allow "$R" "python3 $RV status"
+
+# --- SEC-1: names built from variables
+bash_gate deny  "$R" 'export RAVENWATCH_DISAB${U}LE=1 && git '$P' origin main' "RAVENWATCH_DISABLE"
+bash_gate deny  "$R" 'export RAVENWATCH_DIS"$U"ABLE=1' "RAVENWATCH_DISABLE"
+bash_gate deny  "$R" 'export GIT_CONF${U}IG_COUNT=1' "GIT_CONFIG"
+bash_gate deny  "$R" 'X=ABLE; export RAVENWATCH_DIS$X=1' "builds a variable name"
+bash_gate deny  "$R" 'B=main; git '$P' origin $B' "uses shell variables"
+bash_gate deny  "$R" 'git config ali${U}as.x '$P "aliases"
+
+# --- SEC-2 / BUG-3: paths through variables
+bash_gate deny  "$R" 'd=.git; mkdir -p $d/ravenwatch && printf x > $d/ravenwatch/status' "inside a git directory"
+bash_gate deny  "$R" 'G=.git; cp /tmp/forged $G/ravenwatch/status' "inside a git directory"
+bash_gate deny  "$R" 'd=$(echo x); cp /tmp/f $d/thing' "can't tell where"
+bash_gate deny  "$R" 'read d; printf x > $d' "can't tell where"
+bash_gate deny  "$R" 'cat $UNSET_DIR/ravenwatch/status' "can't tell where"
+bash_gate allow "$R" 'for f in a b; do cp $f /tmp/; done'
+bash_gate allow "$R" 'x=$(mktemp); echo hi > $x'
+bash_gate allow "$R" 'cp a $TMPDIR/b'
+bash_gate allow "$R" 'echo "costs $5" > /tmp/out.txt'
+
+# --- BUG-2: a `cat` heredoc only counts as data where `cat` really is a command
+bash_gate deny  "$R" "python3 - <<X
+cat <<EOF
+X
+git -C $N $P
+EOF" "not installed"
+bash_gate deny  "$R" "echo 'x
+cat <<EOF'
+git -C $N $P
+EOF" "not installed"
+bash_gate allow "$R" 'git commit -m "$(cat <<'"'"'EOF'"'"'
+Fix the '$P' gate
+EOF
+)"'
+
+# --- BUG-4: git options that write files are path-checked; naming a repository is fine
+bash_gate deny  "$R" "git checkout-index -f --prefix=.git/ ravenwatch/status" "inside a git directory"
+bash_gate deny  "$R" "git format-patch -o .git/x HEAD~1" "inside a git directory"
+bash_gate allow "$R" "git clone -q $T/remote.git $T/c2"
+
+# --- BUG-5: `a\ #` is one word, not a comment
+bash_gate deny  "$R" "echo a\\ #; git -C $N $P" "not installed"
+bash_gate deny  "$R" "echo a # note
+git -C $N $P" "not installed"
+
+# --- BUG-6: an option the guard doesn't know may swallow a word before the subcommand
+bash_gate deny  "$R" "git -C $N --attr-source HEAD $P origin main" "not installed"
+bash_gate deny  "$R" "git --frobnicate HEAD $P origin main" "can't tell whether it pushes"
+bash_gate allow "$R" "git stash $P -m wip"
+
+# --- BUG-7: aliases of aliases, and aliases that add git options to a push
+(cd "$N" && git config alias.bb $P && git config alias.aa bb)
+git config alias.pf "-c push.recurseSubmodules=on-demand $P"
+git config alias.bb $P; git config alias.aa bb
+bash_gate deny  "$R" "git -C $N aa" "not installed"
+bash_gate deny  "$R" "git pf" "a push with git options"
+bash_gate allow "$R" "git aa origin main"
+git config --unset alias.pf
+
+# --- TEST-1 (full audit): CDPATH is what sends `cd nohook` elsewhere ($R/nohook exists too)
+mkdir -p "$R/nohook"
+bash_gate deny  "$R" "CDPATH=$T cd nohook && git $P" "cannot follow"
+rmdir "$R/nohook"
+
+# --- TEST-2: submodule recursion switched on in git config
+touch .gitmodules
+for setting in "push.recurseSubmodules on-demand" "push.recurseSubmodules only" "submodule.recurse true"; do
+  git config $setting
+  bash_gate deny "$R" "git $P origin main" "push submodules too"
+  git config --unset ${setting%% *}
+done
+git config push.recurseSubmodules check
+bash_gate allow "$R" "git $P origin main"
+git config --unset push.recurseSubmodules
+rm .gitmodules
+git config push.recurseSubmodules on-demand
+bash_gate allow "$R" "git $P origin main"
+# The terminal hook refuses the same setting.
+touch .gitmodules
+commit sub1
+git $P -q origin main 2>"$T/err" && bad "hook let a recursive-submodule push through" || ok
+grep -q "recurseSubmodules" "$T/err" && ok || bad "hook refusal doesn't name the setting: $(cat "$T/err")"
+git config --unset push.recurseSubmodules; rm .gitmodules
+
+# --- TEST-3: a modified or non-executable hook makes the guard refuse
+HOOK="$(git rev-parse --git-path hooks)/pre-push"
+printf 'exit 0\n' >> "$HOOK"
+bash_gate deny  "$R" "git $P origin main" "out of date"
+python3 "$RV" install-hook --uninstall >/dev/null 2>&1; python3 "$RV" install-hook >/dev/null
+chmod -x "$HOOK"
+bash_gate deny  "$R" "git $P origin main" "out of date"
+chmod +x "$HOOK"
+bash_gate allow "$R" "git $P origin main"
+
+# --- LOOP-1: code in doc-, credential- or infra-named paths is code
+mkdir -p src/documents src/auth src/infra
+for f in src/documents/upload.ts src/auth/credentials.ts src/infra/repository.ts src/docker_client.go; do
+  echo "export const x = 1" > "$f"
+done
+git add src; git commit -qm paths
+ctx=$(python3 "$RV" prepare)
+echo "$ctx" | grep "^- code (4)" | grep -q "src/documents/upload.ts" && ok || bad "classifier: $(echo "$ctx" | grep '^- [a-z-]* (')"
+echo "$ctx" | grep -q "^- docs" && bad "code classified as docs" || ok
+
+# --- LOOP-2: .gitattributes can't hide a file from the secret scan
+k=AKIA; printf 'KEY = "%s"\n' "${k}Q7RTYU2X9ZPLM4KD" > keys.py
+echo "keys.py -diff" > .gitattributes
+git add keys.py .gitattributes; git commit -qm keys
+python3 "$RV" prepare | grep -q "AWS access key ID at keys.py" && ok || bad "-diff attribute hid a key from the scan"
+git rm -q keys.py .gitattributes; git commit -qm unkeys
+
+# --- BUG-9: non-ASCII file names are not quoted into misclassification
+echo "print(1)" > "työkalut.py"; git add "työkalut.py"; git commit -qm uml
+python3 "$RV" prepare | grep "^- code" | grep -q "työkalut.py" && ok || bad "non-ASCII code file misclassified"
+
+# --- LOOP-3: skip-worktree files and dirty trees in a full audit
+git update-index --skip-worktree a
+python3 "$RV" prepare >/dev/null 2>"$T/err" && bad "prepare ignored a skip-worktree file" || ok
+grep -q "skip-worktree" "$T/err" && ok || bad "skip-worktree refusal unclear: $(cat "$T/err")"
+git update-index --no-skip-worktree a
+echo changed >> a
+python3 "$RV" prepare --full >/dev/null 2>"$T/err" && bad "full audit ran over uncommitted tracked changes" || ok
+git checkout -q -- a
+
+# --- RES-1: the history scan stops at its time budget and says so
+python3 - "$RW/scripts" <<'EOF' && ok || bad "scan budget"
+import sys, time; sys.path.insert(0, sys.argv[1]); import ravenwatch as r
+def slow():
+    for i in range(10):
+        yield f"commit {'0' * 40}"
+        time.sleep(0.05)
+state = {"commits": 0, "cut": False}
+lines = list(r.budgeted(slow(), 0.12, state))
+sys.exit(0 if state["cut"] and 0 < state["commits"] < 10 else print(state) or 1)
+EOF
+
+echo "round11: passed=$pass failed=$failn"
+[ "$failn" -eq 0 ]

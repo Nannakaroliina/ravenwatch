@@ -85,6 +85,17 @@ check_target() {
     fail "this push overrides the receive command or recurses into submodules, so the gate cannot check it." \
       "Push again without --exec/--receive-pack/--recurse-submodules (push submodules from inside each one)."
   fi
+  # The same recursion, switched on in git config (only matters when the repository has submodules).
+  top=$(git rev-parse --show-toplevel 2>/dev/null)
+  if [ -n "$top" ] && [ -f "$top/.gitmodules" ]; then
+    mode=$(git config --get push.recurseSubmodules 2>/dev/null | tr 'A-Z' 'a-z')
+    [ -n "$mode" ] || { [ "$(git config --type=bool --get submodule.recurse 2>/dev/null)" = true ] && mode=on-demand; }
+    case "$mode" in
+      on-demand | only)
+        fail "push.recurseSubmodules / submodule.recurse makes git push submodules through their own hooks, which the gate cannot check." \
+          "Set push.recurseSubmodules to check (git config push.recurseSubmodules check) and push submodules from inside each one." ;;
+    esac
+  fi
   listed=$(git ls-remote --get-url "$remote_url" 2>/dev/null)
   if [ "$listed" != "$remote_url" ]; then
     fail "url.*.insteadOf rewrites the push URL to a different one for reads; the gate cannot check this push." \

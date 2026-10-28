@@ -29,6 +29,8 @@ python3 ${CLAUDE_PLUGIN_ROOT}/scripts/ravenwatch.py prepare $ARGUMENTS
 
 Argument meanings: none = commits not yet on the upstream (or first push); `--since-last` = only commits since the last review (only builds on a PASS/WARN/accepted review; after a BLOCK it falls back to the full push range); `--base <ref>` = custom base; `--worktree` = uncommitted changes (never unlocks the push gate, because no commits are reviewed); `--full` = whole repository at HEAD, not just what changed (thorough audit, e.g. before making a repo public or when adopting ravenwatch on an existing project; see **Full repository audit** below). `--quick` combines with any of these and limits the review to the core reviewers (see step 2).
 
+Give this Bash call a `timeout` of 600000: on a long history the secret scan alone can take up to 4 minutes, more than the default limit.
+
 The output is the context summary: run id, range, file categories, commits (and, for `--full`, the review groups), and a deterministic scan (secret patterns, sensitive files, large files, `.gitignore` gaps). The full diff and file list are saved at the paths it prints. Note the run id; step 6 needs it. If it reports `NOTHING TO REVIEW` (it never does when the scan found anything), run the gitleaks check below if available; if that is clean too, record `--verdict pass` (step 6, no report needed) when the range has commits so the push gate unlocks, say so in one line, and stop. Any scan hit means a normal review.
 
 ### Project brief and checks
@@ -107,7 +109,7 @@ Read the full changed files and the code they interact with, not just the diff. 
 
 ## Full repository audit (`--full`)
 
-For mode `full`, this replaces steps 2 and 3. There is no diff: `prepare` split the code at HEAD into **review groups** of related files, each small enough for one reviewer to read in full (`## Full audit` in the context lists them, high-priority first; the group file has each group's files). Lockfiles, vendored, generated, minified and binary files are in no group but are still secret-scanned across the whole history. Tests, config, CI and manifests are in no group either: their own specialists read them. What counts as vendored or generated is decided by paths and `.gitattributes` in the repository, so include the context's `vendored/generated` line in the size line below; if the owner says any of it is their own source, add those files to the closest group (or a new one).
+For mode `full`, this replaces steps 2 and 3. There is no diff: `prepare` split the code at HEAD into **review groups** of related files, each small enough for one reviewer to read in full (`## Full audit` in the context lists them, high-priority first; the group file has each group's files). Lockfiles, vendored, generated, minified and binary files are in no group but are still secret-scanned across the whole history (the scan ignores the repository's own `.gitattributes`, so `-diff` or `binary` can't hide a file from it). The context names every code-like file left out of the groups; tell the owner about them. Tests, config, CI and manifests are in no group either: their own specialists read them. What counts as vendored or generated is decided by paths and `.gitattributes` in the repository, so include the context's `vendored/generated` line in the size line below; if the owner says any of it is their own source, add those files to the closest group (or a new one).
 
 **Who runs:**
 
@@ -139,6 +141,8 @@ Apply the verifier's verdicts: drop REJECTED and MERGED duplicates, move ACCEPTE
 **Severity caps** — enforce these regardless of what an agent or the verifier reported: `test-reviewer` (TEST-) and `design-reviewer` (DES-) findings are at most MEDIUM, so they can WARN but never BLOCK. `ux-reviewer` (UX-) findings are at most HIGH, and HIGH only when a user cannot complete a core task. `privacy-reviewer` (PRIV-) findings are at most HIGH. Licence findings from `supply-chain-auditor` are at most MEDIUM. Failing blocking checks (CHK-) are HIGH and cannot be rejected or accepted away. `impact-analyzer` (IMP-) findings are uncapped: a deploy that breaks clients or destroys data blocks like any bug.
 
 Also keep the `blast radius:` summary from `impact-analyzer` for the report, even when it had no findings.
+
+If the scan says `history scan incomplete`, report it as a MEDIUM finding `SCAN-1` ("history secret scan incomplete") unless gitleaks ran over the whole history without hits.
 
 For deterministic scan hits: a hit is a blocking finding only if `infra-config-auditor` confirmed it as a real credential or sensitive file. If that agent did not run, treat `LIKELY REAL` hits as HIGH and `possible placeholder` hits as notes.
 

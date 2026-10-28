@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.1 — 2026-10-28
+
+Fixes from the first full-repository audit.
+
+- Guard: the helper shortcut only covers a single-line command (a second line used to skip every check); variable names built from other variables (`RAVENWATCH_DIS${X}ABLE`, `GIT_CONF${X}IG_*`, `git config ali${X}as.…`) are caught, and a pushing command may not use shell variables at all; paths through variables are followed (literal assignments, `for` loops, `$(mktemp)`, the environment) and a write to a path that can't be worked out is refused; a `cat` heredoc only counts as data where `cat` really is a command (not inside quotes or another heredoc); git options that write files (`--prefix=`, `-o`, `--output`) are path-checked; a `#` after an escaped space is not a comment; `--attr-source` takes a value, and `push` after an unknown git option is refused; aliases of aliases are followed, and an alias that adds `-c`/`-C` to a push is refused.
+- Hook: `push.recurseSubmodules=on-demand|only` and `submodule.recurse=true` are refused in repositories with submodules, as the README already said.
+- Classifier: code is recognised by its extension before the docs, secret-file, infra and config rules (`src/documents/upload.ts`, `src/auth/credentials.ts` and `src/infra/repository.ts` are code), the docs rule matches whole names only, more code extensions are known, and extension-less scripts count as code in every mode.
+- Scan: the repository's `.gitattributes` (`-diff`, `binary`, textconv) can no longer hide a file from the secret scan, the diff or the per-commit patches, and a NUL byte no longer hides one from the scan; binary files in a diff and code-like files left out of a full audit's groups are listed by path; non-ASCII paths are no longer quoted into misclassification; the history scan has a 4-minute budget, then scans the files at HEAD and says the history scan was incomplete.
+- Full audits and checks: `prepare`, `checks` and `mark` refuse while tracked files are marked skip-worktree or assume-unchanged, and a full audit refuses (and `mark` refuses its pass/warn) while tracked files have uncommitted changes, since the reviewers read the files on disk.
+- Review skill: `prepare` gets a 10-minute Bash timeout; an incomplete history scan is reported as a finding.
+- Tests: new round-11 suite (including the CDPATH, submodule-config and modified-hook gaps the audit found); the FIFO test no longer needs `timeout`, which macOS doesn't have.
+
 ## 0.4.0 — 2026-10-27
 
 - Whole-repository review: `/ravenwatch:review --full` is now a real audit of everything at HEAD. `prepare --full` splits the code into review groups (at most 20 files and 2,500 lines each, related paths together, high-risk paths first) written to `groups.txt`, and leaves lockfiles, vendored, generated, minified and binary files out of the groups (they are still secret-scanned across the whole history). It no longer writes a diff of the whole repository or per-commit patches, and vendored code no longer drives reviewer triage.
