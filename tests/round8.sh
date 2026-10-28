@@ -76,7 +76,7 @@ checks = [
     scan(f'test_api_key = "{real}"') == [("Generic secret assignment", True)],
     scan(f'api_key = "{real}"') == [("Generic secret assignment", False)],
     # a path such as /test after the host says nothing about the password
-    ("Credentials in URL", False) in scan(f"url = 'https://deploy:{real}@db.internal/test'"),
+    ("Credentials in URL", False) in scan(f"url = 'https://deploy:{real}@db.example.com/test'"),
     # an example value earlier on the line must not hide a real one later
     ("Generic secret assignment", False) in scan(f'a = {{"token": "EXAMPLE", "secret": "{real}"}}'),
 ]

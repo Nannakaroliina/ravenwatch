@@ -21,5 +21,7 @@
   ],
   "homepage": "https://github.com/Nannakaroliina/ravenwatch",
   "repository": "https://github.com/Nannakaroliina/ravenwatch",
+  "documentationUrl": "https://github.com/Nannakaroliina/ravenwatch#readme",
+  "supportUrl": "https://github.com/Nannakaroliina/ravenwatch/issues",
   "icon": "./assets/icon-code.png"
 }
