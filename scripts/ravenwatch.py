@@ -46,6 +46,19 @@ PATCH_MAX_BYTES = 20 * 1024 * 1024
 # Generated lockfiles: huge, rarely reviewable line by line; manifests still show dependency changes.
 LOCKFILES = ["package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml", "bun.lockb", "poetry.lock",
              "Pipfile.lock", "uv.lock", "Cargo.lock", "Gemfile.lock", "composer.lock", "go.sum"]
+# Full audits split the code into review groups, each small enough for one reviewer to read in full.
+GROUP_MAX_FILES = 20
+GROUP_MAX_LINES = 2500
+GROUP_MIN_LINES = 600  # a group closes at a directory boundary only once it holds this much
+# Vendored, generated or built files: secret-scanned, but not handed to reviewers in a full audit.
+NOT_REVIEWED = re.compile(r"(^|/)(node_modules|vendor|vendors|third[_-]party|bower_components|jspm_packages|dist|"
+                          r"build|out|\.next|\.nuxt|\.svelte-kit|\.output|coverage|target|__pycache__|\.venv|venv|"
+                          r"site-packages|\.wrangler|cdk\.out|\.terraform)/|\.min\.(js|css)$|\.map$|\.bundle\.js$|"
+                          r"\.pb\.go$|_pb2(_grpc)?\.py$|\.generated\.[a-z]+$|\.g\.dart$|\.snap$", re.I)
+# Paths whose code usually decides who may do what; their groups are reviewed first.
+HIGH_RISK = re.compile(r"auth|login|logout|sign_?in|sign_?up|session|token|oauth|sso|jwt|passw|admin|permission|"
+                       r"role|acl|payment|billing|checkout|stripe|invoice|webhook|upload|crypt|secret|middleware|"
+                       r"guard|cookie|csrf|cors|account|user", re.I)
 
 # --------------------------------------------------------------------------- git
 
@@ -324,21 +337,113 @@ PERSONAL_DATA = re.compile(
     r"openai|anthropic|api\.mistral|generativelanguage)(?![A-Za-z])", re.I)
 
 
-def personal_data_files(diff_path):
-    """Files whose added lines mention personal data, tracking, cookies or outside AI services."""
+def personal_data_files(lines):
+    """Files whose added lines (in an iterable of diff lines) mention personal data, tracking, cookies or
+    outside AI services."""
     found, current = [], None
-    with open(diff_path, encoding="utf-8", errors="replace") as fh:
-        for raw in fh:
-            if raw.startswith("+++ "):
-                p = raw[4:].rstrip("\n")
-                current = p[2:] if p.startswith("b/") else None
-            elif raw.startswith("+") and current and current not in found and PERSONAL_DATA.search(raw):
-                found.append(current)
+    for raw in lines:
+        if raw.startswith("+++ "):
+            p = raw[4:].rstrip("\n")
+            current = p[2:] if p.startswith("b/") else None
+        elif raw.startswith("+") and current and current not in found and PERSONAL_DATA.search(raw):
+            found.append(current)
     return found
 
 
 def signals_for(path):
     return [name for name, rx in SIGNAL_RULES if rx.search(path)]
+
+
+# ------------------------------------------------------------------ full audit
+
+
+def marked_generated(paths):
+    """Paths .gitattributes marks linguist-generated or linguist-vendored."""
+    if not paths:
+        return set()
+    res = subprocess.run(["git", "check-attr", "--stdin", "-z", "linguist-generated", "linguist-vendored"],
+                         input="\0".join(paths) + "\0", capture_output=True, text=True,
+                         encoding="utf-8", errors="replace")
+    if res.returncode != 0:
+        return set()
+    parts = res.stdout.split("\0")
+    return {parts[i] for i in range(0, len(parts) - 2, 3) if parts[i + 2] in ("set", "true")}
+
+
+def has_shebang(path):
+    """Extension-less scripts (bin/deploy) are code too. Only plain files are opened: a FIFO, device or
+    symlink in the working tree must not hang prepare or read outside the repository."""
+    try:
+        if not stat.S_ISREG(os.lstat(path).st_mode):
+            return False
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+        with os.fdopen(fd, "rb") as fh:
+            return fh.read(2) == b"#!"
+    except OSError:
+        return False
+
+
+def audit_inventory(files, sizes):
+    """Split the tracked files of a full audit into code to review ([(path, lines, high_risk)], sorted)
+    and files no reviewer reads line by line ({path: reason}); the secret scan still covers both."""
+    paths = [p for _, p in files]
+    generated = marked_generated(paths)
+    code, skipped = [], {}
+    for p in paths:
+        c = classify(p)
+        added = sizes.get(p, ("-", "-"))[0]
+        if os.path.basename(p) in LOCKFILES:
+            skipped[p] = "lockfile"
+        elif p in generated or NOT_REVIEWED.search(p):
+            skipped[p] = "vendored/generated"
+        elif not added.isdigit():
+            skipped[p] = "binary"
+        elif c == "code" or (c == "other" and has_shebang(p)):
+            high = bool(HIGH_RISK.search(p)) or bool({"api", "migration"} & set(signals_for(p)))
+            code.append((p, int(added), high))
+        else:
+            skipped[p] = c  # docs, assets; tests, config, CI and manifests go to their own specialists
+    return sorted(code), skipped
+
+
+def review_groups(code):
+    """Pack code files into groups of related paths, each small enough for one reviewer to read in full."""
+    groups, cur, cur_lines, cur_key = [], [], 0, None
+    for path, lines, high in code:
+        key = "/".join(path.split("/")[:-1][:2]) or "."
+        if cur and (len(cur) >= GROUP_MAX_FILES or cur_lines + lines > GROUP_MAX_LINES
+                    or (key != cur_key and cur_lines >= GROUP_MIN_LINES)):
+            groups.append(cur)
+            cur, cur_lines = [], 0
+        cur.append((path, lines, high))
+        cur_lines += lines
+        cur_key = key
+    if cur:
+        groups.append(cur)
+    return groups
+
+
+def group_label(group):
+    dirs = sorted({os.path.dirname(p) or "." for p, _, _ in group})
+    common = os.path.commonpath(dirs) if all(d != "." for d in dirs) else ""
+    if len(dirs) == 1:
+        return dirs[0]
+    return (common + "/*" if common else dirs[0] + f" + {len(dirs) - 1} more dir(s)")
+
+
+def group_size(group):
+    return f"{len(group)} file{'s' if len(group) != 1 else ''}, {sum(n for _, n, _ in group)} lines"
+
+
+def write_groups(path, groups, head):
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(f"# ravenwatch review groups — full audit of {head}\n")
+        fh.write("# Each group is one reviewer's scope: read every file in it in full (at HEAD).\n")
+        for i, g in enumerate(groups, 1):
+            high = any(h for _, _, h in g)
+            fh.write(f"\n## G{i} [{'high' if high else 'normal'}] {group_label(g)} — {group_size(g)}\n")
+            for p, n, h in g:
+                fh.write(f"{p}\t{n}" + ("\thigh-risk path\n" if h else "\n"))
 
 
 # ------------------------------------------------------------------ secret scan
@@ -455,7 +560,9 @@ def cmd_prepare(args):
         commits = ""
         rng = None
     else:
-        git_to_file(diff_path, "diff", base, "HEAD", "--no-color", "--no-ext-diff", "-U8")
+        # A full audit has no diff to read: the reviewers read the files at HEAD, group by group.
+        if mode != "full":
+            git_to_file(diff_path, "diff", base, "HEAD", "--no-color", "--no-ext-diff", "-U8")
         names = git("diff", base, "HEAD", "--name-status", "--no-renames")
         numstat = git("diff", base, "HEAD", "--numstat", "--no-renames")
         rng = "HEAD" if base == empty_tree() else f"{base}..HEAD"
@@ -463,7 +570,7 @@ def cmd_prepare(args):
         commits = git("log", "--no-color", "--format=%h %s", "-n", "50", rng)
         # --full-history: changes made and undone on a merged side branch still count.
         touched = git("log", "--full-history", "--format=%H", "-n", "1", rng, "--", ".")
-        if 1 < n_commits <= PER_COMMIT_LIMIT:
+        if 1 < n_commits <= PER_COMMIT_LIMIT and mode != "full":
             commits_path = os.path.join(cur, "commits.patch")
             patch_truncated = write_capped(commits_path, PATCH_MAX_BYTES, git_lines(
                 "log", "-p", "--reverse", "--no-color", "--no-ext-diff", "--format=commit %H%n%s%n", rng,
@@ -486,13 +593,24 @@ def cmd_prepare(args):
                 deleted_lines += int(d)
             sizes[p] = (a, d)
 
+    groups, skipped, in_group = [], {}, {}
+    groups_path = os.path.join(cur, "groups.txt")
+    if mode == "full":
+        audit_code, skipped = audit_inventory(files, sizes)
+        groups = review_groups(audit_code)
+        write_groups(groups_path, groups, head)
+        in_group = {p: f"G{i}" for i, g in enumerate(groups, 1) for p, _, _ in g}
+
     cats = {}
     with open(os.path.join(cur, "files.txt"), "w", encoding="utf-8") as fh:
         for status, path in files:
             c = classify(path)
             cats.setdefault(c, []).append(path)
             a, d = sizes.get(path, ("-", "-"))
-            fh.write(f"{status}\t{c}\t+{a}/-{d}\t{path}\n")
+            extra = ""
+            if mode == "full":
+                extra = "\t" + (in_group.get(path) or f"not grouped: {skipped.get(path, c)}")
+            fh.write(f"{status}\t{c}\t+{a}/-{d}\t{path}{extra}\n")
 
     # Scan: committed history (catches secrets added then removed), or the diff for worktree/full mode.
     # Both are streamed so a long history never has to fit in memory.
@@ -540,7 +658,11 @@ def cmd_prepare(args):
     out.append(f"- mode: {mode}")
     out.append(f"- base: {base}")
     out.append(f"- size: {len(files)} files, +{added_lines}/-{deleted_lines} lines")
-    out.append(f"- diff file: {diff_path}")
+    if mode == "full":
+        out.append(f"- diff file: none (full audit: reviewers read the files at HEAD; see review groups)")
+        out.append(f"- review groups: {groups_path}")
+    else:
+        out.append(f"- diff file: {diff_path}")
     if commits_path:
         out.append(f"- per-commit patches: {commits_path} (changes made and later undone inside the range "
                    "only show up here; lockfiles left out"
@@ -576,15 +698,18 @@ def cmd_prepare(args):
             out.append(f"- {c} ({len(cats[c])}): " + ", ".join(shown) + more)
 
     # Signals for reviewer triage
+    # In a full audit, vendored and generated files would only mislead triage.
+    own = [(s, p) for s, p in files if skipped.get(p) not in ("vendored/generated", "lockfile")]
     sig = {}
-    for status, path in files:
+    for status, path in own:
         for s in signals_for(path):
             sig.setdefault(s, []).append(path)
     deleted = [p for s, p in files if s == "D"]
-    code_changed = len(cats.get("code", []))
-    tests_changed = len(cats.get("test", []))
+    own_code = [p for _, p in own if classify(p) == "code"]
+    code_changed = len(own_code)
+    tests_changed = sum(1 for _, p in own if classify(p) == "test")
     code_lines = sum(int(sizes.get(p, ("0", "0"))[0]) + int(sizes.get(p, ("0", "0"))[1])
-                     for p in cats.get("code", []) if sizes.get(p, ("-",))[0].isdigit())
+                     for p in own_code if sizes.get(p, ("-",))[0].isdigit())
     out.append("")
     out.append("## Signals")
     labels = {"ui": "ui / user-facing", "migration": "schema / migration", "api": "api / routes / entry points",
@@ -597,15 +722,59 @@ def cmd_prepare(args):
     if deleted:
         out.append(f"- deleted files ({len(deleted)}): " + ", ".join(deleted[:20]))
     new_code = [p for s, p in files if s == "A" and classify(p) == "code"]
-    if new_code:
+    if new_code and mode != "full":
         out.append(f"- new code files ({len(new_code)}): " + ", ".join(new_code[:20]))
-    out.append(f"- code lines changed: {code_lines}; code files: {code_changed}; test files: {tests_changed}"
-               + (" (code changed without any test changes)" if code_changed and not tests_changed else ""))
-    pd = [p for p in personal_data_files(diff_path) if classify(p) not in ("docs", "asset")]
+    if mode == "full":
+        out.append(f"- code lines: {code_lines}; code files: {code_changed}; test files: {tests_changed}"
+                   + (" (the repository has no tests)" if code_changed and not tests_changed else ""))
+        found = personal_data_files(git_lines("diff", base, "HEAD", "--no-color", "--no-ext-diff", "--", ".",
+                                              *(f":(exclude,glob)**/{p}" for p in LOCKFILES)))
+    else:
+        out.append(f"- code lines changed: {code_lines}; code files: {code_changed}; test files: {tests_changed}"
+                   + (" (code changed without any test changes)" if code_changed and not tests_changed else ""))
+        with open(diff_path, encoding="utf-8", errors="replace") as fh:
+            found = personal_data_files(fh)
+    pd = [p for p in found if classify(p) not in ("docs", "asset") and skipped.get(p) != "vendored/generated"]
     if pd:
         out.append(f"- personal data / tracking / outside services ({len(pd)}): " + ", ".join(pd[:20]))
     if not (sig or deleted or code_changed or pd):
         out.append("- none")
+    if mode == "full":
+        out.append("")
+        out.append("## Full audit")
+        n_high = sum(1 for g in groups if any(h for _, _, h in g))
+        grouped_lines = sum(n for g in groups for _, n, _ in g)
+        out.append(f"- review groups: {len(groups)} ({n_high} high priority), {len(in_group)} code files, "
+                   f"{grouped_lines} lines — one bug-hunter and one security-auditor per group; "
+                   f"group files: {groups_path}")
+        reasons = {}
+        for r in skipped.values():
+            reasons[r] = reasons.get(r, 0) + 1
+        if reasons:
+            out.append("- not in any group (still secret-scanned): "
+                       + ", ".join(f"{r} {n}" for r, n in sorted(reasons.items())))
+        # Repository content (paths, .gitattributes) decides what counts as vendored, so show all of it.
+        by_dir = {}
+        for p, r in skipped.items():
+            if r == "vendored/generated":
+                d = p.split("/")[0] + "/" if "/" in p else p
+                by_dir[d] = by_dir.get(d, 0) + 1
+        if by_dir:
+            shown = sorted(by_dir.items())
+            out.append("- vendored/generated, by top-level path: "
+                       + ", ".join(f"{d} ({n})" for d, n in shown[:30])
+                       + (f" … and {len(shown) - 30} more" if len(shown) > 30 else "")
+                       + " — tell the owner; if any of it is their own source, add it to a group")
+        out.append(f"- history: {n_commits} commit(s); content deleted from the tree is covered only by the "
+                   "secret scan below")
+        # High-priority groups first: that is the order to review them in.
+        order = sorted(range(len(groups)), key=lambda i: (not any(h for _, _, h in groups[i]), i))
+        for i in order[:60]:
+            g = groups[i]
+            pri = "high" if any(h for _, _, h in g) else "normal"
+            out.append(f"- G{i + 1} [{pri}] {group_label(g)} — {group_size(g)}")
+        if len(groups) > 60:
+            out.append(f"- … and {len(groups) - 60} more groups in the group file")
     brief_lines, _brief_meta = brief_context_lines(brief_state(top, sdir), top, cur, files)
     out.extend(brief_lines)
     if commits:

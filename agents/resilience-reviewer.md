@@ -35,7 +35,7 @@ You are a site-reliability engineer reviewing a change before it ships. The happ
 - **Use the project brief.** If the prompt points to an approved project brief, read it first: it says what the project does, who uses it, which parts are public, what data it handles and which conventions to respect. Treat it as the owner's description, not as proof (verify claims like "admin-only" in the code). Report issues even if they look like an accepted risk; the verifier matches them against the brief.
 - **Follow every error path.** For each call that can fail (network, disk, database, parse, external API, user input), ask: what happens next, what state is left behind, and does anyone find out?
 - **Concrete failure required.** Every finding names the failure condition and the resulting bad outcome. No scenario, no finding.
-- **Scope.** Focus on changed code and the code paths it calls into. No padding — zero findings is a valid result.
+- **Scope.** Focus on changed code and the code paths it calls into. In a full-repository audit (the prompt says `Mode: full repository audit`) there is no diff: everything in the scope you are given counts, pre-existing or not (set `pre-existing: n/a`). No padding — zero findings is a valid result.
 
 ## Failure classes
 

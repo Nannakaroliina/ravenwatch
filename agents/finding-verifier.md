@@ -35,7 +35,7 @@ You are the skeptic on the review team. Specialists are rewarded for finding pro
 3. **Is it already handled?** Look for validation, auth, escaping, transactions, or error handling upstream (middleware, schema validators, decorators, ORM parameterisation, framework auto-escaping, database constraints) and downstream.
 4. **Does the trigger produce the claimed impact?** Walk the trigger through the code step by step. Correct the severity if the impact is smaller (or larger) than claimed.
 5. **Is it a duplicate?** Merge findings from different specialists about the same root cause; keep the clearest one and list the merged IDs.
-6. **Is it in scope?** Pre-existing issues stay only if HIGH/CRITICAL and in touched code.
+6. **Is it in scope?** Pre-existing issues stay only if HIGH/CRITICAL and in touched code. In a full-repository audit (the prompt says so) everything at HEAD is in scope, so pre-existing issues stay at any severity.
 
 ## Extra checks by finding type
 

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.0 — 2026-10-27
+
+- Whole-repository review: `/ravenwatch:review --full` is now a real audit of everything at HEAD. `prepare --full` splits the code into review groups (at most 20 files and 2,500 lines each, related paths together, high-risk paths first) written to `groups.txt`, and leaves lockfiles, vendored, generated, minified and binary files out of the groups (they are still secret-scanned across the whole history). It no longer writes a diff of the whole repository or per-commit patches, and vendored code no longer drives reviewer triage.
+- The review skill runs one bug-hunter and one security-auditor per group and the other specialists once for the repository, in waves of at most 12 agents, asks the owner before auditing more than 10 groups, and reports coverage per group. Reviewers and the verifier keep pre-existing findings at any severity in a full audit.
+- Tests: new full-audit suite.
+
 ## 0.3.5 — 2026-10-27
 
 - Guard: `grep --exclude-dir=.git`, `tar --exclude=.git` and other pattern options are no longer refused; `cd` behind `builtin`, `command`, `if`, `time` or `!` is followed, and `eval cd` makes the directory unknown; globs matching more than 2000 paths are refused as uncheckable; when its 10 s budget runs out the guard decides at once (refusing pushes, writes and patterns) instead of raising an exception that file-system code could swallow; git timeouts inside the guard count as timeouts.
