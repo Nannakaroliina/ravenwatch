@@ -27,6 +27,7 @@ import codecs
 import glob
 import json
 import os
+import pwd
 import re
 import shlex
 import signal
@@ -50,8 +51,6 @@ CD_PREFIXES = {"builtin", "command", "exec", "time", "!", "if", "elif", "then", 
 GLOB_LIMIT = 2000
 # More magic (`*?[`) path components than this: the pattern is uncheckable (deep globs can overflow glob).
 GLOB_DEPTH = 24
-# Longer values are not trimmed (${X%pat} tries every cut): the word counts as unknowable instead.
-TRIM_LIMIT = 4096
 # File names that matter when the directory a command runs in is unknown.
 SENSITIVE_NAMES = {"status", "latest", "prepared", "checks.kv", "brief-approved.md", "brief-trust", "config",
                    "pre-push", "pre-push.local", "head", "guard_push.py", "ravenwatch.py", "git-pre-push.sh",
@@ -107,7 +106,10 @@ EXECUTORS = {"sh", "bash", "zsh", "dash", "ksh", "fish", "env", "xargs", "eval",
 # (a variable set from command output, `read` …) is refused rather than assumed harmless. sed and perl
 # scripts can write files (`w file`) even without -i; `$` inside their single-quoted scripts is text.
 WRITERS = {"cp", "mv", "tee", "dd", "install", "rsync", "ln", "touch", "mkdir", "truncate", "ditto", "rename",
-           "patch", "chmod", "chown", "rm", "rmdir", "sed", "perl"}
+           "patch", "chmod", "chown", "rm", "rmdir", "sed", "perl", "unlink", "shred", "link", "gzip", "gunzip",
+           "bzip2", "xz", "zstd", "zip", "cpio", "pax", "split", "csplit", "mkfifo", "mknod", "chflags", "xattr",
+           "setfacl", "chgrp", "sponge", "ed", "ex", "vi", "vim", "nvim", "nano", "emacs", "scp", "sftp", "base64",
+           "xxd", "uniq", "sort", "openssl", "gpg", "ssh-keygen", "plutil", "defaults", "sqlite3"}
 # Programs that only write where an option says (other arguments are URLs, headers, archive members …).
 OUTPUT_OPTS = {
     "curl": {"-o", "--output", "-D", "--dump-header", "-c", "--cookie-jar", "--trace", "--trace-ascii",
@@ -436,17 +438,19 @@ SHELLS = {"sh", "bash", "zsh", "dash", "ksh", "mksh", "fish", "su"}
 # Programs that run code given to them (a string, a file or stdin): what they do can't be seen.
 INTERPRETERS = {"python", "perl", "ruby", "node", "nodejs", "deno", "bun", "php", "lua", "osascript", "awk", "gawk",
                 "nawk", "mawk", "tclsh", "Rscript"}
-# Words that make a command with shell features worth refusing: anything that writes files, runs other
-# commands or code, changes the shell, or deals with git. Matched as whole words anywhere in the command, in
-# every way the shell may read it — deliberately broad, since such a command can't be parsed reliably.
-RISKY_WORDS = (WRITERS | EXECUTORS | SHELLS | INTERPRETERS
-               | {"git", "hub", "gh", "source", "alias", "unalias", "function", "trap", "hash", "enable", "export",
-                  "declare", "typeset", "readonly", "local", "unlink", "shred", "link", "gzip", "gunzip", "bzip2",
-                  "xz", "zstd", "zip", "cpio", "pax", "split", "csplit", "mkfifo", "mknod", "chflags", "xattr",
-                  "setfacl", "chgrp", "sponge", "ed", "ex", "vi", "vim", "nvim", "nano", "emacs"})
-# (Writing to hooks, verdict state, the plugin or a gitconfig needs a redirect or a writer, and calling the
-# helper needs python, which are all caught anyway; these are what's left: git internals and settings.)
-RISKY_TEXT = re.compile(r"(?i)\.git\b|\bgit-|GIT_|HOME=|XDG_")
+# Commands a command with shell features may run: they only read, print or set shell state, and none of them
+# writes a file, runs another command or reaches the network (curl only without output options). Anything
+# else in such a command is refused — a default deny, since such a command can't be parsed reliably.
+READ_ONLY = {"echo", "printf", "cat", "head", "tail", "ls", "grep", "egrep", "fgrep", "wc", "cut", "tr", "date",
+             "pwd", "basename", "dirname", "realpath", "readlink", "stat", "file", "du", "df", "seq", "expr", "test",
+             "[", "[[", "true", "false", ":", "sleep", "which", "type", "jq", "diff", "cmp", "comm", "column", "nl",
+             "rev", "tac", "fold", "fmt", "paste", "md5", "md5sum", "shasum", "sha256sum", "od", "hexdump", "read",
+             "cd", "pushd", "popd", "export", "local", "declare", "readonly", "set", "unset", "shift", "return",
+             "exit", "break", "continue", "wait", "printenv", "id", "whoami", "uname", "hostname", "nproc", "sort",
+             "uniq", "curl"}
+# Shell words that come before a command name rather than being one.
+KEYWORDS = {"if", "then", "elif", "else", "fi", "do", "done", "while", "until", "time", "!", "esac", "in"}
+GLOB_CHARS = re.compile(r"[*?\[\]]")
 # Redirections that write nowhere: to /dev/null or to another file descriptor.
 HARMLESS_REDIRECT = re.compile(r"\d*>>?&\d+-?|&?\d*>>?[ \t]*/dev/null\b|\d*>&-")
 # Builtins that change the shell itself (its variables, functions, aliases, options), which a push in the
@@ -459,19 +463,20 @@ SET_OPTION_NAMES = {"errexit", "nounset", "pipefail", "xtrace", "verbose", "nocl
 # A comment of plain words, up to the end of its line.
 INERT_COMMENT = re.compile(r"#[A-Za-z0-9 \t.,:_/+=@%-]*(?=\n|$)")
 # Claude Code's way to pass a commit message: `-m "$(cat <<'EOF' … EOF)"`. With a quoted delimiter the body
-# is plain text, so the whole substitution is one literal word. It ends at the first line that could be
-# the delimiter, never later than the shell's own end (bash wants the delimiter alone on its line).
-CAT_SUBST = re.compile(r"\$\([ \t]*cat[ \t]+<<(-?)[ \t]*(['\"])(\w+)\2[ \t]*\n(?:.*?\n)??[ \t]*\3[ \t]*\n?[ \t]*\)",
-                       re.S)
+# is plain text, so the whole substitution is one literal word — if the shell's own end of the body (the
+# first line that is exactly the delimiter) is followed by nothing but the closing `)`.
+CAT_SUBST_START = re.compile(r"\$\([ \t]*cat[ \t]+<<(-?)[ \t]*(['\"])(\w+)\2[ \t]*\n")
 # A heredoc (`<<'EOF'`, `<<-"EOF"`, `<<EOF`, but not `<<<`). With a quoted delimiter its body is never
 # expanded; with a bare one, only a body free of `$`, backticks and backslashes counts as plain text.
-DATA_HEREDOC = re.compile(r"<<(-?)[ \t]*(['\"]?)(\w+)\2")
+DATA_HEREDOC = re.compile(r"<<(-?)[ \t]*(['\"]?)(\w+)\2(?=[\s;&|<>]|$)")
 HEREDOC_STDIN = "HEREDOC_BODY"
-STRICT_HELP = ("Commands that touch git, write files, run other programs' code or call the review helper must "
-               "be plain: literal words, quoted strings and operators (`&&`, `|`, `>` …) only — no variables, "
-               "`$(…)`, backticks, subshells, braces, `#` comments or backslashes. Write paths and values out, "
-               "split it into separate commands, use the Write/Edit tools for files, or a script file. A commit "
-               "message can be given as `-m \"$(cat <<'EOF' … EOF)\"` or with `git commit -F <file>`.")
+STRICT_HELP = ("Commands with variables, `$(…)`, backticks, subshells, braces, backslashes or `#` comments may "
+               "only run read-only programs (echo, cat, grep, ls, head, wc …). Anything else — git, writing files, "
+               "other programs — must be plain: literal words, quoted strings and operators (`&&`, `|`, `>` …). "
+               "Everything inside single quotes is plain text, so quote braces, `$` and backslashes (`'@{u}'`, "
+               "`'a\\|b'`). Otherwise write paths and values out, split the command, use the Write/Edit tools for "
+               "files, or a script file. A commit message can be given as `-m \"$(cat <<'EOF' … EOF)\"` or with "
+               "`git commit -F <file>`.")
 
 
 def quote_contexts(text):
@@ -488,6 +493,31 @@ def quote_contexts(text):
     return contexts
 
 
+def cat_substitutions(command):
+    """[(start, end, body)] for each `$(cat <<'EOF' … EOF)` the shell reads as exactly that: the body runs to
+    the first line that is the delimiter (after leading tabs with `<<-`), and only blanks and the closing `)`
+    follow it. Anything else after that line is not stripped, so the command isn't plain."""
+    found, pos = [], 0
+    while True:
+        m = CAT_SUBST_START.search(command, pos)
+        if not m:
+            return found
+        pos = m.end()
+        delim, tabs, i = m.group(3), m.group(1) == "-", m.end()
+        while i <= len(command):
+            end = command.find("\n", i)
+            line = command[i:] if end < 0 else command[i:end]
+            if (line.lstrip("\t") if tabs else line) == delim:
+                close = re.match(r"[ \t\n]*\)", command[i + len(line):])
+                if close:
+                    found.append((m.start(), i + len(line) + close.end(), command[m.end():i]))
+                    pos = i + len(line) + close.end()
+                break
+            if end < 0:
+                break
+            i = end + 1
+
+
 def strip_data_heredocs(command):
     """(the command with heredoc bodies that are plain data taken out, [(body, index in the result)]).
     `"$(cat <<'EOF' … EOF)"` becomes the literal word HEREDOC_BODY; any other heredoc with a quoted
@@ -495,29 +525,28 @@ def strip_data_heredocs(command):
     result isn't plain, the caller doesn't parse it, and checks the original command as text instead."""
     contexts = quote_contexts(command)
     out, pos, bodies = [], 0, []
-    for m in CAT_SUBST.finditer(command):
-        if m.start() < pos or contexts[m.start()] == "'":
+    for start, end, body in cat_substitutions(command):
+        if start < pos or contexts[start] == "'":
             continue
-        body = m.group(0).split("\n", 1)[1] if "\n" in m.group(0) else ""
-        out.append(command[pos:m.start()])
+        out.append(command[pos:start])
         bodies.append((body, sum(map(len, out))))
         out.append(HEREDOC_STDIN)
-        pos = m.end()
+        pos = end
     text = "".join(out) + command[pos:]
     # Other quoted-delimiter heredocs: the body starts after the line that holds `<<`, and ends at the first
-    # line that is the delimiter (with `<<-`, after leading tabs). Several may queue on one line.
-    result, i, pending = [], 0, []
-    contexts = quote_contexts(text)
+    # line that is the delimiter (with `<<-`, after leading tabs). Several may queue on one line. The quote
+    # state is tracked as the text is read, and never inside a body.
+    result, i, pending, quote = [], 0, [], None
     while i < len(text):
         ch = text[i]
-        if contexts[i] is None and ch == "<":
+        if quote is None and ch == "<":
             m = DATA_HEREDOC.match(text, i)
             if m and not text.startswith("<<<", i) and (m.group(2) or plain_body(text, m)):
                 pending.append((m.group(3), m.group(1) == "-"))
                 result.append(f"< {HEREDOC_STDIN}")
                 i = m.end()
                 continue
-        if contexts[i] is None and ch == "\n" and pending:
+        if quote is None and ch == "\n" and pending:
             result.append("\n")
             i += 1
             for delim, tabs in pending:
@@ -531,8 +560,11 @@ def strip_data_heredocs(command):
                     lines.append(line)
                 bodies.append(("\n".join(lines), len("".join(result))))
             pending = []
-            contexts = quote_contexts(text)  # unchanged text; indices still valid
             continue
+        if quote is None and ch in "'\"":
+            quote = ch
+        elif quote is not None and ch == quote:
+            quote = None
         result.append(ch)
         i += 1
     for _ in pending:  # a heredoc on the last line: no body at all
@@ -568,6 +600,21 @@ def strip_inert_comments(text):
     return "".join(out)
 
 
+def plain_tilde(rest):
+    """True if a word starting with `~` (rest is the text from there on) is one every shell reads the same:
+    `~`, `~/…`, or `~user` for a user that exists."""
+    m = re.match(r"~([A-Za-z0-9_.-]*)(?=[/\s;&|<>:]|$)", rest)
+    if not m:
+        return False
+    if not m.group(1):
+        return True
+    try:
+        pwd.getpwnam(m.group(1))
+        return True
+    except KeyError:
+        return False
+
+
 def plain_problem(text):
     """None if text is a plain command (literal words, single and double quotes without `$`, backticks or
     backslashes inside, operators, newlines); else the first construct that makes it not plain. For plain
@@ -600,48 +647,52 @@ def plain_problem(text):
             return "a zsh number range"
         elif ch == "=" and (i == 0 or text[i - 1] in " \t\n;&|<>"):
             return "a word starting with `=`"
-        elif ch == "~" and (i == 0 or text[i - 1] in " \t\n;&|<>=:") and not re.match(r"~(?:[/\s;&|<>:]|$|[A-Za-z_])",
-                                                                                        text[i:]):
-            return "a `~` directory-stack reference"
+        elif ch == "~" and (i == 0 or text[i - 1] in " \t\n;&|<>=:") and not plain_tilde(text[i:]):
+            return "a `~` that isn't your home or a user's (zsh reads `~X` as the directory in $X)"
         elif ord(ch) < 32 and ch not in "\t\n":
             return "a control character"
     return "an unclosed quote" if quote else None
 
 
 def dynamic_reason(command):
-    """Why a command that isn't plain must be refused, or None if — read as text, in every way the shell
-    may read it — it can't touch git, write a file, run other code or change the shell for a later push.
-    Deliberately broad: such a command can't be parsed reliably, so any sign of these counts."""
+    """Why a command that isn't plain must be refused, or None if it only runs read-only programs and writes
+    nothing. Such a command can't be parsed reliably, so this errs on the side of refusing: every place a
+    command could start is checked (wherever `;`, `&`, `|`, `(`, `)`, braces, newlines, `$(`, `<(` or
+    backticks appear, quoted or not), and the command named there must be a literal, known read-only one."""
     bodies = [m.group(1) for m in ANSI_QUOTE.finditer(command)]
     if any(body != "\\0" and UNSURE_ESCAPE.search(body) for body in bodies) or not decode_ansi(command)[1]:
         return "it uses `$'…'` escapes the shells read differently"
-    for view in shell_views(command):
-        if GIT_WORD.search(view):
-            return "it mentions git"
-        m = RISKY_TEXT.search(view)
-        if m:
-            return f"it names `{m.group(0)}`"
-        if ">" in HARMLESS_REDIRECT.sub("", view):
+    for view in shell_views(command)[:3]:  # as written, lines joined, $'…' decoded: quotes kept
+        view = HARMLESS_REDIRECT.sub(" ", view)
+        if ">" in view.replace(">(", ""):
             return "it writes to a file"
-        words = set(re.findall(r"[A-Za-z0-9_.+-]+", view))
-        risky = sorted(w for w in words if w in RISKY_WORDS or PYTHONS.match(w))
-        if risky:
-            return f"it runs `{risky[0]}`"
-        quoted = view in shell_views(command)[:3]  # the views that still have their quotes
-        for prog in sorted(words & set(OUTPUT_OPTS)) if quoted else []:
-            opts = OUTPUT_OPTS[prog]
-            short = {o[1] for o in opts if len(o) == 2}
-            for word in rough_words(view):
-                bare = word.lstrip("'\"")
-                if bare[:1] in ("$", "`") or bare.split("=")[0] in opts or \
-                        (bare[:1] == "-" and bare[1:2] != "-" and any(c in short for c in bare[1:])):
-                    return f"it runs `{prog}` with an output option or an argument a variable could turn into one"
-        # A command name the shell only learns at run time (`$W x`, `"$(…)" x`, `` `…` x ``), or `. file`.
-        if re.search(r"(?:^|[;&|(`{\n]|\b(?:then|do|else))[ \t]*\.[ \t]", view):
-            return "it sources a file"
-        for m in re.finditer(r"\$|`", view):
-            if dynamic_head(view[:m.start()]):
-                return "it takes a command name from a variable or command output"
+        for piece in re.split(r"\$\(|[<>]\(|[`;&|(){}\n]", view):
+            words = piece.split()
+            if words and words[0] in ("for", "select", "case"):
+                continue  # `for f in …`: a name and words, no command
+            while words and (words[0] in KEYWORDS or re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", words[0])
+                             or re.match(r"^\d*<", words[0])):
+                # keywords, assignments, and input redirections (`done < list`: the target goes too)
+                words = words[2:] if re.fullmatch(r"\d*<", words[0]) else words[1:]
+            if not words:
+                continue
+            head, args = words[0], words[1:]
+            if head not in READ_ONLY:
+                return f"it runs `{head}`, which isn't a known read-only command"
+            if head in DECLARERS and any(re.search(r"[$`]", a.split("=", 1)[0]) for a in args):
+                return f"`{head}` builds a variable name from another variable (`RAVENWATCH_DIS$X`)"
+            if head == "sort" and any(re.match(r"-[A-Za-z]*o|--output", a.lstrip("'\"")) for a in args):
+                return "it runs `sort` with an output file"
+            if head == "uniq" and len([a for a in args if not a.lstrip("'\"").startswith("-")]) > 1:
+                return "it runs `uniq` with an output file"
+            if head == "curl":
+                opts = OUTPUT_OPTS["curl"] | {"-K", "--config"}
+                short = {o[1] for o in opts if len(o) == 2}
+                for word in rough_words(piece):
+                    bare = word.lstrip("'\"")
+                    if bare[:1] in ("$", "`") or bare.split("=")[0] in opts or \
+                            (bare[:1] == "-" and bare[1:2] != "-" and any(c in short for c in bare[1:])):
+                        return "it runs `curl` with an output option or an argument a variable could turn into one"
     return None
 
 
@@ -660,24 +711,6 @@ def rough_words(text):
             continue
         cur += ch
     return [w for w in words + [cur] if w]
-
-
-def dynamic_head(before):
-    """True if a `$` or backtick that follows `before` starts a command name (not an argument, an assignment's
-    value or the middle of a word). Quotes around it don't change that."""
-    before = before.rstrip("'\"")
-    if re.search(r"[A-Za-z_][A-Za-z0-9_]*=[^\s;&|]*$", before):
-        return False  # X=$(…): a value
-    if before and not before[-1].isspace() and before[-1] not in ";&|({\n`":
-        return False  # a$x: the middle of a word
-    rest = before.rstrip(" \t")
-    while True:  # keywords and assignment words before a command name
-        m = re.search(r"(?:^|(?<=[\s;&|({`]))(?:then|do|else|elif|if|while|until|time|!|[A-Za-z_][A-Za-z0-9_]*=\S*)$",
-                      rest)
-        if not m:
-            break
-        rest = rest[:m.start()].rstrip(" \t")
-    return not rest or rest[-1] in ";&|({\n`" or rest.endswith("$(")
 
 
 def segments(text):
@@ -722,6 +755,16 @@ def segments(text):
     return segs
 
 
+def dangerous_program(word):
+    """True if a command word may write files, run other code or reach git: a known writer, output-option
+    program, shell, interpreter or wrapper, git itself, or a word with glob characters (it could be any
+    of these once the shell expands it)."""
+    name = os.path.basename(word)
+    return bool(GLOB_CHARS.search(word)) or name in WRITERS or name in OUTPUT_OPTS or name in SHELLS or \
+        name in INTERPRETERS or name in EXECUTORS or name in ("git", "gh", "hub") or name.startswith("git-") or \
+        bool(PYTHONS.match(name))
+
+
 def reads_code_from_stdin(seg):
     """True if the command runs code read from its stdin: a shell without -c or a script, or an interpreter
     given no script (or `-`). awk takes its program from its arguments, never stdin."""
@@ -743,7 +786,7 @@ def inner_commands(seg):
         return [" ".join(a for a in seg[1:] if not a.startswith("-"))]
     found = []
     for i, tok in enumerate(seg):
-        if os.path.basename(tok) in SHELLS:
+        if os.path.basename(tok) in SHELLS or GLOB_CHARS.search(tok):
             for j in range(i + 1, len(seg)):
                 if re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", seg[j]) and j + 1 < len(seg):
                     found.append(seg[j + 1])
@@ -759,9 +802,7 @@ def runs_unseen(seg):
     head = os.path.basename(seg[0]) if seg else ""
 
     def worrying(words):
-        name = os.path.basename(words[0]) if words else ""
-        return name in WRITERS or name in OUTPUT_OPTS or name in SHELLS or name in INTERPRETERS or \
-            name in EXECUTORS or name == "git" or bool(PYTHONS.match(name))
+        return bool(words) and dangerous_program(words[0])
     if head in ("xargs", "parallel"):
         rest = [a for a in seg[1:] if not a.startswith("-")]
         if worrying(rest):
@@ -829,6 +870,9 @@ def check_bash(command, cwd, depth=0):
                 return ("a command that pushes can't also set shell variables (they can change which config git "
                         "reads). Run `git push` as its own command.")
             continue
+        if GLOB_CHARS.search(seg[0]):
+            return (f"the program name `{seg[0]}` has glob characters, so the guard can't tell what runs. Write "
+                    "the program's name out.")
         head = os.path.basename(seg[0])
         if bodies and (head in ("alias", "unalias", "hash", "enable", "builtin") or
                        any(p.startswith("PATH=") for p in prefix)):
@@ -910,7 +954,7 @@ def check_bash(command, cwd, depth=0):
                 word = (touches_git_dir(heres, option_values(args, OUTPUT_OPTS[head]), protect, writes=True)
                         or touches_git_dir(heres, args, protect, writes=False))
             else:
-                word = touches_git_dir(heres, args, protect, writes=head in WRITERS)
+                word = touches_git_dir(heres, args, protect, writes=dangerous_program(head))
         if word:
             return path_refusal(*word)
         if not (pushing or GIT_WORD.search(" ".join(seg))):
@@ -921,7 +965,8 @@ def check_bash(command, cwd, depth=0):
             # A push run by another program: a wrapper given a command string, or `git` and `push` as
             # separate words in its arguments (find -exec git push, xargs git push). A quoted mention such
             # as `rg "git push"` is one token and is fine.
-            runs_git_push = any(os.path.basename(t) in ("git", "git-push") for t in seg[1:]) and \
+            runs_git_push = any(os.path.basename(t) in ("git", "git-push") or GLOB_CHARS.search(t)
+                                for t in seg[1:]) and \
                 any(PUSH_WORD.fullmatch(t) or os.path.basename(t) == "git-push" for t in seg[1:])
             if (head in EXECUTORS and may_push(seg_text)) or runs_git_push:
                 return (f"`{seg[0]}` runs a push the gate cannot check (wrappers, find -exec, xargs …). "
@@ -1037,9 +1082,9 @@ def risky_on_failure(command, target):
     could write somewhere, names git internals or the plugin, or uses shell features. Never unrelated tools."""
     if command is None:  # Write/Edit: only git-looking or plugin paths
         return bool(re.search(r"(?i)\.git\b|ravenwatch|hooks", target))
-    programs = sorted(RISKY_WORDS | set(OUTPUT_OPTS) | {"python", "python3"})
-    return may_push(command) or bool(re.search(r"[*?\[>$`(){}#\\]|\.git|ravenwatch|hooks|\b(?:"
-                                               + "|".join(map(re.escape, programs)) + r")\b", command, re.I))
+    words = re.findall(r"[A-Za-z0-9_.+/-]+", command)
+    return may_push(command) or any(dangerous_program(w) for w in words) or \
+        bool(re.search(r"[*?\[>$`(){}#\\]|\.git|ravenwatch|hooks", command, re.I))
 
 
 def _too_slow(signum, frame):

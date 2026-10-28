@@ -56,7 +56,8 @@ bash_gate deny  "$R" "python3 $RV mark --verdict block --run x --report $R/.git/
 bash_gate allow "$R" 'echo $HOME'
 bash_gate allow "$R" 'x=$(date); echo "$x"'
 bash_gate allow "$R" 'for f in *.md; do echo "$f"; done'
-bash_gate allow "$R" 'docker '$P' "$IMAGE"'
+# Since 0.5.1 a command that isn't plain may only run read-only programs.
+bash_gate deny  "$R" 'docker '$P' "$IMAGE"' "known read-only"
 bash_gate allow "$R" 'curl -s -H "Authorization: Bearer $TOKEN" https://example.com/api'
 bash_gate deny  "$R" 'curl -so "$F" https://example.com' "must be plain"
 bash_gate deny  "$R" 'curl $OPTS https://example.com' "must be plain"
@@ -96,7 +97,8 @@ bash_gate deny  "$R" "find . -name x -delete" "deletes"
 # --- round 8 LOOP-1: mark takes no abbreviated options and no repeated ones
 python3 "$RV" mark --verdict block --sc >/dev/null 2>"$T/err" && bad "mark took --sc as an abbreviation" || ok
 grep -q "unrecognized arguments: --sc" "$T/err" && ok || bad "abbreviation refusal unclear: $(cat "$T/err")"
-python3 "$RV" mark --verdict block --v pass >/dev/null 2>&1 && bad "mark took --v as --verdict" || ok
+python3 "$RV" mark --verdict block --v pass >/dev/null 2>"$T/err" && bad "mark took --v as --verdict" || ok
+grep -q "unrecognized arguments: --v" "$T/err" && ok || bad "abbreviated --v not refused by the parser: $(cat "$T/err")"
 python3 "$RV" mark --verdict block --note x --verdict pass >/dev/null 2>"$T/err" && bad "mark took a second --verdict" || ok
 grep -q "more than once" "$T/err" && ok || bad "repeated-option refusal unclear: $(cat "$T/err")"
 

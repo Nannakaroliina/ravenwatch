@@ -228,7 +228,8 @@ bash_gate deny  "$R" 'PWD=/tmp cp a $PWD/.gi?/hooks/pre-'$P "inside a git direct
 rmdir sub
 
 # --- round 2 (UX-1/2/3, sed, reads): ordinary commands with variables
-bash_gate allow "$R" 'docker '$P' "$IMAGE"'
+# Since 0.5.1 a command that isn't plain may only run read-only programs.
+bash_gate deny  "$R" 'docker '$P' "$IMAGE"' "known read-only"
 bash_gate allow "$R" 'grep -rn '$P' src | awk -F: '"'"'{print $1}'"'"
 bash_gate deny  "$R" 'git stash '$P' -m "wip $B"' "must be plain"
 bash_gate deny  "$R" 'git '$P' origin "$B"' "uses shell variables"
@@ -333,8 +334,9 @@ bash_gate deny  "$R" "cat > /tmp/x <<'EOF' && git -C $N $P
 EOF" "not installed"
 bash_gate deny  "$R" "cat > .git/hooks/x <<'EOF'
 EOF" "git hooks"
-# A literal `$` that is no expansion (`grep 'x$\|y'`) is just text, after variables are filled in.
-bash_gate allow "$R" 'grep -n "a\$\|b" a'
+# A `\$` inside double quotes isn't plain (since 0.5.1 refused when the command splits oddly); single quotes are.
+bash_gate deny  "$R" 'grep -n "a\$\|b" a' "known read-only"
+bash_gate allow "$R" "grep -n 'a\$\|b' a"
 bash_gate allow "$R" "cat > /tmp/rw-x.sh <<'EOF'
 IFS=\$'\\n'
 for f in \$(git diff --name-only); do echo \"\$f\"; done

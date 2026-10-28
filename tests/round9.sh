@@ -80,7 +80,9 @@ bash_gate deny  "$R" "cd -P /tmp && printf x > $RW/hooks/guard_push.py"
 bash_gate deny  "$R" "cd \"\$PWD\" && cd .git && printf x > status" "can't tell which directory"
 bash_gate deny  "$R" "cd \"\$PWD\" && printf x > ravenwatch/status" "can't tell which directory"
 bash_gate allow "$R" "cd \"\$HOME\" && ls"
-bash_gate allow "$R" "cd \"\$PWD\" && npm test"
+# Since 0.5.1 a command that isn't plain may only run read-only programs.
+bash_gate deny  "$R" "cd \"\$PWD\" && npm test" "known read-only"
+bash_gate allow "$R" "npm test"
 bash_gate allow "$T" "cd $R && git $P -q origin main"
 bash_gate deny  "$R" "cd /tmp; git $P -q origin main" "not a git repository"
 

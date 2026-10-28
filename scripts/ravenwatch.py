@@ -135,13 +135,15 @@ def hidden_tracked_files():
     return {"missing": missing, "changed": changed}
 
 
-def refuse_hidden_files(paths=None):
+def refuse_hidden_files(paths=None, run_exists=True):
     """Refuse while hidden files could change what is reviewed or tested; return the ones that don't.
     A changed file (present on disk but different from the commit) is refused when it is in `paths` (the
     reviewed files of a diff review) or when `paths` is None (checks and full audits read the whole tree);
     any other changed file is returned, so the context can tell reviewers it is a local override, not the
     commit. A missing file is refused on the same terms, so an ordinary sparse checkout or a local config
-    override kept out of commits still works for a normal review."""
+    override kept out of commits still works for a normal review. `accepted` is only offered where a run
+    exists to record it on (mark, checks), not from prepare."""
+    accept = " Or record the review as `accepted`." if run_exists else ""
     flagged = hidden_tracked_files()
     changed = [p for p in flagged["changed"] if paths is None or p in paths]
     missing = [p for p in flagged["missing"] if paths is None or p in paths]
@@ -150,14 +152,14 @@ def refuse_hidden_files(paths=None):
                            f"what is committed: {', '.join(changed[:5])}{' …' if len(changed) > 5 else ''}. Reviewers "
                            "and checks would read the version on disk, not the commit. If it is a local override, set "
                            "it aside for the review: git update-index --no-skip-worktree --no-assume-unchanged <file> "
-                           "&& git stash push -- <file>; review and push; then git stash pop and set the flag again. "
-                           "Or record the review as `accepted`.")
+                           "&& git stash push -- <file>; review and push; then git stash pop and set the flag again."
+                           + accept)
     if missing:
         raise RuntimeError("these tracked files are missing from disk but are marked skip-worktree/assume-unchanged "
                            f"or left out by a sparse checkout: {', '.join(missing[:5])}{' …' if len(missing) > 5 else ''}. "
                            "Reviewers and checks would run without them. Restore them (git update-index "
                            "--no-skip-worktree <file> && git checkout -- <file>, or git sparse-checkout add <dir>), "
-                           "review from a full checkout, or record the review as `accepted`.")
+                           "or review from a full checkout." + accept)
     return [p for p in flagged["changed"] if p not in changed]
 
 
@@ -723,7 +725,7 @@ def cmd_prepare(args):
     ignore_repo_attributes()
     overrides = []
     if mode != "worktree":
-        overrides = refuse_hidden_files(None if mode == "full" else reviewed_paths(base))
+        overrides = refuse_hidden_files(None if mode == "full" else reviewed_paths(base), run_exists=False)
     if mode == "full":
         changed = tracked_changes()
         if changed:

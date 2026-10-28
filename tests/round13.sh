@@ -80,7 +80,9 @@ bash_gate deny  "$R" "D=\$(mktemp -d); cp f \"\$D/b\"" "must be plain"
 bash_gate deny  "$R" "D=\$(mktemp -d \"\$TMPDIR/x.XXXX\"); cp f \"\$D/b\"" "must be plain"
 bash_gate deny  "$R" "cp f \"\$HOME/b\"" "must be plain"
 bash_gate deny  "$R" "for f in a.md b.md; do cp \$f /tmp/\$f; done" "must be plain"
-bash_gate allow "$R" "echo hi # (a comment)"
+# A comment with more than plain words isn't plain; since 0.5.1 its words count as commands.
+bash_gate deny  "$R" "echo hi # (a comment)" "known read-only"
+bash_gate allow "$R" "echo hi # a plain comment"
 
 # --- BUG-3: options in the middle of an alias chain count
 git config alias.aa "bb --recurse-submodules=on-demand"; git config alias.bb "$P"

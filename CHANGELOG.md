@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.5.1 — 2026-10-28
+
+Fixes from the review of 0.5.0.
+
+**Upgrade:** re-run /ravenwatch:install-git-hook in each gated repository. If push recursion into submodules is on anywhere (for example `submodule.recurse=true` in your global config), set `push.recurseSubmodules=check` in each gated repository's own config: since 0.4.1 the hook (and Claude's guard) refuse every push while recursion is on, with or without submodules.
+
+- Guard:
+  - A command that isn't plain may only run read-only programs (a short allowlist: echo, cat, grep, ls, head, wc, sort/uniq without an output file, curl without output options …), and must not write to a file. 0.5.0 instead looked for risky words, which globbed program names (`/bin/c?`), globbed paths (`.gi?`) and writers it didn't list (`uniq`, `sort -o`) got past. More commands are refused as a result (`docker push "$IMAGE"`, `cd "$DIR" && npm test`); the refusal says that anything in single quotes is plain.
+  - In plain commands, a program name with glob characters (`/usr/bin/gi[t] push`) is refused, and a globbed word counts as possibly any program in `xargs`, `find -exec`, `sh -c` and pushes run through wrappers.
+  - The `-m "$(cat <<'EOF' … EOF)"` commit message ends where the shell ends it: at the first line that is exactly the delimiter. Anything other than `)` after that line makes the command not plain (0.5.0 could run on to a later delimiter line and miss the commands in between).
+  - A partly quoted heredoc delimiter (`<<"E"OF`, `<<EOF'X'`) is no longer mistaken for a shorter one; such a heredoc isn't plain.
+  - A `~name` word is plain only for a user that exists (zsh reads `~X` as the directory in `$X`).
+  - One rule decides which programs write or run code (writers, output-option programs, shells, interpreters, wrappers, git, globbed names); more writers are known (`ed`, `sponge`, `shred`, `uniq`, `sort`, `base64`, `scp` …), so `ed ~/.gitconfig` and `xargs sponge` are refused.
+  - Quote state is no longer read from inside an earlier heredoc body (a `don't` there made a second heredoc look unquoted).
+- `prepare`'s refusal for skip-worktree or sparse files no longer suggests recording `accepted`: there is no run to record it on yet.
+- Tests: new `tests/round15.sh`.
+
 ## 0.5.0 — 2026-10-28
 
 The Claude guard no longer tries to work out what shell variables, substitutions and comments do. Four review rounds in a row found a new way around that guesswork, and some of the fixes opened the next one. It now parses only **plain** commands, and refuses anything else that could matter.
