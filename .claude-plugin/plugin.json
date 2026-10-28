@@ -20,5 +20,6 @@
     "gdpr"
   ],
   "homepage": "https://github.com/Nannakaroliina/ravenwatch",
-  "repository": "https://github.com/Nannakaroliina/ravenwatch"
+  "repository": "https://github.com/Nannakaroliina/ravenwatch",
+  "icon": "./assets/icon-code.png"
 }

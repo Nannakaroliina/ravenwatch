@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <title>Ravenwatch</title>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#232A4D"/>
+      <stop offset="1" stop-color="#0F1226"/>
+    </linearGradient>
+    <linearGradient id="panel" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#F3EEDD"/>
+      <stop offset="1" stop-color="#D8D1BE"/>
+    </linearGradient>
+    <clipPath id="tile"><rect width="512" height="512" rx="112"/></clipPath>
+  </defs>
+
+  <g clip-path="url(#tile)">
+    <rect width="512" height="512" fill="url(#bg)"/>
+
+    <!-- code editor window -->
+    <rect x="52" y="68" width="408" height="300" rx="30" fill="url(#panel)"/>
+    <g fill="#9AA0BD">
+      <circle cx="88" cy="100" r="9"/>
+      <circle cx="116" cy="100" r="9"/>
+      <circle cx="144" cy="100" r="9"/>
+    </g>
+    <g stroke-linecap="round" stroke-width="20" fill="none">
+      <path d="M 92 152 H 168" stroke="#5E6898"/>
+      <path d="M 196 152 H 312" stroke="#9AA0BD"/>
+      <path d="M 128 200 H 240" stroke="#9AA0BD"/>
+      <path d="M 268 200 H 336" stroke="#5E6898"/>
+      <path d="M 128 248 H 196" stroke="#5E6898"/>
+      <!-- the line the raven caught -->
+      <path d="M 128 296 H 208" stroke="#E8A321"/>
+      <path d="M 92 340 H 156" stroke="#9AA0BD"/>
+    </g>
+
+    <!-- raven head, faceted, facing left at the flagged line -->
+    <g transform="translate(176 117) scale(0.72)">
+      <path fill="#0B0D1A" d="
+        M 96 252 L 182 196 L 226 166 L 290 146 L 352 160 L 392 206
+        L 410 300 L 436 400 L 470 620 L 200 620 L 238 410 L 250 352
+        L 230 336 L 246 322 L 222 306 L 238 292 L 208 278 L 196 268 Z"/>
+      <path fill="#262C52" d="M 96 252 L 182 196 L 226 166 L 214 228 Z"/>
+      <path fill="#171B36" d="M 96 252 L 214 228 L 196 268 Z"/>
+      <path fill="#171B35" d="M 226 166 L 290 146 L 352 160 L 300 200 Z"/>
+      <path fill="#12152B" d="M 214 226 L 226 166 L 300 200 L 290 262 Z"/>
+      <path fill="#191D38" d="M 352 160 L 392 206 L 410 300 L 330 286 Z"/>
+      <circle cx="262" cy="210" r="22" fill="#F5B53D"/>
+      <circle cx="266" cy="208" r="9" fill="#0B0D1A"/>
+      <circle cx="257" cy="202" r="4.5" fill="#FFF4D6"/>
+    </g>
+  </g>
+</svg>
