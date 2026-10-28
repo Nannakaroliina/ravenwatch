@@ -104,9 +104,8 @@ def budgeted(lines, seconds, state):
 
 
 def hidden_tracked_files():
-    """Tracked files on disk that git status doesn't compare with HEAD (skip-worktree or assume-unchanged),
-    so their content on disk may differ from the commit being reviewed. Sparse-checkout files that aren't on
-    disk don't count."""
+    """Tracked files that git status doesn't compare with HEAD (skip-worktree, assume-unchanged, or left out
+    by a sparse checkout) and that are missing from disk or differ there from what is committed."""
     res = subprocess.run(["git", "ls-files", "-v", "-s", "-z"], capture_output=True, text=True,
                          errors="surrogateescape")
     if res.returncode != 0:
@@ -120,10 +119,11 @@ def hidden_tracked_files():
             flagged[path] = parts[2]
     # A flagged file missing from disk (deleted, or left out by a sparse checkout) hides a change just as
     # much as an edited one: checks and reviewers would run without it.
-    hidden = [p for p in flagged if not os.path.isfile(p) or os.path.islink(p)]
-    present = [p for p in flagged if p not in hidden]
-    if not present or any("\n" in p for p in present):
-        return hidden + [p for p in present if "\n" in p]
+    hidden, present = [], []
+    for p in flagged:
+        (hidden if not os.path.isfile(p) or os.path.islink(p) or "\n" in p else present).append(p)
+    if not present:
+        return hidden
     # A local override that matches the commit is harmless; only content that differs is hidden.
     disk = subprocess.run(["git", "hash-object", "--stdin-paths"], input="\n".join(present) + "\n",
                           capture_output=True, text=True, errors="surrogateescape")
@@ -132,8 +132,11 @@ def hidden_tracked_files():
     return hidden + [p for p, h in zip(present, disk.stdout.split()) if flagged[p] != h]
 
 
-def refuse_hidden_files():
-    hidden = hidden_tracked_files()
+def refuse_hidden_files(paths=None):
+    """Refuse while hidden files (above) could change what is reviewed or tested. paths: only these count —
+    a diff review reads the reviewed files, so a sparse checkout or a local override elsewhere is fine.
+    None (checks, full audits): every hidden file counts, because those read the whole tree."""
+    hidden = [p for p in hidden_tracked_files() if paths is None or p in paths]
     if hidden:
         raise RuntimeError("these tracked files are marked skip-worktree or assume-unchanged (or left out by a sparse "
                            "checkout) and are missing or differ on disk from what is committed: "
@@ -141,6 +144,15 @@ def refuse_hidden_files():
                            "read what is on disk. Clear the flag (git update-index --no-skip-worktree "
                            "--no-assume-unchanged <file>, or git sparse-checkout disable) and commit or stash any "
                            "change first.")
+
+
+def reviewed_paths(base):
+    """The paths a diff review from base to HEAD covers."""
+    res = subprocess.run(["git", "-c", "core.quotePath=false", "diff", "--name-only", "-z", "--no-renames", base,
+                          "HEAD"], capture_output=True, text=True, errors="surrogateescape")
+    if res.returncode != 0:
+        raise RuntimeError(f"git diff failed: {res.stderr.strip()[:200]}")
+    return {p for p in res.stdout.split("\0") if p}
 
 
 def tracked_changes():
@@ -625,21 +637,32 @@ def scan_added_lines(lines, commit_label=None):
     """Return [(file, line_no, pattern, redacted, likely_placeholder, commit)] for an iterable of diff lines."""
     hits = []
     current_file, new_line, commit = None, 0, commit_label
+    # `+++ b/file` is a header only between `diff …` and the first `@@`; inside a hunk every line is content,
+    # even one that starts with `++` (so text can't pass itself off as a header and go unscanned). Combined
+    # diffs of merges (`@@@`) have one marker column per parent.
+    in_hunk, columns = False, 1
     for raw in lines:
         if raw.startswith("commit ") and len(raw.split()) >= 2 and re.fullmatch(r"[0-9a-f]{40}", raw.split()[1]):
-            commit = raw.split()[1][:8]
+            commit, in_hunk = raw.split()[1][:8], False
             continue
-        if raw.startswith("+++ "):
+        if raw.startswith("diff "):
+            in_hunk = False
+            continue
+        if not in_hunk and raw.startswith("+++ "):
             p = raw[4:]
             current_file = p[2:] if p.startswith("b/") else (None if p == "/dev/null" else p)
             continue
         if raw.startswith("@@"):
             m = re.search(r"\+(\d+)", raw)
             new_line = int(m.group(1)) - 1 if m else 0
+            in_hunk, columns = True, max(len(raw) - len(raw.lstrip("@")) - 1, 1)
             continue
-        if raw.startswith("+") and not raw.startswith("+++"):
+        if not in_hunk:
+            continue
+        marker = raw[:columns]
+        if "+" in marker and "-" not in marker:
             new_line += 1
-            line = raw[1:]
+            line = raw[columns:]
             # Every pattern and every match: an example key earlier on a line must not hide a real one.
             for name, rx in SECRET_PATTERNS:
                 for m in rx.finditer(line):
@@ -652,7 +675,7 @@ def scan_added_lines(lines, commit_label=None):
                         placeholder = placeholder or bool(TESTISH_NAME.search(line[m.start():m.start(1)]))
                     digest = sha256_bytes(val.encode("utf-8", "surrogateescape"))[:16]
                     hits.append((current_file, new_line, name, redact(val), placeholder, commit, digest))
-        elif not raw.startswith("-"):
+        elif "-" not in marker:
             new_line += 1
     return hits
 
@@ -671,7 +694,7 @@ def cmd_prepare(args):
     base, label, mode, covered_base = decide_range(args, sdir)
     ignore_repo_attributes()
     if mode != "worktree":
-        refuse_hidden_files()
+        refuse_hidden_files(None if mode == "full" else reviewed_paths(base))
     if mode == "full":
         changed = tracked_changes()
         if changed:
@@ -1072,8 +1095,9 @@ def cmd_mark(args):
                            f"now {head[:8]}); the verdict would cover commits nobody reviewed. Review again.")
     if args.verdict in ("pass", "warn") and prepared.get("mode") != "worktree":
         # Reviewers and checks read the files on disk; they must be the commit the verdict unlocks.
-        refuse_hidden_files()
-        if prepared.get("mode") == "full" and tracked_changes():
+        full = prepared.get("mode") == "full"
+        refuse_hidden_files(None if full else reviewed_paths(prepared.get("diff_base") or empty_tree()))
+        if full and tracked_changes():
             raise RuntimeError("tracked files changed on disk since this full audit was prepared, so the reviewers may "
                                "not have read what HEAD contains. Commit or stash, then review again.")
     brief_sha = current_brief_sha(sdir)

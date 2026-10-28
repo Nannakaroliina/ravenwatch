@@ -46,6 +46,8 @@ PATTERN_OPTION = re.compile(r"exclude|include|ignore|filter|pattern|regex|glob|m
 CD_PREFIXES = {"builtin", "command", "exec", "time", "!", "if", "elif", "then", "else", "do", "while", "until"}
 # More matches than this and a glob is treated as unknowable (checking them all could take too long).
 GLOB_LIMIT = 2000
+# Longer values are not trimmed (${X%pat} tries every cut): the word counts as unknowable instead.
+TRIM_LIMIT = 4096
 # File names that matter when the directory a command runs in is unknown.
 SENSITIVE_NAMES = {"status", "latest", "prepared", "checks.kv", "brief-approved.md", "brief-trust", "config",
                    "pre-push", "pre-push.local", "head", "guard_push.py", "ravenwatch.py", "git-pre-push.sh",
@@ -118,7 +120,9 @@ OUTPUT_OPTS = {
 # A `cat` heredoc. Its body is only dropped when the rest of its first line is just redirections:
 # `cat <<EOF | sh` or `cat <<EOF && git push` keep the body, which is then checked as commands. The body
 # may be empty (the delimiter on the very next line); it ends at the first line that is the delimiter.
-CAT_HEREDOC = re.compile(r"\bcat\s+<<-?\s*(['\"]?)(\w+)\1([^\n]*)\n(?:.*?\n)??[ \t]*\2[ \t]*(?=\n|\)|$)", re.S)
+# `cat > file <<'EOF'` writes the same body as `cat <<'EOF' > file`; the redirect is kept (and checked).
+CAT_HEREDOC = re.compile(r"\bcat\s+((?:\d?>>?\s*[^\s;&|<>()\"'`$]+\s+)?)<<-?\s*(['\"]?)(\w+)\2([^\n]*)\n"
+                         r"(?:.*?\n)??[ \t]*\3[ \t]*(?=\n|\)|$)", re.S)
 HARMLESS_REST = re.compile(r"[\s\"')]*(?:(?:(?<=\s)\d+)?>>?\s*[^\s;&|()<>\"']+[\s\"')]*)*")
 REPORTS_PATH = re.compile(r"/ravenwatch/reports(?:/|$)")
 # ravenwatch state file names, wherever they are written (a directory may become a git dir later).
@@ -150,7 +154,7 @@ TMPDIR_REF = re.compile(r"\$\{?TMPDIR(?::?-[^}]*)?\}?")
 ANSI_QUOTE = re.compile(r"\$'((?:[^'\\]|\\.)*)'")
 # Escapes whose meaning differs between Python, bash and zsh (\c truncates, a bare \x, \u or \U, NUL …):
 # a $'…' using them can't be decoded reliably, so it is refused.
-UNSURE_ESCAPE = re.compile(r"\\(?:c|0|x(?![0-9A-Fa-f]{2})|u(?![0-9A-Fa-f]{4})|U(?![0-9A-Fa-f]{8}))")
+UNSURE_ESCAPE = re.compile(r"\\(?:c|0|N|x(?![0-9A-Fa-f]{2})|u(?![0-9A-Fa-f]{4})|U(?![0-9A-Fa-f]{8}))")
 # `$` and backticks inside single quotes, as segments() hands them on: plain text, never an expansion.
 LITERAL = {"$": "", "`": ""}
 UNLITERAL = str.maketrans({v: k for k, v in LITERAL.items()})
@@ -161,48 +165,88 @@ def may_push(text):
     return bool(PUSH_WORD.search(re.sub(r"[\"'\\]", "", text)))
 
 
-def unquoted_dollar_quotes(command):
-    """The bodies of $'…' and the positions of $"…" that are really quoting (not a `$` at the end of a
-    quoted string, as in grep 'push$')."""
-    found, quote, escaped, i = [], None, False, 0
-    while i < len(command):
-        ch = command[i]
-        if escaped:
+def quoting(command):
+    """Walk a command the way the shell's quoting does. Yields (index, context) before each character and
+    once more at the end, where context is None (plain), "'", '"', "$'" (ANSI-C), "#" (comment) or "\\"
+    (escaped). `$(…)` and backticks start a fresh context, even inside double quotes. The one quote
+    scanner: segments() aside, everything that asks "is this quoted?" uses it."""
+    stack = [[None, None]]  # [open quote, what opened this level: None, "(" or "`"]
+    escaped = comment = False
+    i, n = 0, len(command)
+    while i < n:
+        ch, quote = command[i], stack[-1][0]
+        yield i, "#" if comment else "\\" if escaped else quote
+        if comment:
+            comment = ch != "\n"
+        elif escaped:
             escaped = False
-        elif ch == "\\" and quote != "'":
+        elif quote == "'":
+            stack[-1][0] = None if ch == "'" else quote
+        elif quote == "$'":
+            if ch == "\\":
+                escaped = True
+            elif ch == "'":
+                stack[-1][0] = None
+        elif ch == "\\":
             escaped = True
-        elif quote:
-            quote = None if ch == quote else quote
-        elif ch == "$" and command[i + 1:i + 2] in ("'", '"'):
-            m = ANSI_QUOTE.match(command, i)
-            found.append(m.group(1) if m else command[i + 1:i + 2])
-            if m:
-                i = m.end()
-                continue
+        elif ch == "$" and command[i + 1:i + 2] == "(":
+            stack.append([None, "("])
+            i += 2
+            continue
+        elif ch == "`":
+            if stack[-1][1] == "`" and len(stack) > 1:
+                stack.pop()
+            else:
+                stack.append([None, "`"])
+        elif quote == '"':
+            stack[-1][0] = None if ch == '"' else quote
+        elif ch == "$" and command[i + 1:i + 2] == "'":
+            stack[-1][0] = "$'"
+            i += 2
+            continue
         elif ch in "'\"":
-            quote = ch
+            stack[-1][0] = ch
+        elif ch == ")" and len(stack) > 1 and stack[-1][1] == "(":
+            stack.pop()
+        elif ch == "#" and (i == 0 or command[i - 1] in " \t\n;&|()"):
+            comment = True
         i += 1
+    yield n, "#" if comment else "\\" if escaped else stack[-1][0]
+
+
+def unquoted_dollar_quotes(command):
+    """The bodies of $'…' (and `"` for each $"…") that the shell really reads as quoting — wherever they
+    are, including inside `"$(…)"` — but not a `$` at the end of a quoted string (grep 'push$')."""
+    found = []
+    for i, context in quoting(command):
+        if context is None and command[i:i + 1] == "$" and command[i + 1:i + 2] in ("'", '"'):
+            m = ANSI_QUOTE.match(command, i)
+            found.append(m.group(1) if m and command[i + 1] == "'" else command[i + 1])
     return found
 
 
 def decode_ansi(text):
-    """Text with each $'…' replaced by what the shell makes of it (`$'--no-\\x76erify'` → `--no-verify`).
-    Only used once UNSURE_ESCAPE has ruled out escapes the shells disagree on."""
+    """(text with each $'…' replaced by what the shell makes of it, whether every one decoded).
+    `$'--no-\\x76erify'` → `--no-verify`. Only trusted once UNSURE_ESCAPE has ruled out escapes the shells
+    disagree on; a body that still fails to decode makes the command uncheckable."""
+    ok = [True]
+
     def decoded(m):
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")  # escapes Python doesn't know (\e) stay as they are
                 return codecs.decode(m.group(1), "unicode_escape")
         except (UnicodeDecodeError, ValueError):
+            ok[0] = False
             return m.group(1)
-    return ANSI_QUOTE.sub(decoded, text).replace('$"', '"')
+    return ANSI_QUOTE.sub(decoded, text).replace('$"', '"'), ok[0]
 
 
 def shell_views(text):
     """The ways the shell may read a command or word: as written, with line continuations joined,
     with $'…' decoded, without quotes and backslashes, and without variables (`RAVENWATCH_DIS${X}ABLE`)."""
     joined = re.sub(r"\\\r?\n", "", text.translate(UNLITERAL))
-    decoded = decode_ansi(joined)
+    decoded = decode_ansi(joined)[0]
     return [text, joined, decoded, re.sub(r"[\"'\\]", "", decoded),
             re.sub(r"[\"'\\]", "", EXPANSION.sub("", decoded))]
 
@@ -279,34 +323,27 @@ def hook_installed(repo):
 
 
 def recurses_into_submodules(repo):
-    """True if a plain push here may also push submodules (through their own, unchecked hooks).
-    push.recurseSubmodules and submodule.recurse both set the mode and the one git reads last wins (the
-    order `git config --get-regexp` lists them in). Submodules are looked for only then: in the commits,
-    the index or a .gitmodules file, and in .git/modules (submodules of other branches)."""
-    if effective_recursion(git(repo, "config", "--get-regexp", r"^(push\.recursesubmodules|submodule\.recurse)$")[1]) \
-            not in ("on-demand", "only"):
-        return False
-    code, top = git(repo, "rev-parse", "--show-toplevel")
-    if code != 0:
-        return False
-    modules = git(repo, "rev-parse", "--path-format=absolute", "--git-path", "modules")[1]
-    return os.path.exists(os.path.join(top, ".gitmodules")) \
-        or git(repo, "cat-file", "-e", "HEAD:.gitmodules")[0] == 0 \
-        or (os.path.isdir(modules) and bool(os.listdir(modules))) \
-        or any(line.startswith("160000 ") for line in git(repo, "ls-files", "-s")[1].splitlines())
+    """True if a plain push here may also push submodules (through their own, unchecked hooks): push
+    recursion is switched on, whether or not the guard can find submodules (git finds them in places the
+    guard would miss, such as a gitlink in an older pushed commit). push.recurseSubmodules and
+    submodule.recurse both set the mode, and the one git reads last wins (the order `git config
+    --get-regexp` lists them in). The git hook applies the same rule."""
+    return effective_recursion(
+        git(repo, "config", "--get-regexp", r"^(push\.recursesubmodules|submodule\.recurse)$")[1])
 
 
 def effective_recursion(listing):
-    """The push recursion mode from `git config --get-regexp` output, last entry winning like git does."""
-    mode = "no"
+    """Whether push recursion is on, from `git config --get-regexp` output, the last entry winning like git
+    does. Anything but a value known to mean off counts as on (git reads `submodule.recurse=2` as true)."""
+    on = False
     for line in listing.splitlines():
         key, _, value = line.partition(" ")
         value = value.strip().lower()
         if key.lower() == "push.recursesubmodules":
-            mode = value
+            on = value not in ("check", "no", "false", "off", "0")
         elif key.lower() == "submodule.recurse":
-            mode = "on-demand" if value in ("true", "yes", "on", "1", "") else "no"
-    return mode
+            on = value not in ("false", "no", "off", "0")
+    return on
 
 
 def git_dir_of(path):
@@ -418,30 +455,8 @@ def parse_git(seg):
 def unquoted_command_start(command, idx):
     """True if idx is outside quotes and comments and starts a command (after a newline, `;`, `&`, `|` or `(`).
     `$(…)` starts a fresh quoting context, even inside double quotes (`-m "$(cat <<'EOF' …`)."""
-    quotes, escaped, comment, i = [None], False, False, 0
-    while i < idx:
-        ch, quote = command[i], quotes[-1]
-        if comment:
-            comment = ch != "\n"
-        elif escaped:
-            escaped = False
-        elif ch == "\\" and quote != "'":
-            escaped = True
-        elif quote == "'":
-            quotes[-1] = None if ch == "'" else quote
-        elif ch == "$" and command[i + 1:i + 2] == "(":
-            quotes.append(None)
-            i += 1
-        elif quote == '"':
-            quotes[-1] = None if ch == '"' else quote
-        elif ch in "'\"":
-            quotes[-1] = ch
-        elif ch == ")" and len(quotes) > 1:
-            quotes.pop()
-        elif ch == "#":
-            comment = True
-        i += 1
-    if quotes[-1] or escaped or comment:
+    context = next((c for i, c in quoting(command) if i >= idx), None)
+    if context is not None:
         return False
     before = command[:idx].rstrip(" \t")
     return not before or before[-1] in "\n;&|("
@@ -525,13 +540,18 @@ def expand_vars(word, variables):
             if any(ch in op.group(5) for ch in "$`\\"):
                 return None
             values = [trim(v, op.group(4), op.group(5)) for v in values]
+            if None in values:
+                return None
         results = [r + word[pos:m.start()] + v for r in results for v in values][:64]
         pos = m.end()
     return [r + word[pos:] for r in results]
 
 
 def trim(value, op, pattern):
-    """${X%pat} (shortest suffix), ${X%%pat} (longest suffix), ${X#pat}, ${X##pat} (prefixes), like the shell."""
+    """${X%pat} (shortest suffix), ${X%%pat} (longest suffix), ${X#pat}, ${X##pat} (prefixes), like the shell.
+    None for values too long to trim within the guard's time budget (the word is then unknowable)."""
+    if len(value) > TRIM_LIMIT:
+        return None
     cuts = range(len(value) + 1)
     if op.startswith("%"):
         for i in (cuts if op == "%%" else reversed(cuts)):
@@ -599,12 +619,14 @@ def risky_when_lost(word):
     return "/" in w or os.path.basename(w).lower() in SENSITIVE_NAMES or w.lower() in (".git", "..")
 
 
-def touches_git_dir(bases, words, protect_plugin=False, variables=None, writes=False, check_lost=True):
+def touches_git_dir(bases, words, protect_plugin=False, variables=None, writes=False, check_lost=True,
+                    filled_in=False):
     """(word, "git" | "plugin" | "lost" | "var" | "many") for the first word (argument or redirect target) that
     refers to something inside a git directory or, when protect_plugin is set, to ravenwatch's own installed
     code, from any directory the command may be in (None = unknown); else None. Variables are filled in from
-    `variables` and the environment; a word whose value can't be known is refused when the command writes
-    there (writes) or its literal parts name git internals."""
+    `variables` and the environment (once: a `$` left after that is text, as the shell doesn't expand values
+    again); a word whose value can't be known is refused when the command writes there (writes) or its
+    literal parts name git internals."""
     for w in words:
         if w.startswith("-"):
             if "=" not in w:
@@ -612,16 +634,18 @@ def touches_git_dir(bases, words, protect_plugin=False, variables=None, writes=F
             opt, w = w.split("=", 1)  # --output=FILE, --target-directory=DIR
             if not w or PATTERN_OPTION.search(opt):
                 continue
-        if "$" in w or "`" in w:
+        if not filled_in and ("$" in w or "`" in w):
             filled = expand_vars(w, variables or {})
             if filled is None:
                 if writes or names_sensitive(w, writes=False):
                     return w, "var"
                 continue
-            hit = touches_git_dir(bases, filled, protect_plugin, None, writes, check_lost)
+            hit = touches_git_dir(bases, filled, protect_plugin, None, writes, check_lost, filled_in=True)
             if hit:
                 return (w, hit[1])
             continue
+        if filled_in:
+            w = w.replace("$", LITERAL["$"]).replace("`", LITERAL["`"])  # plain text now, for expand()
         for base in bases:
             if check_lost and base is None and not w.startswith(("/", "~")) and risky_when_lost(w):
                 return w, "lost"
@@ -693,17 +717,35 @@ def helper_refusal():
     return None
 
 
+def drop_cat_heredocs(command):
+    """The command with the bodies of `cat` heredocs left out: they are data (Claude's usual way to pass a
+    commit message), not commands — unless the rest of the first line feeds the body somewhere or chains
+    another command, the `cat` isn't really a command (inside quotes, or inside the body of an earlier
+    heredoc), or the delimiter is unquoted and the body has command substitutions (the shell runs those)."""
+    return CAT_HEREDOC.sub(
+        lambda m: "cat " + m.group(1) + m.group(4) if len(m.group(4)) <= 500 and HARMLESS_REST.fullmatch(m.group(4))
+        and "<<" not in command[:m.start()] and unquoted_command_start(command, m.start())
+        and (m.group(2) or not re.search(r"`|\$\(", m.group(0).split("\n", 1)[-1]))
+        else m.group(0), command)
+
+
 def check_bash(command, cwd):
     if "\n" not in command and "\r" not in command and OWN_HELPER.match(re.sub(r"/{2,}", "/", command)):
         return helper_refusal()
-    # What the shell sees: line continuations joined, $'…' decoded, quotes and variables removed.
-    dollar_quotes = unquoted_dollar_quotes(command)
-    if any(UNSURE_ESCAPE.search(body) for body in dollar_quotes):
-        return ("$'…' quoting with escapes the shells read differently (\\c, \\0, or a \\x, \\u or \\U without all "
-                "its digits) can't be checked. Write the text out plainly.")
+    # $'…' quoting, outside heredoc bodies that are data. Escapes the shells disagree on are refused
+    # wherever they appear (also where the quote scanner thinks they are quoted), and so is any body
+    # Python can't decode; in a command that mentions git, any $'…' or $"…" at all.
+    data = drop_cat_heredocs(command)
+    dollar_quotes = unquoted_dollar_quotes(data)
+    bodies = dollar_quotes + [m.group(1) for m in ANSI_QUOTE.finditer(data)]
+    if any(body != "\\0" and UNSURE_ESCAPE.search(body) for body in bodies) or not decode_ansi(data)[1]:
+        return ("$'…' quoting with escapes the shells read differently (\\c, \\0, \\N, or a \\x, \\u or \\U without "
+                "all its digits) can't be checked. Use printf (`printf '\\t'`) or a quoted literal instead.")
     views = shell_views(command)
-    if dollar_quotes and any(PUSH_WORD.search(v) or GIT_WORD.search(v) for v in views):
-        return "$'…' and $\"…\" quoting in a git command can't be checked. Write the arguments out plainly."
+    if dollar_quotes and any(PUSH_WORD.search(v) or GIT_WORD.search(v) for v in shell_views(data)):
+        return ("$'…' and $\"…\" quoting in a command that mentions git can't be checked. Put the text in a variable "
+                "in an earlier command (`T=$(printf '\\t')`), use printf, or for a commit message write it to a file "
+                "and use `git commit -F <file>`.")
     why = bypass_reason(command)
     if why:
         return f"{why}. Run the command without it."
@@ -716,16 +758,8 @@ def check_bash(command, cwd):
     if git_dir_of(cwd) and not PLAIN_CD.match(command):
         return ("the shell's working directory is inside a git directory, where commands can reach the hooks and "
                 "verdict state. `cd` back to the work tree first.")
-    # The body of a `cat` heredoc is data (Claude's usual way to pass a commit message), not commands —
-    # unless the rest of its first line feeds it somewhere or chains another command, the `cat` isn't
-    # really a command (inside quotes, or inside the body of an earlier heredoc), or the delimiter is
-    # unquoted and the body has command substitutions (the shell runs those).
-    command = CAT_HEREDOC.sub(
-        lambda m: "cat" + m.group(3) if len(m.group(3)) <= 500 and HARMLESS_REST.fullmatch(m.group(3))
-        and "<<" not in command[:m.start()] and unquoted_command_start(command, m.start())
-        and (m.group(1) or not re.search(r"`|\$\(", m.group(0).split("\n", 1)[-1]))
-        else m.group(0), command)
-    pushing = may_push(command)
+    command = data
+    pushing = any(may_push(v) for v in shell_views(command))
     if pushing and re.search(r"`|\$\(|<\(|>\(", command):
         return "a push inside command substitution can't be checked. Run `git push` as its own command."
     parsed_cmd = segments(command)
@@ -906,9 +940,10 @@ def check_bash(command, cwd):
                         "the repository uses Husky or lefthook, ravenwatch can't install there yet: the owner pushes "
                         "from their own terminal.)")
             if recurses_into_submodules(repo):
-                return ("this repository is configured to push submodules too (push.recurseSubmodules / "
-                        "submodule.recurse — whichever git reads last wins), and their hooks cannot be checked. Set "
-                        "push.recurseSubmodules to check in this repository's config, and push submodules yourself.")
+                return ("push recursion into submodules is on in this repository (push.recurseSubmodules / "
+                        "submodule.recurse — whichever git reads last wins), and submodule hooks cannot be checked. "
+                        "Set push.recurseSubmodules to check (or submodule.recurse to false) in this repository's "
+                        "config, and push submodules yourself.")
     return None
 
 
@@ -945,9 +980,10 @@ def _too_slow(signum, frame):
         target = _CURRENT.get("target", "")
         risky = bool(re.search(r"(?i)\.git\b|ravenwatch|hooks", target))
     else:
-        risky = may_push(command) or bool(re.search(r"[*?\[>]|\.git|ravenwatch|hooks|\b(?:cp|mv|tee|dd|ln|install|"
-                                                    r"rsync|ditto|sed|perl|python3?|ruby|node|printf|echo)\b",
-                                                    command, re.I))
+        # Everything the checks would look at counts: writers, output options, variables, patterns, git.
+        programs = sorted(WRITERS | set(OUTPUT_OPTS) | {"python", "python3", "ruby", "node", "printf", "echo", "git"})
+        risky = may_push(command) or bool(re.search(r"[*?\[>$`]|\.git|ravenwatch|hooks|\b(?:"
+                                                    + "|".join(map(re.escape, programs)) + r")\b", command, re.I))
     if risky:
         sys.stdout.write(json.dumps({"hookSpecificOutput": {
             "hookEventName": "PreToolUse", "permissionDecision": "deny",

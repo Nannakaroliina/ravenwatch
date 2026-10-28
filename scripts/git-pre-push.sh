@@ -85,34 +85,22 @@ check_target() {
     fail "this push overrides the receive command or recurses into submodules, so the gate cannot check it." \
       "Push again without --exec/--receive-pack/--recurse-submodules (push submodules from inside each one)."
   fi
-  # The same recursion, switched on in git config. push.recurseSubmodules and submodule.recurse both set
-  # it and the one git reads last wins (the order --get-regexp lists them in). Only then are submodules
-  # looked for: in the commits being pushed, HEAD, the index, a .gitmodules file, or .git/modules.
-  mode=no
+  # The same recursion, switched on in git config: refused whenever it is on, whether or not submodules can
+  # be found (git finds them in places a hook would miss). push.recurseSubmodules and submodule.recurse both
+  # set it and the one git reads last wins (the order --get-regexp lists them in); any value not known to
+  # mean off counts as on (git reads submodule.recurse=2 as true). Same rule as the Claude guard.
+  recurse=0
   while IFS=' ' read -r key value; do
     value=$(printf '%s' "$value" | tr 'A-Z' 'a-z')
     case "$(printf '%s' "$key" | tr 'A-Z' 'a-z')" in
-      push.recursesubmodules) mode=$value ;;
-      submodule.recurse) case "$value" in true | yes | on | 1 | "") mode=on-demand ;; *) mode=no ;; esac ;;
+      push.recursesubmodules) case "$value" in check | no | false | off | 0) recurse=0 ;; *) recurse=1 ;; esac ;;
+      submodule.recurse) case "$value" in false | no | off | 0) recurse=0 ;; *) recurse=1 ;; esac ;;
     esac
   done <<EOF
 $(git config --get-regexp '^(push\.recursesubmodules|submodule\.recurse)$' 2>/dev/null)
 EOF
-  case "$mode" in on-demand | only) ;; *) mode= ;; esac
-  if [ -n "$mode" ]; then
-    top=$(git rev-parse --show-toplevel 2>/dev/null)
-    modules=$(git rev-parse --path-format=absolute --git-path modules 2>/dev/null)
-    found=
-    { [ -n "$top" ] && [ -f "$top/.gitmodules" ]; } && found=1
-    git cat-file -e HEAD:.gitmodules 2>/dev/null && found=1
-    [ -n "$modules" ] && [ -d "$modules" ] && [ -n "$(ls -A "$modules" 2>/dev/null)" ] && found=1
-    git ls-files -s 2>/dev/null | grep -q '^160000 ' && found=1
-    for sha in $(printf '%s\n' "$input" | awk '{ print $2 }'); do
-      is_sha "$sha" && ! is_null "$sha" && git cat-file -e "$sha:.gitmodules" 2>/dev/null && found=1
-    done
-    [ -n "$found" ] && fail "push.recurseSubmodules / submodule.recurse makes git push submodules through their own hooks, which the gate cannot check." \
-      "Set push.recurseSubmodules to check in this repository's config (the setting git reads last wins), and push submodules from inside each one."
-  fi
+  [ "$recurse" = 1 ] && fail "push.recurseSubmodules / submodule.recurse is on, so git may push submodules through their own hooks, which the gate cannot check." \
+    "Set push.recurseSubmodules to check (or submodule.recurse to false) in this repository's config, and push submodules from inside each one."
   listed=$(git ls-remote --get-url "$remote_url" 2>/dev/null)
   if [ "$listed" != "$remote_url" ]; then
     fail "url.*.insteadOf rewrites the push URL to a different one for reads; the gate cannot check this push." \

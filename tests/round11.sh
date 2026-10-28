@@ -110,25 +110,24 @@ mkdir -p "$R/nohook"
 bash_gate deny  "$R" "CDPATH=$T cd nohook && git $P" "cannot follow"
 rmdir "$R/nohook"
 
-# --- TEST-2: submodule recursion switched on in git config
-touch .gitmodules
-for setting in "push.recurseSubmodules on-demand" "push.recurseSubmodules only" "submodule.recurse true"; do
+# --- TEST-2 (round 4: LOOP-1/3): push recursion switched on in git config is refused whenever it is on,
+# submodules or not, by the guard and by the terminal hook. Values git may read as on (2, 1k) count.
+commit sub1
+for setting in "push.recurseSubmodules on-demand" "push.recurseSubmodules only" "submodule.recurse true" \
+               "submodule.recurse 2" "submodule.recurse 1k"; do
   git config $setting
-  bash_gate deny "$R" "git $P origin main" "push submodules too"
+  bash_gate deny "$R" "git $P origin main" "recursion into submodules is on"
+  git $P -q origin main 2>"$T/err" && bad "hook let '$setting' through" || ok
+  grep -q "recurseSubmodules" "$T/err" && ok || bad "hook refusal for '$setting' not about submodules: $(cat "$T/err")"
   git config --unset ${setting%% *}
 done
-git config push.recurseSubmodules check
-bash_gate allow "$R" "git $P origin main"
-git config --unset push.recurseSubmodules
-rm .gitmodules
-git config push.recurseSubmodules on-demand
-bash_gate allow "$R" "git $P origin main"
-# The terminal hook refuses the same setting.
-touch .gitmodules
-commit sub1
-git $P -q origin main 2>"$T/err" && bad "hook let a recursive-submodule push through" || ok
-grep -q "recurseSubmodules" "$T/err" && ok || bad "hook refusal doesn't name the setting: $(cat "$T/err")"
-git config --unset push.recurseSubmodules; rm .gitmodules
+for setting in "push.recurseSubmodules check" "push.recurseSubmodules no" "submodule.recurse false"; do
+  git config $setting
+  bash_gate allow "$R" "git $P origin main"
+  git $P -q origin main 2>"$T/err"
+  grep -q "recurseSubmodules" "$T/err" && bad "hook refused '$setting' as recursion: $(cat "$T/err")" || ok
+  git config --unset ${setting%% *}
+done
 
 # --- TEST-3: a modified or non-executable hook makes the guard refuse
 HOOK="$(git rev-parse --git-path hooks)/pre-push"
@@ -161,12 +160,18 @@ git rm -q keys.py .gitattributes; git commit -qm unkeys
 echo "print(1)" > "työkalut.py"; git add "työkalut.py"; git commit -qm uml
 python3 "$RV" prepare | grep "^- code" | grep -q "työkalut.py" && ok || bad "non-ASCII code file misclassified"
 
-# --- LOOP-3 / IMP-2: skip-worktree files block only when their content differs from the commit
-git update-index --skip-worktree a
+# --- LOOP-3 / IMP-2 (round 4: IMP-1): a skip-worktree file blocks a diff review only when it is one of the
+# reviewed files and differs from the commit; a full audit counts every one. `a` is already pushed, U is not.
+U=src/documents/upload.ts
+git update-index --skip-worktree "$U"
 python3 "$RV" prepare >/dev/null 2>"$T/err" && ok || bad "an unchanged skip-worktree file blocked prepare: $(cat "$T/err")"
-echo changed >> a
-python3 "$RV" prepare >/dev/null 2>"$T/err" && bad "prepare ignored a changed skip-worktree file" || ok
+echo changed >> "$U"
+python3 "$RV" prepare >/dev/null 2>"$T/err" && bad "prepare ignored a changed, reviewed skip-worktree file" || ok
 grep -q "skip-worktree" "$T/err" && ok || bad "skip-worktree refusal unclear: $(cat "$T/err")"
+git update-index --no-skip-worktree "$U"; git checkout -q -- "$U"
+git update-index --skip-worktree a; echo override >> a
+python3 "$RV" prepare >/dev/null 2>"$T/err" && ok || bad "a local override outside the reviewed files blocked prepare: $(cat "$T/err")"
+python3 "$RV" prepare --full >/dev/null 2>"$T/err" && bad "full audit ignored a changed skip-worktree file" || ok
 git update-index --no-skip-worktree a; git checkout -q -- a
 echo changed >> a
 python3 "$RV" prepare --full >/dev/null 2>"$T/err" && bad "full audit ran over uncommitted tracked changes" || ok
@@ -175,11 +180,11 @@ git checkout -q -- a
 
 # --- TEST-2: mark refuses pass/warn over a changed skip-worktree file or a full audit changed on disk
 python3 "$RV" prepare >/dev/null
-git update-index --skip-worktree a; echo changed >> a
+git update-index --skip-worktree "$U"; echo changed >> "$U"
 python3 "$RV" mark --verdict pass --secrets-cleared >/dev/null 2>"$T/err" && bad "mark passed over a hidden change" || ok
 grep -q "skip-worktree" "$T/err" && ok || bad "mark's skip-worktree refusal unclear: $(cat "$T/err")"
 python3 "$RV" mark --verdict block >/dev/null 2>&1 && ok || bad "mark refused block over a hidden change"
-git update-index --no-skip-worktree a; git checkout -q -- a
+git update-index --no-skip-worktree "$U"; git checkout -q -- "$U"
 python3 "$RV" prepare --full >/dev/null
 echo changed >> a
 python3 "$RV" mark --verdict pass --secrets-cleared >/dev/null 2>"$T/err" && bad "mark passed a full audit changed on disk" || ok
@@ -229,7 +234,7 @@ bash_gate deny  "$R" 'read F; sed "s/a/b/w $F" a' "can't tell where"
 
 # --- round 3 (SEC-1): $'…' escapes the shells read differently, and $'…' in git commands
 bash_gate deny  "$R" "git \$'pu\\x73h\\c@' origin main" "escapes the shells read differently"
-bash_gate deny  "$R" "git \$'pu\\x73h' origin main" "in a git command"
+bash_gate deny  "$R" "git \$'pu\\x73h' origin main" "mentions git"
 bash_gate allow "$R" "grep -nE 'git $P\$' README.md"
 bash_gate allow "$R" "printf \$'\\e[1mbold\\e[0m\\n'"
 
@@ -258,34 +263,63 @@ bash_gate deny  "$R" "cat <<EOF
 \$(git -C $N $P)
 EOF" "command substitution"
 
-# --- round 2 (BUG-3 / LOOP-1): submodules found from git, either setting counts
-printf '[submodule "s"]\n\tpath = s\n\turl = ./s\n' > .gitmodules
-git add .gitmodules; git commit -qm gitmodules
-# The setting git reads last wins: submodule.recurse after push.recurseSubmodules=check recurses …
+# --- round 2-4 (BUG-3 / LOOP-1 / IMP-1): of the two settings, the one git reads last wins …
 git config push.recurseSubmodules check; git config submodule.recurse true
-bash_gate deny  "$R" "git $P origin main" "push submodules too"
+bash_gate deny  "$R" "git $P origin main" "recursion into submodules is on"
 git $P -q origin main 2>"$T/err" && bad "hook let submodule.recurse=true (read last) through" || ok
 grep -q "recurseSubmodules" "$T/err" && ok || bad "hook refusal not about submodules: $(cat "$T/err")"
-# … and an opt-out on the command line can't be told apart from an option's value, so it doesn't count.
-bash_gate deny  "$R" "git $P -o --no-recurse-submodules origin main" "push submodules too"
-bash_gate deny  "$R" "git $P --no-recurse-submodules origin main" "push submodules too"
-# push.recurseSubmodules=check read last (the repository's own setting) wins over submodule.recurse.
+# … an opt-out on the command line can't be told apart from an option's value, so it doesn't count …
+bash_gate deny  "$R" "git $P -o --no-recurse-submodules origin main" "recursion into submodules is on"
+bash_gate deny  "$R" "git $P --no-recurse-submodules origin main" "recursion into submodules is on"
+# … and push.recurseSubmodules=check read last (the repository's own setting) wins over submodule.recurse.
 git config --unset submodule.recurse; git config --unset push.recurseSubmodules
 git config submodule.recurse true; git config push.recurseSubmodules check
 bash_gate allow "$R" "git $P origin main"
+git $P -q origin main 2>"$T/err"
+grep -q "recurseSubmodules" "$T/err" && bad "hook refused check-read-last as recursion: $(cat "$T/err")" || ok
 git config --unset submodule.recurse; git config --unset push.recurseSubmodules
-git config push.recurseSubmodules on-demand; rm .gitmodules
-bash_gate deny  "$R" "git $P origin main" "push submodules too"
-git $P -q origin main 2>"$T/err" && bad "hook let a recursive push through without .gitmodules on disk" || ok
-grep -q "recurseSubmodules" "$T/err" && ok || bad "hook refusal without .gitmodules not about submodules: $(cat "$T/err")"
-git checkout -q -- .gitmodules; git config --unset push.recurseSubmodules
-git rm -q .gitmodules; git commit -qm nogitmodules
-# Submodules of another branch leave .git/modules behind; that counts too.
-mkdir -p "$(git rev-parse --git-path modules)/s"
-git config push.recurseSubmodules on-demand
-bash_gate deny  "$R" "git $P origin main" "push submodules too"
-git config --unset push.recurseSubmodules
-rm -rf "$(git rev-parse --git-path modules)"
+
+# --- round 4 (TEST-2): $PWD comes from the session's directory, even when the guard's own differs
+out=$(python3 -c 'import json,sys; print(json.dumps({"tool_name":"Bash","cwd":sys.argv[1],"tool_input":{"command":sys.argv[2]}}))' \
+  "$R" 'cp /tmp/f $PWD/.gi?/ravenwatch/status' | PWD="$T" python3 "$G")
+echo "$out" | grep -q "inside a git directory" && ok || bad "\$PWD taken from the guard's environment: $out"
+out=$(python3 -c 'import json,sys; print(json.dumps({"tool_name":"Bash","cwd":sys.argv[1],"tool_input":{"command":sys.argv[2]}}))' \
+  "$T" 'cp a $PWD/.gi?/notes.txt' | PWD="$R" python3 "$G")
+[ -z "$out" ] && ok || bad "\$PWD from the guard's environment refused a harmless copy: $out"
+
+# --- round 4 (VER-1, UX-1): $'…' is found inside "$(…)" too; undecodable bodies are refused; heredoc data
+# and harmless $'\0' are fine
+bash_gate deny  "$R" "echo \"\$(git \$'pu\\x73h' origin main)\"" "can't be checked"
+bash_gate deny  "$R" "echo \"\$(git \$'pu\\x7' origin main)\"" "escapes the shells read differently"
+bash_gate deny  "$R" "printf %s \$'\\N{LATIN SMALL LETTER P}'" "escapes the shells read differently"
+bash_gate allow "$R" "find . -print0 | while IFS= read -r -d \$'\\0' f; do echo \"\$f\"; done"
+bash_gate deny  "$R" "cat > /tmp/x <<'EOF' && git -C $N $P
+EOF" "not installed"
+bash_gate deny  "$R" "cat > .git/hooks/x <<'EOF'
+EOF" "git hooks"
+# A literal `$` that is no expansion (`grep 'x$\|y'`) is just text, after variables are filled in.
+bash_gate allow "$R" 'grep -n "a\$\|b" a'
+bash_gate allow "$R" "cat > /tmp/rw-x.sh <<'EOF'
+IFS=\$'\\n'
+for f in \$(git diff --name-only); do echo \"\$f\"; done
+EOF"
+
+# --- round 4 (RES-1): a long value isn't trimmed (that could run out the guard's time), and when time runs
+# out anyway, writes and variables are refused
+bash_gate deny  "$R" "X=\$(printf '%5000s' x); rm \${X%zz}/f" "can't tell where"
+python3 - "$RW/hooks" <<'EOF' && ok || bad "out of time, rm with variables was let through"
+import io, json, sys, contextlib; sys.path.insert(0, sys.argv[1]); import guard_push as g
+g._CURRENT.update(command="rm ${A}${B}", target="")
+buf = io.StringIO()
+real_exit = g.os._exit
+g.os._exit = lambda code: (_ for _ in ()).throw(SystemExit(code))
+try:
+    with contextlib.redirect_stdout(buf):
+        g._too_slow(14, None)
+except SystemExit:
+    pass
+sys.exit(0 if '"deny"' in buf.getvalue() else 1)
+EOF
 
 # --- round 2 (BUG-1 / IMP-1): sensitive files whatever category wins; infrastructure code is signalled
 mkdir -p terraform tests infra
@@ -314,11 +348,36 @@ sys.exit(0 if "+tail" in lines and max(map(len, lines)) <= 1000 + 513
 EOF
 git rm -q long.txt; git commit -qm nolong
 
-# --- round 3 (LOOP-1): a flagged file deleted from disk blocks like a changed one
+# --- round 4 (LOOP-2): a piece that starts with `++` (or an added line that does) is still scanned
+python3 - "$RW/scripts" <<'EOF' && ok || bad "a ++ line or piece hid a key from the scan"
+import sys; sys.path.insert(0, sys.argv[1]); import ravenwatch as r
+k = "AKIA" + "Q7RTYU2X9ZPLM4KD"
+lines = ["diff --git a/x.js b/x.js", "--- a/x.js", "+++ b/x.js", "@@ -0,0 +1,3 @@",
+         "+++n; const t = '" + k + "'", "+++ b/elsewhere " + k, "+ok"]
+hits = r.scan_added_lines(lines)
+sys.exit(0 if len([h for h in hits if h[2] == "AWS access key ID"]) == 2 and all(h[0] == "x.js" for h in hits)
+         else print(hits) or 1)
+EOF
+
+# --- round 3/4 (LOOP-1 / IMP-1): a flagged file missing from disk blocks a full audit and the checks (they
+# read the whole tree), and a diff review only when it is a reviewed file — so sparse checkouts still work
 git update-index --skip-worktree a; rm a
-python3 "$RV" prepare >/dev/null 2>"$T/err" && bad "prepare ignored a deleted skip-worktree file" || ok
+python3 "$RV" prepare >/dev/null 2>"$T/err" && ok || bad "a missing file outside the reviewed ones blocked prepare: $(cat "$T/err")"
+python3 "$RV" prepare --full >/dev/null 2>"$T/err" && bad "full audit ignored a deleted skip-worktree file" || ok
 grep -q "missing or differ" "$T/err" && ok || bad "deleted skip-worktree refusal unclear: $(cat "$T/err")"
 git update-index --no-skip-worktree a; git checkout -q -- a
+printf -- '---\nchecks:\n  - name: ok\n    run: "true"\n---\n# P\n' > .ravenwatch.md
+sha=$(python3 "$RV" trust-brief --private 2>&1 | sed -n 's/^sha256: //p')
+python3 "$RV" trust-brief --private --approve "$sha" >/dev/null 2>&1 || bad "approve failed"
+python3 "$RV" prepare >/dev/null
+git update-index --skip-worktree a; rm a
+python3 "$RV" checks >/dev/null 2>"$T/err" && bad "checks ran with a deleted skip-worktree file" || ok
+grep -q "missing or differ" "$T/err" && ok || bad "checks' skip-worktree refusal unclear: $(cat "$T/err")"
+git update-index --no-skip-worktree a; git checkout -q -- a
+U=src/documents/upload.ts
+git update-index --skip-worktree "$U"; rm "$U"
+python3 "$RV" prepare >/dev/null 2>"$T/err" && bad "prepare ignored a reviewed file missing from disk" || ok
+git update-index --no-skip-worktree "$U"; git checkout -q -- "$U"
 
 # --- RES-1: the history scan stops at its time budget and says so
 python3 - "$RW/scripts" <<'EOF' && ok || bad "scan budget"
