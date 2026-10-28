@@ -85,18 +85,33 @@ check_target() {
     fail "this push overrides the receive command or recurses into submodules, so the gate cannot check it." \
       "Push again without --exec/--receive-pack/--recurse-submodules (push submodules from inside each one)."
   fi
-  # The same recursion, switched on in git config. git finds submodules from the commits and the index, not
-  # the .gitmodules file on disk; and whichever of the two settings git reads last wins, so either counts.
-  top=$(git rev-parse --show-toplevel 2>/dev/null)
-  if [ -n "$top" ] && { [ -f "$top/.gitmodules" ] || git cat-file -e HEAD:.gitmodules 2>/dev/null ||
-    git ls-files -s 2>/dev/null | grep -q '^160000 '; }; then
-    mode=$(git config --get push.recurseSubmodules 2>/dev/null | tr 'A-Z' 'a-z')
-    case "$mode" in on-demand | only) recurse=1 ;; *) recurse=0 ;; esac
-    [ "$(git config --type=bool --get submodule.recurse 2>/dev/null)" = true ] && recurse=1
-    if [ "$recurse" = 1 ] && ! printf '%s\n' "$args" | grep -Eq -- '(^|[[:space:]])--no-recurse-submodules([[:space:]]|$)'; then
-      fail "push.recurseSubmodules / submodule.recurse makes git push submodules through their own hooks, which the gate cannot check." \
-        "Set push.recurseSubmodules to check and submodule.recurse to false (or push with --no-recurse-submodules), and push submodules from inside each one."
-    fi
+  # The same recursion, switched on in git config. push.recurseSubmodules and submodule.recurse both set
+  # it and the one git reads last wins (the order --get-regexp lists them in). Only then are submodules
+  # looked for: in the commits being pushed, HEAD, the index, a .gitmodules file, or .git/modules.
+  mode=no
+  while IFS=' ' read -r key value; do
+    value=$(printf '%s' "$value" | tr 'A-Z' 'a-z')
+    case "$(printf '%s' "$key" | tr 'A-Z' 'a-z')" in
+      push.recursesubmodules) mode=$value ;;
+      submodule.recurse) case "$value" in true | yes | on | 1 | "") mode=on-demand ;; *) mode=no ;; esac ;;
+    esac
+  done <<EOF
+$(git config --get-regexp '^(push\.recursesubmodules|submodule\.recurse)$' 2>/dev/null)
+EOF
+  case "$mode" in on-demand | only) ;; *) mode= ;; esac
+  if [ -n "$mode" ]; then
+    top=$(git rev-parse --show-toplevel 2>/dev/null)
+    modules=$(git rev-parse --path-format=absolute --git-path modules 2>/dev/null)
+    found=
+    { [ -n "$top" ] && [ -f "$top/.gitmodules" ]; } && found=1
+    git cat-file -e HEAD:.gitmodules 2>/dev/null && found=1
+    [ -n "$modules" ] && [ -d "$modules" ] && [ -n "$(ls -A "$modules" 2>/dev/null)" ] && found=1
+    git ls-files -s 2>/dev/null | grep -q '^160000 ' && found=1
+    for sha in $(printf '%s\n' "$input" | awk '{ print $2 }'); do
+      is_sha "$sha" && ! is_null "$sha" && git cat-file -e "$sha:.gitmodules" 2>/dev/null && found=1
+    done
+    [ -n "$found" ] && fail "push.recurseSubmodules / submodule.recurse makes git push submodules through their own hooks, which the gate cannot check." \
+      "Set push.recurseSubmodules to check in this repository's config (the setting git reads last wins), and push submodules from inside each one."
   fi
   listed=$(git ls-remote --get-url "$remote_url" 2>/dev/null)
   if [ "$listed" != "$remote_url" ]; then

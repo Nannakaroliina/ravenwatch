@@ -20,6 +20,7 @@ Code's environment to turn the gate off.
 """
 
 import codecs
+import fnmatch
 import glob
 import json
 import os
@@ -29,6 +30,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import warnings
 
 SCRIPTS = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts"))
 PLUGIN_ROOT = os.path.realpath(os.path.dirname(SCRIPTS))
@@ -101,9 +103,10 @@ REDIRECT = re.compile(r"^(?=.*[<>])[<>&|]+$")
 EXECUTORS = {"sh", "bash", "zsh", "dash", "ksh", "fish", "env", "xargs", "eval", "exec", "command", "nohup", "time",
              "timeout", "watch", "find", "parallel", "sudo", "doas", "nice", "stdbuf", "script", "builtin"}
 # Programs that write to files named in their arguments: a path there that the guard can't work out
-# (a variable set from command output, `read` …) is refused rather than assumed harmless.
+# (a variable set from command output, `read` …) is refused rather than assumed harmless. sed and perl
+# scripts can write files (`w file`) even without -i; `$` inside their single-quoted scripts is text.
 WRITERS = {"cp", "mv", "tee", "dd", "install", "rsync", "ln", "touch", "mkdir", "truncate", "ditto", "rename",
-           "patch", "chmod", "chown", "rm", "rmdir"}
+           "patch", "chmod", "chown", "rm", "rmdir", "sed", "perl"}
 # Programs that only write where an option says (other arguments are URLs, headers, archive members …).
 OUTPUT_OPTS = {
     "curl": {"-o", "--output", "-D", "--dump-header", "-c", "--cookie-jar", "--trace", "--trace-ascii",
@@ -112,8 +115,6 @@ OUTPUT_OPTS = {
     "tar": {"-f", "--file", "-C", "--directory"},
     "unzip": {"-d"},
 }
-# Programs that write their file arguments only when editing in place (sed -i, perl -pi).
-IN_PLACE = {"sed", "perl"}
 # A `cat` heredoc. Its body is only dropped when the rest of its first line is just redirections:
 # `cat <<EOF | sh` or `cat <<EOF && git push` keep the body, which is then checked as commands. The body
 # may be empty (the delimiter on the very next line); it ends at the first line that is the delimiter.
@@ -145,8 +146,14 @@ ASSIGNMENT = re.compile(r"(?:^|[\s;&|(])(?:(?:export|declare|typeset|readonly|lo
 FOR_LOOP = re.compile(r"\bfor\s+([A-Za-z_][A-Za-z0-9_]*)\s+in\s+([^;\n]*)")
 MKTEMP = re.compile(r"^\$\(\s*mktemp\b([^)`]*)\)$")
 TMPDIR_REF = re.compile(r"\$\{?TMPDIR(?::?-[^}]*)?\}?")
-# ANSI-C ($'…') and locale ($"…") quoting: the shell decodes escapes inside them.
+# ANSI-C ($'…') quoting: the shell decodes escapes inside it.
 ANSI_QUOTE = re.compile(r"\$'((?:[^'\\]|\\.)*)'")
+# Escapes whose meaning differs between Python, bash and zsh (\c truncates, a bare \x, \u or \U, NUL …):
+# a $'…' using them can't be decoded reliably, so it is refused.
+UNSURE_ESCAPE = re.compile(r"\\(?:c|0|x(?![0-9A-Fa-f]{2})|u(?![0-9A-Fa-f]{4})|U(?![0-9A-Fa-f]{8}))")
+# `$` and backticks inside single quotes, as segments() hands them on: plain text, never an expansion.
+LITERAL = {"$": "", "`": ""}
+UNLITERAL = str.maketrans({v: k for k, v in LITERAL.items()})
 
 
 def may_push(text):
@@ -154,14 +161,86 @@ def may_push(text):
     return bool(PUSH_WORD.search(re.sub(r"[\"'\\]", "", text)))
 
 
+def unquoted_dollar_quotes(command):
+    """The bodies of $'…' and the positions of $"…" that are really quoting (not a `$` at the end of a
+    quoted string, as in grep 'push$')."""
+    found, quote, escaped, i = [], None, False, 0
+    while i < len(command):
+        ch = command[i]
+        if escaped:
+            escaped = False
+        elif ch == "\\" and quote != "'":
+            escaped = True
+        elif quote:
+            quote = None if ch == quote else quote
+        elif ch == "$" and command[i + 1:i + 2] in ("'", '"'):
+            m = ANSI_QUOTE.match(command, i)
+            found.append(m.group(1) if m else command[i + 1:i + 2])
+            if m:
+                i = m.end()
+                continue
+        elif ch in "'\"":
+            quote = ch
+        i += 1
+    return found
+
+
 def decode_ansi(text):
-    """Text with each $'…' replaced by what the shell makes of it (`$'--no-\\x76erify'` → `--no-verify`)."""
+    """Text with each $'…' replaced by what the shell makes of it (`$'--no-\\x76erify'` → `--no-verify`).
+    Only used once UNSURE_ESCAPE has ruled out escapes the shells disagree on."""
     def decoded(m):
         try:
-            return codecs.decode(m.group(1), "unicode_escape")
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")  # escapes Python doesn't know (\e) stay as they are
+                return codecs.decode(m.group(1), "unicode_escape")
         except (UnicodeDecodeError, ValueError):
             return m.group(1)
     return ANSI_QUOTE.sub(decoded, text).replace('$"', '"')
+
+
+def shell_views(text):
+    """The ways the shell may read a command or word: as written, with line continuations joined,
+    with $'…' decoded, without quotes and backslashes, and without variables (`RAVENWATCH_DIS${X}ABLE`)."""
+    joined = re.sub(r"\\\r?\n", "", text.translate(UNLITERAL))
+    decoded = decode_ansi(joined)
+    return [text, joined, decoded, re.sub(r"[\"'\\]", "", decoded),
+            re.sub(r"[\"'\\]", "", EXPANSION.sub("", decoded))]
+
+
+def resolve_word(word, variables):
+    """A word with its variables filled in, if the guard knows exactly one value for it; else None."""
+    if "$" not in word and "`" not in word:
+        return word
+    values = expand_vars(word, variables)
+    return values[0] if values and len(set(values)) == 1 else None
+
+
+def option_values(args, opts):
+    """The values of the given options: `-o v`, `-ov`, `-sSo v`, `-sSov`, `--output v`, `--output=v`."""
+    short = {o[1] for o in opts if len(o) == 2 and o[0] == "-"}
+    values = []
+    for i, a in enumerate(args):
+        following = args[i + 1] if i + 1 < len(args) else None
+        if a.startswith("--"):
+            name, eq, value = a.partition("=")
+            if name in opts:
+                values += [value] if eq else [following] if following is not None else []
+        elif a.startswith("-") and len(a) > 1:
+            for j, ch in enumerate(a[1:], 1):
+                if ch in short:
+                    rest = a[j + 1:]
+                    values += [rest] if rest else [following] if following is not None else []
+                    break
+    return values
+
+
+def bypass_reason(text):
+    """Why text skips or redirects the hook, in any of its shell views; else None."""
+    for view in shell_views(text):
+        for rx, why in BYPASS:
+            if rx.search(view):
+                return why
+    return None
 
 
 def allow():
@@ -200,20 +279,34 @@ def hook_installed(repo):
 
 
 def recurses_into_submodules(repo):
-    """True if a plain push here may also push submodules (through their own, unchecked hooks). git finds
-    submodules from the commits and the index, not the .gitmodules file on disk; and whichever of
-    push.recurseSubmodules and submodule.recurse git reads last wins, so either one switched on counts."""
+    """True if a plain push here may also push submodules (through their own, unchecked hooks).
+    push.recurseSubmodules and submodule.recurse both set the mode and the one git reads last wins (the
+    order `git config --get-regexp` lists them in). Submodules are looked for only then: in the commits,
+    the index or a .gitmodules file, and in .git/modules (submodules of other branches)."""
+    if effective_recursion(git(repo, "config", "--get-regexp", r"^(push\.recursesubmodules|submodule\.recurse)$")[1]) \
+            not in ("on-demand", "only"):
+        return False
     code, top = git(repo, "rev-parse", "--show-toplevel")
     if code != 0:
         return False
-    has_submodules = os.path.exists(os.path.join(top, ".gitmodules")) \
+    modules = git(repo, "rev-parse", "--path-format=absolute", "--git-path", "modules")[1]
+    return os.path.exists(os.path.join(top, ".gitmodules")) \
         or git(repo, "cat-file", "-e", "HEAD:.gitmodules")[0] == 0 \
+        or (os.path.isdir(modules) and bool(os.listdir(modules))) \
         or any(line.startswith("160000 ") for line in git(repo, "ls-files", "-s")[1].splitlines())
-    if not has_submodules:
-        return False
-    mode = git(repo, "config", "--get", "push.recurseSubmodules")[1].lower()
-    recurse = git(repo, "config", "--type=bool", "--get", "submodule.recurse")[1] == "true"
-    return mode in ("on-demand", "only") or recurse
+
+
+def effective_recursion(listing):
+    """The push recursion mode from `git config --get-regexp` output, last entry winning like git does."""
+    mode = "no"
+    for line in listing.splitlines():
+        key, _, value = line.partition(" ")
+        value = value.strip().lower()
+        if key.lower() == "push.recursesubmodules":
+            mode = value
+        elif key.lower() == "submodule.recurse":
+            mode = "on-demand" if value in ("true", "yes", "on", "1", "") else "no"
+    return mode
 
 
 def git_dir_of(path):
@@ -251,7 +344,10 @@ def segments(command):
                 continue
             escaped = True
         elif quote:
-            quote = None if ch == quote else quote
+            if ch == quote:
+                quote = None
+            elif quote == "'" and ch in LITERAL:
+                ch = LITERAL[ch]  # `$` and backticks in single quotes are text, never an expansion
         elif ch in "'\"":
             quote = ch
         elif ch == "#" and (not out or (out[-1] in " \t;&|()" and last_escaped != len(out) - 1)):
@@ -351,10 +447,11 @@ def unquoted_command_start(command, idx):
     return not before or before[-1] in "\n;&|("
 
 
-def shell_vars(command):
+def shell_vars(command, cwd):
     """{name: [values it may have]} for variables the command sets, or {name: None} when a value can't be
-    known (command output, `read`, a loop over unknown words). `$(mktemp …)` counts as a temp path."""
-    found = {}
+    known (command output, `read`, a loop over unknown words). `$(mktemp …)` counts as a temp path.
+    $PWD is the shell's directory (cwd), never the guard's own; after a `cd` it is unknown."""
+    found = {"PWD": [cwd], "OLDPWD": None}
 
     def add(name, values):
         # An assignment may not run (`false && X=…`) or may only apply to one command (`X=… cmd`), so the
@@ -402,7 +499,7 @@ def shell_vars(command):
 def expand_vars(word, variables):
     """The words a shell word may become once its variables are filled in (from variables, else the
     environment), or None when a part can't be known: command output, an unset variable, $1 …
-    `${X:-word}` is X or word; `${X%…}` and `${X#…}` trim X (counted as X, unless the pattern has a `/`)."""
+    `${X:-word}` is X or word; `${X%pat}`, `${X%%pat}`, `${X#pat}` and `${X##pat}` trim X as the shell does."""
     if "`" in word or "$(" in word:
         return None
     results, pos = [""], 0
@@ -411,7 +508,7 @@ def expand_vars(word, variables):
         inner = tok[2:-1] if tok.startswith("${") and tok.endswith("}") else (None if tok.startswith("${") else tok[1:])
         if inner is None:
             return None
-        op = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)(?:(:?[-=])(.*)|(%%?|##?)([^/]*))?", inner)
+        op = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)(?:(:?[-=])(.*)|(%%?|##?)(.*))?", inner)
         if not op:
             return None
         name = op.group(1)
@@ -424,9 +521,27 @@ def expand_vars(word, variables):
             values = (values or []) + fallback
         if values is None:
             return None
+        if op.group(4):
+            if any(ch in op.group(5) for ch in "$`\\"):
+                return None
+            values = [trim(v, op.group(4), op.group(5)) for v in values]
         results = [r + word[pos:m.start()] + v for r in results for v in values][:64]
         pos = m.end()
     return [r + word[pos:] for r in results]
+
+
+def trim(value, op, pattern):
+    """${X%pat} (shortest suffix), ${X%%pat} (longest suffix), ${X#pat}, ${X##pat} (prefixes), like the shell."""
+    cuts = range(len(value) + 1)
+    if op.startswith("%"):
+        for i in (cuts if op == "%%" else reversed(cuts)):
+            if fnmatch.fnmatchcase(value[i:], pattern):
+                return value[:i]
+    else:
+        for i in (reversed(cuts) if op == "##" else cuts):
+            if fnmatch.fnmatchcase(value[:i], pattern):
+                return value[i:]
+    return value
 
 
 def names_sensitive(word, writes=True):
@@ -523,6 +638,7 @@ def touches_git_dir(bases, words, protect_plugin=False, variables=None, writes=F
 
 
 def path_refusal(word, kind):
+    word = word.translate(UNLITERAL)
     if kind == "many":
         return (f"`{word}` matches more than {GLOB_LIMIT} paths, too many for the guard to check. Use a narrower "
                 "pattern or name the files.")
@@ -580,17 +696,18 @@ def helper_refusal():
 def check_bash(command, cwd):
     if "\n" not in command and "\r" not in command and OWN_HELPER.match(re.sub(r"/{2,}", "/", command)):
         return helper_refusal()
-    # What the shell sees: line continuations joined and $'…' escapes decoded (`--no-\<newline>verify`).
-    joined = re.sub(r"\\\r?\n", "", command)
-    decoded = decode_ansi(joined)
-    if may_push(decoded) and re.search(r"\$['\"]", joined):
-        return "$'…' and $\"…\" quoting in a pushing command can't be checked. Write the arguments out plainly."
-    stripped = re.sub(r"[\"'\\]", "", decoded)
-    # `RAVENWATCH_DIS${X}ABLE`: the name only exists once the shell has expanded the variable.
-    collapsed = re.sub(r"[\"'\\]", "", EXPANSION.sub("", decoded))
-    for rx, why in BYPASS:
-        if any(rx.search(t) for t in (command, joined, stripped, collapsed)):
-            return f"{why}. Run the command without it."
+    # What the shell sees: line continuations joined, $'…' decoded, quotes and variables removed.
+    dollar_quotes = unquoted_dollar_quotes(command)
+    if any(UNSURE_ESCAPE.search(body) for body in dollar_quotes):
+        return ("$'…' quoting with escapes the shells read differently (\\c, \\0, or a \\x, \\u or \\U without all "
+                "its digits) can't be checked. Write the text out plainly.")
+    views = shell_views(command)
+    if dollar_quotes and any(PUSH_WORD.search(v) or GIT_WORD.search(v) for v in views):
+        return "$'…' and $\"…\" quoting in a git command can't be checked. Write the arguments out plainly."
+    why = bypass_reason(command)
+    if why:
+        return f"{why}. Run the command without it."
+    stripped = views[3]
     if PROTECTED_TEXT.search(command) or PROTECTED_TEXT.search(stripped):
         return ("this command touches the git hooks, git config or ravenwatch state inside .git/. Read files there "
                 "with the Read tool; install or remove the hook with /ravenwatch:install-git-hook. If the path only "
@@ -600,11 +717,13 @@ def check_bash(command, cwd):
         return ("the shell's working directory is inside a git directory, where commands can reach the hooks and "
                 "verdict state. `cd` back to the work tree first.")
     # The body of a `cat` heredoc is data (Claude's usual way to pass a commit message), not commands —
-    # unless the rest of its first line feeds it somewhere or chains another command, or the `cat` isn't
-    # really a command (inside quotes, or inside the body of an earlier heredoc).
+    # unless the rest of its first line feeds it somewhere or chains another command, the `cat` isn't
+    # really a command (inside quotes, or inside the body of an earlier heredoc), or the delimiter is
+    # unquoted and the body has command substitutions (the shell runs those).
     command = CAT_HEREDOC.sub(
         lambda m: "cat" + m.group(3) if len(m.group(3)) <= 500 and HARMLESS_REST.fullmatch(m.group(3))
         and "<<" not in command[:m.start()] and unquoted_command_start(command, m.start())
+        and (m.group(1) or not re.search(r"`|\$\(", m.group(0).split("\n", 1)[-1]))
         else m.group(0), command)
     pushing = may_push(command)
     if pushing and re.search(r"`|\$\(|<\(|>\(", command):
@@ -613,13 +732,14 @@ def check_bash(command, cwd):
     if parsed_cmd is None:
         return "could not parse this command. Run `git push` as its own plain command." if pushing else None
     segs = parsed_cmd
-    # The words as the shell splits them, checked once more (quoting can hide a flag from the text checks).
-    words = " ".join(" ".join(seg + redirects) for seg, redirects, _ in segs)
-    for rx, why in BYPASS:
-        if rx.search(words) or rx.search(re.sub(r"[\"'\\]", "", EXPANSION.sub("", words))):
+    # Each command's words as the shell splits them, checked once more (quoting can hide a flag from the
+    # text checks). One command at a time, so a pattern never spans `|` or `&&`.
+    for seg, redirects, _ in segs:
+        why = bypass_reason(" ".join(seg + redirects))
+        if why:
             return f"{why}. Run the command without it."
     protect_plugin = not developing_plugin(cwd)
-    variables = shell_vars(command)
+    variables = shell_vars(command, cwd)
 
     # Every directory the shell may be in: a `cd` only replaces the current one when the next command
     # runs after it succeeded (`&&`); after `;`, `||`, a pipe or a subshell, or `popd`/`cd -`, every
@@ -642,6 +762,15 @@ def check_bash(command, cwd):
             seg = seg[drop:]
         if not seg:
             continue
+        # A command name from a variable (`G=git; $G push`): use its value if the guard knows it.
+        if "$" in seg[0] or "`" in seg[0]:
+            known = resolve_word(seg[0], variables)
+            if known is None:
+                if pushing or any(GIT_WORD.search(v) for v in views):
+                    return ("this command takes its name from a variable the guard can't work out, in a command that "
+                            "mentions git. Write the command name out.")
+            else:
+                seg, dynamic_prefix = [known] + seg[1:], True
         head = os.path.basename(seg[0])
         if head == "eval" and any(t.split()[0] in ("cd", "pushd", "popd") for t in seg[1:] if t.split()):
             heres = list(dict.fromkeys(heres + [None]))
@@ -681,21 +810,17 @@ def check_bash(command, cwd):
         # Paths given to programs (cp, printf >, rm, git checkout-index --prefix=…). git's own arguments are
         # often not paths (messages, refs), so only paths that can be worked out are checked there.
         if head == "git":
-            outputs = [a for a in args if a.startswith("-") and "=" in a]
-            outputs += [args[i + 1] for i, a in enumerate(args[:-1]) if a in GIT_OUTPUT_OPTS]
+            outputs = [a for a in args if a.startswith("-") and "=" in a] + option_values(args, GIT_OUTPUT_OPTS)
             word = touches_git_dir(heres, outputs, False, variables, writes=False, check_lost=False)
         else:
             protect = protect_plugin and head not in READERS
             if head in OUTPUT_OPTS:
-                # Only option values are files written to; URLs, headers and members are just checked as text.
-                outputs = [args[i + 1] for i, a in enumerate(args[:-1]) if a in OUTPUT_OPTS[head]]
-                outputs += [a for a in args if a.startswith("--") and a.split("=", 1)[0] in OUTPUT_OPTS[head]]
-                word = (touches_git_dir(heres, outputs, protect, variables, writes=True)
+                # Only option values are files written to (`-o f`, `-of`, `-sSo f`, `--output=f`); URLs,
+                # headers and archive members are just checked as text.
+                word = (touches_git_dir(heres, option_values(args, OUTPUT_OPTS[head]), protect, variables, writes=True)
                         or touches_git_dir(heres, args, protect, variables, writes=False))
             else:
-                in_place = head in IN_PLACE and any(re.match(r"^-[a-zA-Z]*i", a) or a.startswith("--in-place")
-                                                    for a in args)
-                word = touches_git_dir(heres, args, protect, variables, writes=head in WRITERS or in_place)
+                word = touches_git_dir(heres, args, protect, variables, writes=head in WRITERS)
         if word:
             return path_refusal(*word)
         if not (pushing or GIT_WORD.search(" ".join(seg))):
@@ -713,6 +838,11 @@ def check_bash(command, cwd):
                         "Run `git push` as its own command.")
             continue
         cdir, globs, sub, args = parsed
+        if "$" in sub or "`" in sub:
+            known = resolve_word(sub, variables)
+            if known is None:
+                return "the git subcommand comes from a variable the guard can't work out. Write it out."
+            sub, dynamic_prefix = known, True
         # The push may run in any of the directories the shell may be in; each must be gated.
         repos = list(dict.fromkeys(resolve(h, cdir) if cdir else h for h in heres))
         is_push = sub == "push"
@@ -728,9 +858,9 @@ def check_bash(command, cwd):
                     if may_push(value):
                         return f"`git {sub}` is a shell alias that pushes, which the gate cannot check. Run `git push` directly."
                     break
-                for rx, why in BYPASS:
-                    if rx.search(value):
-                        return f"`git {sub}` expands to `{value}`: {why}."
+                why = bypass_reason(value)
+                if why:
+                    return f"`git {sub}` expands to `{value}`: {why}."
                 try:
                     _, aglobs, name, aargs = parse_git(["git"] + shlex.split(value))
                 except ValueError:
@@ -775,11 +905,10 @@ def check_bash(command, cwd):
                         "push could not be checked. Run /ravenwatch:install-git-hook in that repository first. (If "
                         "the repository uses Husky or lefthook, ravenwatch can't install there yet: the owner pushes "
                         "from their own terminal.)")
-            if "--no-recurse-submodules" not in args and recurses_into_submodules(repo):
+            if recurses_into_submodules(repo):
                 return ("this repository is configured to push submodules too (push.recurseSubmodules / "
-                        "submodule.recurse), and their hooks cannot be checked. Push submodules yourself, and set "
-                        "push.recurseSubmodules to check and submodule.recurse to false (or push with "
-                        "--no-recurse-submodules).")
+                        "submodule.recurse — whichever git reads last wins), and their hooks cannot be checked. Set "
+                        "push.recurseSubmodules to check in this repository's config, and push submodules yourself.")
     return None
 
 

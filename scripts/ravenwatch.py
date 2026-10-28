@@ -34,6 +34,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 LARGE_FILE_BYTES = 5 * 1024 * 1024  # 5 MB
@@ -44,7 +45,8 @@ LARGE_HISTORY_COMMITS = 500
 PER_COMMIT_LIMIT = 200
 PATCH_MAX_BYTES = 20 * 1024 * 1024
 SCAN_SECONDS = 240  # secret scan budget (history, then HEAD); `prepare` must finish within the skill's Bash timeout
-MAX_SCAN_LINE = 1024 * 1024  # longer lines (binary blobs under --text) are scanned up to this many characters
+HISTORY_SCAN_SECONDS = 180  # the history's share; the files at HEAD get the rest, and at least a minute
+MAX_SCAN_LINE = 1024 * 1024  # longer lines (binary blobs under --text) are scanned in overlapping pieces this big
 # Generated lockfiles: huge, rarely reviewable line by line; manifests still show dependency changes.
 LOCKFILES = ["package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml", "bun.lockb", "poetry.lock",
              "Pipfile.lock", "uv.lock", "Cargo.lock", "Gemfile.lock", "composer.lock", "go.sum"]
@@ -105,35 +107,40 @@ def hidden_tracked_files():
     """Tracked files on disk that git status doesn't compare with HEAD (skip-worktree or assume-unchanged),
     so their content on disk may differ from the commit being reviewed. Sparse-checkout files that aren't on
     disk don't count."""
-    res = subprocess.run(["git", "ls-files", "-v", "-z"], capture_output=True, text=True, errors="surrogateescape")
+    res = subprocess.run(["git", "ls-files", "-v", "-s", "-z"], capture_output=True, text=True,
+                         errors="surrogateescape")
     if res.returncode != 0:
         raise RuntimeError(f"git ls-files failed: {res.stderr.strip()[:200]}")
-    flagged = [e[2:] for e in res.stdout.split("\0")
-               if len(e) > 2 and (e[0] == "S" or e[0].islower()) and os.path.isfile(e[2:])]
-    if not flagged:
-        return []
+    # Entries look like `S 100644 <blob> 0\t<path>`: tag, mode, blob, stage, path.
+    flagged = {}
+    for e in res.stdout.split("\0"):
+        meta, tab, path = e.partition("\t")
+        parts = meta.split()
+        if tab and len(parts) == 4 and (parts[0] == "S" or parts[0].islower()):
+            flagged[path] = parts[2]
+    # A flagged file missing from disk (deleted, or left out by a sparse checkout) hides a change just as
+    # much as an edited one: checks and reviewers would run without it.
+    hidden = [p for p in flagged if not os.path.isfile(p) or os.path.islink(p)]
+    present = [p for p in flagged if p not in hidden]
+    if not present or any("\n" in p for p in present):
+        return hidden + [p for p in present if "\n" in p]
     # A local override that matches the commit is harmless; only content that differs is hidden.
-    staged = subprocess.run(["git", "ls-files", "-s", "-z", "--", *flagged], capture_output=True, text=True,
-                            errors="surrogateescape")
-    blobs = {}
-    for e in staged.stdout.split("\0"):
-        if "\t" in e:
-            meta, path = e.split("\t", 1)
-            blobs[path] = meta.split()[1]
-    disk = subprocess.run(["git", "hash-object", "--stdin-paths"], input="\n".join(flagged) + "\n",
+    disk = subprocess.run(["git", "hash-object", "--stdin-paths"], input="\n".join(present) + "\n",
                           capture_output=True, text=True, errors="surrogateescape")
-    if staged.returncode != 0 or disk.returncode != 0:
-        return flagged
-    return [f for f, h in zip(flagged, disk.stdout.split()) if blobs.get(f) != h]
+    if disk.returncode != 0:
+        return hidden + present
+    return hidden + [p for p, h in zip(present, disk.stdout.split()) if flagged[p] != h]
 
 
 def refuse_hidden_files():
     hidden = hidden_tracked_files()
     if hidden:
-        raise RuntimeError("these tracked files are marked skip-worktree or assume-unchanged and differ on disk from "
-                           f"what is committed: {', '.join(hidden[:5])}{' …' if len(hidden) > 5 else ''}. Reviewers "
-                           "and checks would read the version on disk. Clear the flag (git update-index "
-                           "--no-skip-worktree --no-assume-unchanged <file>) and commit or stash the change first.")
+        raise RuntimeError("these tracked files are marked skip-worktree or assume-unchanged (or left out by a sparse "
+                           "checkout) and are missing or differ on disk from what is committed: "
+                           f"{', '.join(hidden[:5])}{' …' if len(hidden) > 5 else ''}. Reviewers and checks would "
+                           "read what is on disk. Clear the flag (git update-index --no-skip-worktree "
+                           "--no-assume-unchanged <file>, or git sparse-checkout disable) and commit or stash any "
+                           "change first.")
 
 
 def tracked_changes():
@@ -175,21 +182,37 @@ def git_to_file(path, *args):
         raise RuntimeError(f"git {' '.join(args)} failed: {res.stderr.strip()}")
 
 
-def git_lines(*args, max_line=None):
-    """Yield git output line by line (stderr goes to a temp file so a failure can say why). With max_line,
-    longer lines are cut to that many characters and the rest of them is skipped."""
+def git_lines(*args, max_line=None, deadline=None, state=None):
+    """Yield git output line by line (stderr goes to a temp file so a failure can say why).
+    max_line: a longer line comes out in pieces of that size, each starting with the line's first character
+    (the diff's `+`) and overlapping the previous piece, so a pattern across a cut is still seen.
+    deadline (time.monotonic()): git is stopped then, even if it is busy without output, and
+    state["cut"] is set instead of reporting a failure."""
+    overlap = 512
     with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as err:
         proc = subprocess.Popen(["git", "-c", "core.quotePath=false", *args], stdout=subprocess.PIPE, stderr=err, text=True,
                                 encoding="utf-8", errors="replace")
+        timer = None
+        if deadline is not None:
+            timer = threading.Timer(max(deadline - time.monotonic(), 0), proc.kill)
+            timer.daemon = True
+            timer.start()
         try:
             while True:
                 line = proc.stdout.readline(max_line or -1)
                 if not line:
                     break
                 if max_line and len(line) >= max_line and not line.endswith("\n"):
-                    rest = line
-                    while rest and not rest.endswith("\n"):
-                        rest = proc.stdout.readline(max_line)
+                    marker, piece = line[:1], line
+                    yield piece
+                    while piece and not piece.endswith("\n"):
+                        more = proc.stdout.readline(max_line)
+                        if not more:
+                            break
+                        piece = marker + piece[-overlap:] + more
+                        yield piece.rstrip("\n")
+                        piece = more
+                    continue
                 yield line.rstrip("\n")
         except GeneratorExit:
             # The caller stopped early (e.g. a size cap): end git quietly instead of reporting a failure.
@@ -197,8 +220,16 @@ def git_lines(*args, max_line=None):
             proc.stdout.close()
             proc.wait()
             raise
+        finally:
+            if timer:
+                timer.cancel()
         proc.stdout.close()
-        if proc.wait() != 0:
+        code = proc.wait()
+        if deadline is not None and time.monotonic() >= deadline and code != 0:
+            if state is not None:
+                state["cut"] = True
+            return
+        if code != 0:
             err.seek(0)
             raise RuntimeError(f"git {' '.join(args)} failed: {err.read().strip()[:500]}")
 
@@ -725,15 +756,18 @@ def cmd_prepare(args):
     if rng:
         # Two thirds of the budget for the history; the rest (at least) for the files at HEAD if it runs out.
         hits = scan_added_lines(budgeted(git_lines(*ATTR_FREE, "log", "-p", "--cc", *text_opts, "--format=commit %H",
-                                                   rng, max_line=MAX_SCAN_LINE), SCAN_SECONDS * 2 / 3, scan))
+                                                   rng, max_line=MAX_SCAN_LINE, deadline=started + HISTORY_SCAN_SECONDS,
+                                                   state=scan), HISTORY_SCAN_SECONDS, scan))
         if scan["cut"]:
             tree = {"commits": 0, "cut": False}
-            left = max(SCAN_SECONDS - (time.monotonic() - started), SCAN_SECONDS / 3)
+            left = max(SCAN_SECONDS - (time.monotonic() - started), 60)
             hits += scan_added_lines(budgeted(git_lines(*ATTR_FREE, "diff", empty_tree(), "HEAD", *text_opts,
-                                                        max_line=MAX_SCAN_LINE), left, tree), "HEAD")
+                                                        max_line=MAX_SCAN_LINE, deadline=time.monotonic() + left,
+                                                        state=tree), left, tree), "HEAD")
             scan["tree_cut"] = tree["cut"]
     else:
-        hits = scan_added_lines(git_lines(*ATTR_FREE, "diff", "HEAD", *text_opts, max_line=MAX_SCAN_LINE))
+        hits = scan_added_lines(budgeted(git_lines(*ATTR_FREE, "diff", "HEAD", *text_opts, max_line=MAX_SCAN_LINE,
+                                                   deadline=started + SCAN_SECONDS, state=scan), SCAN_SECONDS, scan))
     # One entry per distinct value (by hash), so two different keys with the same prefix are both listed.
     seen, uniq, repeats = {}, [], {}
     for h in hits:
@@ -909,9 +943,12 @@ def cmd_prepare(args):
             out.append(f"- … and {n_commits - 50} more")
     out.append("")
     out.append("## Deterministic scan")
-    if scan["cut"]:
+    if scan["cut"] and not rng:
+        out.append(f"- WARNING: secret scan incomplete: the uncommitted changes were only partly scanned "
+                   f"({SCAN_SECONDS} s budget). Run gitleaks on the working tree.")
+    elif scan["cut"]:
         out.append(f"- WARNING: history scan incomplete: stopped after {scan['commits']} of {n_commits} commit(s) "
-                   f"({SCAN_SECONDS * 2 // 3} s budget); the files at HEAD were scanned instead"
+                   f"({HISTORY_SCAN_SECONDS} s budget); the files at HEAD were scanned instead"
                    + (" (that scan was cut short too)" if scan.get("tree_cut") else "")
                    + ". Secrets added and later removed in the rest of the history were not checked; run gitleaks "
                    "on the full history.")

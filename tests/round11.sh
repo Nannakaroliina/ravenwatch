@@ -217,22 +217,75 @@ bash_gate deny  "$R" 'd=$(mktemp -d .git/x.XXXX); cp a $d/y' "inside a git direc
 bash_gate deny  "$R" 'd=$(mktemp -d "$X/y.XXXX"); cp a $d/y' "can't tell where"
 bash_gate allow "$R" 'curl -s -H "Authorization: Bearer $TOKEN" https://example.com/api'
 bash_gate deny  "$R" 'curl -s -o "$(echo .)/x" https://example.com' "can't tell where"
-bash_gate allow "$R" 'sed -n "$(echo 1)p" a'
+bash_gate deny  "$R" 'sed -n "$(echo 1)p" a' "can't tell where"
 bash_gate deny  "$R" 'sed -i "" $UNKNOWN_DIR/x' "can't tell where"
 bash_gate allow "$R" 'cat "$(git rev-parse --show-toplevel)/config/x.yml"'
+
+# --- round 3 (UX-1): `$` inside a single-quoted sed or perl script is text
+bash_gate allow "$R" "sed -i '' '\$d' a"
+bash_gate allow "$R" "sed -i 's/\\\${VERSION}/1.2.0/' a"
+bash_gate allow "$R" "perl -pi -e 's/v(\\d+)/v\$1/' a"
+bash_gate deny  "$R" 'read F; sed "s/a/b/w $F" a' "can't tell where"
+
+# --- round 3 (SEC-1): $'…' escapes the shells read differently, and $'…' in git commands
+bash_gate deny  "$R" "git \$'pu\\x73h\\c@' origin main" "escapes the shells read differently"
+bash_gate deny  "$R" "git \$'pu\\x73h' origin main" "in a git command"
+bash_gate allow "$R" "grep -nE 'git $P\$' README.md"
+bash_gate allow "$R" "printf \$'\\e[1mbold\\e[0m\\n'"
+
+# --- round 3 (BUG-1): ${X#…} and ${X%…} are trimmed like the shell does
+bash_gate deny  "$R" 'X=x.git; cp /tmp/f ${X#x}/ravenwatch/status' "inside a git directory"
+bash_gate deny  "$R" 'X=.gitx; cp /tmp/f ${X%x}/hooks/pre-'$P "inside a git directory"
+bash_gate allow "$R" 'X=notes.md; cp a "${X%.md}.txt"'
+
+# --- round 3 (BUG-2): a command name or git subcommand from a variable
+bash_gate deny  "$R" 'G=git; $G '$P' origin main' "uses shell variables"
+bash_gate deny  "$R" 'read G; $G '$P' origin main' "takes its name from a variable"
+bash_gate deny  "$R" 'read S; git $S origin main' "subcommand comes from a variable"
+
+# --- round 3 (BUG-3): output options in clusters and attached values
+bash_gate deny  "$R" 'read F; curl -sSo "$F" https://example.com' "can't tell where"
+bash_gate deny  "$R" 'read F; curl -o"$F" https://example.com' "can't tell where"
+bash_gate deny  "$R" 'read F; wget -qO "$F" https://example.com' "can't tell where"
+bash_gate deny  "$R" 'read F; tar -xf"$F"' "can't tell where"
+bash_gate deny  "$R" 'read F; curl --output="$F" https://example.com' "can't tell where"
+
+# --- round 3 (BUG-5): $PWD is the shell's directory, not the guard's
+bash_gate deny  "$R" 'cp /tmp/f $PWD/.gi?/ravenwatch/status' "inside a git directory"
+
+# --- round 3 (SEC-2 r2): an unquoted heredoc delimiter with a command substitution in the body
+bash_gate deny  "$R" "cat <<EOF
+\$(git -C $N $P)
+EOF" "command substitution"
 
 # --- round 2 (BUG-3 / LOOP-1): submodules found from git, either setting counts
 printf '[submodule "s"]\n\tpath = s\n\turl = ./s\n' > .gitmodules
 git add .gitmodules; git commit -qm gitmodules
+# The setting git reads last wins: submodule.recurse after push.recurseSubmodules=check recurses …
 git config push.recurseSubmodules check; git config submodule.recurse true
 bash_gate deny  "$R" "git $P origin main" "push submodules too"
-bash_gate allow "$R" "git $P --no-recurse-submodules origin main"
-git config --unset submodule.recurse
+git $P -q origin main 2>"$T/err" && bad "hook let submodule.recurse=true (read last) through" || ok
+grep -q "recurseSubmodules" "$T/err" && ok || bad "hook refusal not about submodules: $(cat "$T/err")"
+# … and an opt-out on the command line can't be told apart from an option's value, so it doesn't count.
+bash_gate deny  "$R" "git $P -o --no-recurse-submodules origin main" "push submodules too"
+bash_gate deny  "$R" "git $P --no-recurse-submodules origin main" "push submodules too"
+# push.recurseSubmodules=check read last (the repository's own setting) wins over submodule.recurse.
+git config --unset submodule.recurse; git config --unset push.recurseSubmodules
+git config submodule.recurse true; git config push.recurseSubmodules check
+bash_gate allow "$R" "git $P origin main"
+git config --unset submodule.recurse; git config --unset push.recurseSubmodules
 git config push.recurseSubmodules on-demand; rm .gitmodules
 bash_gate deny  "$R" "git $P origin main" "push submodules too"
 git $P -q origin main 2>"$T/err" && bad "hook let a recursive push through without .gitmodules on disk" || ok
+grep -q "recurseSubmodules" "$T/err" && ok || bad "hook refusal without .gitmodules not about submodules: $(cat "$T/err")"
 git checkout -q -- .gitmodules; git config --unset push.recurseSubmodules
 git rm -q .gitmodules; git commit -qm nogitmodules
+# Submodules of another branch leave .git/modules behind; that counts too.
+mkdir -p "$(git rev-parse --git-path modules)/s"
+git config push.recurseSubmodules on-demand
+bash_gate deny  "$R" "git $P origin main" "push submodules too"
+git config --unset push.recurseSubmodules
+rm -rf "$(git rev-parse --git-path modules)"
 
 # --- round 2 (BUG-1 / IMP-1): sensitive files whatever category wins; infrastructure code is signalled
 mkdir -p terraform tests infra
@@ -248,14 +301,24 @@ echo "$ctx" | grep "infrastructure as code" | grep -q "infra/app.ts" && ok || ba
 echo "$ctx" | grep "infrastructure as code" | grep -q "next.config.js" && ok || bad "framework config not signalled"
 git rm -rq terraform tests/.env infra next.config.js; git commit -qm noinfra
 
-# --- round 2 (RES-1): over-long lines are cut, and the lines after them still arrive
-python3 -c 'print("x" * 5000); print("tail")' > long.txt; git add long.txt; git commit -qm long
-python3 - "$RW/scripts" <<'EOF' && ok || bad "long lines not capped"
+# --- round 2/3 (RES-1, LOOP-3): over-long lines come out in bounded, overlapping pieces, so a key far
+# into a minified line is still found, and the lines after it still arrive
+k=AKIA; python3 -c 'import sys; print("x" * 5000 + "KEY=\"" + sys.argv[1] + "\""); print("tail")' "${k}Q7RTYU2X9ZPLM4KD" > long.txt
+git add long.txt; git commit -qm long
+python3 - "$RW/scripts" <<'EOF' && ok || bad "long lines not scanned in bounded pieces"
 import sys; sys.path.insert(0, sys.argv[1]); import ravenwatch as r
 lines = list(r.git_lines("show", "--format=", "HEAD", max_line=1000))
-sys.exit(0 if "+tail" in lines and max(map(len, lines)) <= 1000 else 1)
+hits = r.scan_added_lines(lines)
+sys.exit(0 if "+tail" in lines and max(map(len, lines)) <= 1000 + 513
+         and any(h[2] == "AWS access key ID" for h in hits) else print(len(lines), hits) or 1)
 EOF
 git rm -q long.txt; git commit -qm nolong
+
+# --- round 3 (LOOP-1): a flagged file deleted from disk blocks like a changed one
+git update-index --skip-worktree a; rm a
+python3 "$RV" prepare >/dev/null 2>"$T/err" && bad "prepare ignored a deleted skip-worktree file" || ok
+grep -q "missing or differ" "$T/err" && ok || bad "deleted skip-worktree refusal unclear: $(cat "$T/err")"
+git update-index --no-skip-worktree a; git checkout -q -- a
 
 # --- RES-1: the history scan stops at its time budget and says so
 python3 - "$RW/scripts" <<'EOF' && ok || bad "scan budget"
