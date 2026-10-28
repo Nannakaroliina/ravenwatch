@@ -25,6 +25,7 @@ Code's environment to turn the gate off.
 
 import codecs
 import glob
+import itertools
 import json
 import os
 import pwd
@@ -113,6 +114,7 @@ WRITERS = {"cp", "mv", "tee", "dd", "install", "rsync", "ln", "touch", "mkdir", 
 # Programs that only write where an option says (other arguments are URLs, headers, archive members …).
 OUTPUT_OPTS = {
     "curl": {"-o", "--output", "-D", "--dump-header", "-c", "--cookie-jar", "--trace", "--trace-ascii",
+             "--libcurl", "--etag-save", "--hsts", "--alt-svc",
              "--output-dir", "--stderr"},
     "wget": {"-O", "--output-document", "-P", "--directory-prefix", "-o", "--output-file", "-a", "--append-output"},
     "tar": {"-f", "--file", "-C", "--directory"},
@@ -329,7 +331,11 @@ def glob_existing(pattern):
     """Matches of a pattern; if none, the pattern's leading directories that do match, with the rest
     appended literally (the path that would be created there)."""
     found = []
-    for path in glob.iglob(pattern):
+    try:
+        matches = list(itertools.islice(glob.iglob(pattern), GLOB_LIMIT + 1))  # stop at the limit, like before
+    except (re.error, ValueError, OSError):
+        return []  # not a pattern glob can read (a regex such as `[z-a]`): the word is a literal path
+    for path in matches:
         found.append(path)
         if len(found) > GLOB_LIMIT:
             raise TooManyMatches(pattern)
@@ -466,6 +472,9 @@ INERT_COMMENT = re.compile(r"#[A-Za-z0-9 \t.,:_/+=@%-]*(?=\n|$)")
 # is plain text, so the whole substitution is one literal word — if the shell's own end of the body (the
 # first line that is exactly the delimiter) is followed by nothing but the closing `)`.
 CAT_SUBST_START = re.compile(r"\$\([ \t]*cat[ \t]+<<(-?)[ \t]*(['\"])(\w+)\2[ \t]*\n")
+# Downloads named after the URL in the current directory (curl -O, wget without -O), or by the server.
+NAMED_BY_URL = {"curl": {"-O", "--remote-name", "--remote-name-all"}, "wget": set()}
+NAMED_BY_SERVER = {"curl": {"-J", "--remote-header-name"}, "wget": {"--content-disposition", "--trust-server-names"}}
 # A heredoc (`<<'EOF'`, `<<-"EOF"`, `<<EOF`, but not `<<<`). With a quoted delimiter its body is never
 # expanded; with a bare one, only a body free of `$`, backticks and backslashes counts as plain text.
 DATA_HEREDOC = re.compile(r"<<(-?)[ \t]*(['\"]?)(\w+)\2(?=[\s;&|<>]|$)")
@@ -686,7 +695,7 @@ def dynamic_reason(command):
             if head == "uniq" and len([a for a in args if not a.lstrip("'\"").startswith("-")]) > 1:
                 return "it runs `uniq` with an output file"
             if head == "curl":
-                opts = OUTPUT_OPTS["curl"] | {"-K", "--config"}
+                opts = OUTPUT_OPTS["curl"] | {"-K", "--config"} | NAMED_BY_URL["curl"] | NAMED_BY_SERVER["curl"]
                 short = {o[1] for o in opts if len(o) == 2}
                 for word in rough_words(piece):
                     bare = word.lstrip("'\"")
@@ -763,6 +772,28 @@ def dangerous_program(word):
     return bool(GLOB_CHARS.search(word)) or name in WRITERS or name in OUTPUT_OPTS or name in SHELLS or \
         name in INTERPRETERS or name in EXECUTORS or name in ("git", "gh", "hub") or name.startswith("git-") or \
         bool(PYTHONS.match(name))
+
+
+def downloaded_names(head, args):
+    """Files curl/wget write named after the URL ([] if none, None if the server picks the name): curl with
+    -O/--remote-name, wget unless -O/--output-document names the file (its -P directory is checked as an
+    option value already, so the name is joined to it)."""
+    def has(opts):
+        short = {o[1] for o in opts if len(o) == 2}
+        return any(a.split("=")[0] in opts or (a[:1] == "-" and a[1:2] != "-" and any(c in short for c in a[1:]))
+                   for a in args)
+    if head not in NAMED_BY_URL:
+        return []
+    if has(NAMED_BY_SERVER[head]):
+        return None
+    if head == "curl" and not has(NAMED_BY_URL["curl"]):
+        return []
+    if head == "wget" and has({"-O", "--output-document"}):
+        return []
+    prefix = (option_values(args, {"-P", "--directory-prefix"}) or [""])[-1] if head == "wget" else ""
+    urls = [a for a in args if re.match(r"(?i)[a-z][a-z0-9+.-]*://", a)]
+    return [os.path.join(prefix, re.sub(r"[?#].*", "", u).rstrip("/").rsplit("/", 1)[-1] or "index.html")
+            for u in urls]
 
 
 def reads_code_from_stdin(seg):
@@ -950,8 +981,13 @@ def check_bash(command, cwd, depth=0):
             protect = protect_plugin and head not in READERS
             if head in OUTPUT_OPTS:
                 # Only option values are files written to (`-o f`, `-of`, `-sSo f`, `--output=f`); URLs,
-                # headers and archive members are just checked as text.
-                word = (touches_git_dir(heres, option_values(args, OUTPUT_OPTS[head]), protect, writes=True)
+                # headers and archive members are just checked as text. Downloads named after their URL land
+                # in the current directory; ones the server names can't be checked.
+                named = downloaded_names(head, args)
+                if named is None:
+                    return (f"`{head}` would save a file under a name the server chooses, which the guard can't "
+                            "check. Give the file name with `-o`/`-O <file>`.")
+                word = (touches_git_dir(heres, option_values(args, OUTPUT_OPTS[head]) + named, protect, writes=True)
                         or touches_git_dir(heres, args, protect, writes=False))
             else:
                 word = touches_git_dir(heres, args, protect, writes=dangerous_program(head))
@@ -1082,9 +1118,13 @@ def risky_on_failure(command, target):
     could write somewhere, names git internals or the plugin, or uses shell features. Never unrelated tools."""
     if command is None:  # Write/Edit: only git-looking or plugin paths
         return bool(re.search(r"(?i)\.git\b|ravenwatch|hooks", target))
-    words = re.findall(r"[A-Za-z0-9_.+/-]+", command)
-    return may_push(command) or any(dangerous_program(w) for w in words) or \
-        bool(re.search(r"[*?\[>$`(){}#\\]|\.git|ravenwatch|hooks", command, re.I))
+    # Command names (the first word wherever a command could start) may be globs; other words count only
+    # as plain names (`grep '[z-a]' f` is a read).
+    heads = [p.split()[0].strip("'\"") for p in re.split(r"[;&|\n(){}`]|\$\(", command) if p.split()]
+    words = [w.strip("'\"") for w in command.split()]
+    return may_push(command) or any(dangerous_program(h) for h in heads) or \
+        any(dangerous_program(w) for w in words if not GLOB_CHARS.search(w)) or \
+        bool(re.search(r"[>$`]|\.git|ravenwatch|hooks", command, re.I))
 
 
 def _too_slow(signum, frame):
@@ -1131,8 +1171,8 @@ def main():
         # let it through (RES-1). Never brick unrelated tools.
         reason = None
         if risky_on_failure(_CURRENT.get("command"), _CURRENT.get("target", "")):
-            reason = (f"internal error while checking this ({type(exc).__name__}: {exc}). "
-                      "Start Claude Code with RAVENWATCH_DISABLE=1 to bypass the gate if this persists.")
+            reason = (f"internal error while checking this ({type(exc).__name__}: {exc}), and the command could "
+                      "push or write. Rephrase or split it (quote patterns, name paths directly).")
     if reason:
         deny(reason)
     allow()

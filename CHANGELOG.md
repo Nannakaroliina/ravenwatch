@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.2 — 2026-10-28
+
+Fixes from the review of 0.5.1.
+
+- Guard:
+  - A search pattern that isn't a valid file glob (`grep -n '[z-a]' f`) is treated as a literal path instead of crashing the check. When the checks do fail, only commands that could push or write are refused, and the message no longer suggests turning the gate off.
+  - curl's other file-writing options (`-O`, `--remote-name(-all)`, `-J`, `--libcurl`, `--etag-save`, `--hsts`, `--alt-svc`) count as output options. In a plain command, a `curl -O` or `wget` download is checked as a write of its file name in the current directory (so `cd ~ && curl -sO …/.gitconfig` is refused), and one the server names (`curl -J`, `wget --content-disposition`) is refused.
+- `mark --verdict accepted` after a secret scan that ran out of time also needs the owner's `--scan-incomplete-accepted`, like `--secrets-cleared` (the README already said so); the refusal reads more clearly.
+- Tests: new `tests/round16.sh`.
+
 ## 0.5.1 — 2026-10-28
 
 Fixes from the review of 0.5.0.

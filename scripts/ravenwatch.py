@@ -1166,12 +1166,13 @@ def cmd_mark(args):
                            "are not credentials (pass --secrets-cleared).")
     # A secret scan cut short by its time budget can't vouch for the range: only the owner can let it pass.
     incomplete = prepared.get("scan_incomplete") == "1" and prepared.get("mode") != "worktree"
-    if args.verdict in ("pass", "warn") and incomplete and not args.scan_incomplete_accepted:
-        part = ("neither the whole history nor all files at HEAD were" if prepared.get("head_scan_incomplete") == "1"
-                else "the files at HEAD were, but not the whole history was")
-        raise RuntimeError(f"the deterministic secret scan ran out of time: {part} scanned. Run gitleaks over the "
-                           "full history, then pass --scan-incomplete-accepted if the owner confirms it is clean, or "
-                           "record `block` / `accepted`.")
+    if args.verdict in ALLOWED and incomplete and not args.scan_incomplete_accepted:
+        part = ("neither the whole history nor all files at HEAD were scanned"
+                if prepared.get("head_scan_incomplete") == "1"
+                else "only part of the history was scanned (all files at HEAD were)")
+        raise RuntimeError(f"the deterministic secret scan ran out of time: {part}. Run gitleaks over the "
+                           "full history, then pass --scan-incomplete-accepted if the owner accepts the gap (also with "
+                           "`accepted`), or record `block`.")
     lines = [
         f"head={head}",
         f"base={prepared.get('base', '')}",
