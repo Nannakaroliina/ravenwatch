@@ -130,8 +130,9 @@ import sys; sys.path.insert(0, sys.argv[1]); import ravenwatch as r
 def ph(line):
     return [h[4] for h in r.scan_added_lines(["+++ b/x.py", "@@ -0,0 +1 @@", "+" + line])
             if h[2] == "Credentials in URL"]
-sys.exit(0 if ph('u = f"https://deploy:{real}@db/x"') == [True] and ph("u=https://x:$TOKEN@h/x") == [True]
-         and ph("u=https://x:Zr84kQpL2w@h/x") == [False] else 1)
+sys.exit(0 if ph('u = f"https://deploy:{real}@db.example.com/x"') == [True]
+         and ph("u=https://x:$TOKEN@h.example.com/x") == [True]
+         and ph("u=https://x:Zr84kQpL2w@h.example.com/x") == [False] else 1)
 EOF
 
 # --- BUG-H3 / LOOP-4 / BUG-H2: brief validation

@@ -96,9 +96,9 @@ def ph(line, pattern):
 G, U = "Generic secret assignment", "Credentials in URL"
 # Values are built from pieces so this file never holds a credential-looking literal.
 pw, sec, fer = "pass" + "word", "$uper" + "Secret2024", "Testa" + "rossa2024"
-real = [ph(f'{pw} = "{sec}"', G), ph(f'u = "postgres://app:{sec}@db.prod/x"', U),
+real = [ph(f'{pw} = "{sec}"', G), ph(f'u = "postgres://app:{sec}@db.example.com/x"', U),
         ph('api_secret = "{Hunter2' + 'Real99}"', G), ph(f'{pw} = "{fer}"', G)]
-fake = [ph('u = "https://x:$GITHUB_TOKEN@h/x"', U), ph('u = f"https://x:{password}@h/x"', U),
+fake = [ph('u = "https://x:$GITHUB_TOKEN@h.example.com/x"', U), ph('u = f"https://x:{password}@h.example.com/x"', U),
         ph("tok" + 'en = "mock.' + 'abcdefghijklmnopqrstuvwxyz"', G)]
 sys.exit(0 if all(v == [False] for v in real) and all(v == [True] for v in fake) else print(real, fake) or 1)
 EOF
