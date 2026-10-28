@@ -26,6 +26,7 @@ All state lives inside the git directory (never committed):
 
 import argparse
 import datetime as _dt
+import io
 import os
 import re
 import shutil
@@ -34,6 +35,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 LARGE_FILE_BYTES = 5 * 1024 * 1024  # 5 MB
@@ -43,6 +45,11 @@ KEEP_VERDICTS = 50
 LARGE_HISTORY_COMMITS = 500
 PER_COMMIT_LIMIT = 200
 PATCH_MAX_BYTES = 20 * 1024 * 1024
+SCAN_SECONDS = 240  # secret scan budget (history, then HEAD); `prepare` must finish within the skill's Bash timeout
+# Prefix git_lines puts on each later piece of an over-long line (never the start of a real diff line).
+CONTINUATION = "\x00\x00rw-cont\x00"
+HISTORY_SCAN_SECONDS = 180  # the history's share; the files at HEAD get the rest, and at least a minute
+MAX_SCAN_LINE = 1024 * 1024  # longer lines (binary blobs under --text) are scanned in overlapping pieces this big
 # Generated lockfiles: huge, rarely reviewable line by line; manifests still show dependency changes.
 LOCKFILES = ["package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml", "bun.lockb", "poetry.lock",
              "Pipfile.lock", "uv.lock", "Cargo.lock", "Gemfile.lock", "composer.lock", "go.sum"]
@@ -64,7 +71,7 @@ HIGH_RISK = re.compile(r"auth|login|logout|sign_?in|sign_?up|session|token|oauth
 
 
 def git(*args, check=True):
-    res = subprocess.run(["git", *args], capture_output=True, text=True,
+    res = subprocess.run(["git", "-c", "core.quotePath=false", *args], capture_output=True, text=True,
                          encoding="utf-8", errors="replace")
     if check and res.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)} failed: {res.stderr.strip()}")
@@ -74,6 +81,105 @@ def git(*args, check=True):
 def empty_tree():
     """The empty tree's id in this repository's hash (SHA-1 or SHA-256)."""
     return git("hash-object", "-t", "tree", "/dev/null")
+
+
+# Global git options for diffs and logs that must show every file's real content: the repository's own
+# .gitattributes (`-diff`, `binary`, textconv drivers) are ignored. Set by `prepare` (needs git 2.42+).
+ATTR_FREE = []
+
+
+def ignore_repo_attributes():
+    opt = f"--attr-source={empty_tree()}"
+    ATTR_FREE[:] = [opt] if git_ok(opt, "rev-parse", "HEAD") else []
+
+
+def budgeted(lines, seconds, state):
+    """Pass lines through until the time budget runs out; count commits and record whether it was cut short."""
+    deadline = time.monotonic() + seconds
+    for line in lines:
+        if line.startswith("commit "):
+            state["commits"] += 1
+        if time.monotonic() > deadline:
+            state["cut"] = True
+            lines.close()
+            return
+        yield line
+
+
+def hidden_tracked_files():
+    """{"missing": [...], "changed": [...]} for tracked files git status doesn't compare with HEAD
+    (skip-worktree, assume-unchanged, or left out by a sparse checkout): "missing" are not on disk,
+    "changed" are present but differ from the commit. A present file matching the commit is harmless."""
+    res = subprocess.run(["git", "ls-files", "-v", "-s", "-z"], capture_output=True, text=True,
+                         errors="surrogateescape")
+    if res.returncode != 0:
+        raise RuntimeError(f"git ls-files failed: {res.stderr.strip()[:200]}")
+    # Entries look like `S 100644 <blob> 0\t<path>`: tag, mode, blob, stage, path.
+    flagged = {}
+    for e in res.stdout.split("\0"):
+        meta, tab, path = e.partition("\t")
+        parts = meta.split()
+        if tab and len(parts) == 4 and (parts[0] == "S" or parts[0].islower()):
+            flagged[path] = parts[2]
+    # Split the flagged files into "missing" (deleted or left out by a sparse checkout) and "changed"
+    # (present on disk but different from the commit). A matching local override is harmless and dropped.
+    missing, present = [], []
+    for p in flagged:
+        (missing if not os.path.isfile(p) or os.path.islink(p) or "\n" in p else present).append(p)
+    changed = present
+    if present:
+        disk = subprocess.run(["git", "hash-object", "--stdin-paths"], input="\n".join(present) + "\n",
+                              capture_output=True, text=True, errors="surrogateescape")
+        if disk.returncode == 0:
+            changed = [p for p, h in zip(present, disk.stdout.split()) if flagged[p] != h]
+    return {"missing": missing, "changed": changed}
+
+
+def refuse_hidden_files(paths=None, run_exists=True):
+    """Refuse while hidden files could change what is reviewed or tested; return the ones that don't.
+    A changed file (present on disk but different from the commit) is refused when it is in `paths` (the
+    reviewed files of a diff review) or when `paths` is None (checks and full audits read the whole tree);
+    any other changed file is returned, so the context can tell reviewers it is a local override, not the
+    commit. A missing file is refused on the same terms, so an ordinary sparse checkout or a local config
+    override kept out of commits still works for a normal review. `accepted` is only offered where a run
+    exists to record it on (mark, checks), not from prepare."""
+    accept = " Or record the review as `accepted`." if run_exists else ""
+    flagged = hidden_tracked_files()
+    changed = [p for p in flagged["changed"] if paths is None or p in paths]
+    missing = [p for p in flagged["missing"] if paths is None or p in paths]
+    if changed:
+        raise RuntimeError("these tracked files are marked skip-worktree or assume-unchanged and differ on disk from "
+                           f"what is committed: {', '.join(changed[:5])}{' …' if len(changed) > 5 else ''}. Reviewers "
+                           "and checks would read the version on disk, not the commit. If it is a local override, set "
+                           "it aside for the review: git update-index --no-skip-worktree --no-assume-unchanged <file> "
+                           "&& git stash push -- <file>; review and push; then git stash pop and set the flag again."
+                           + accept)
+    if missing:
+        raise RuntimeError("these tracked files are missing from disk but are marked skip-worktree/assume-unchanged "
+                           f"or left out by a sparse checkout: {', '.join(missing[:5])}{' …' if len(missing) > 5 else ''}. "
+                           "Reviewers and checks would run without them. Restore them (git update-index "
+                           "--no-skip-worktree <file> && git checkout -- <file>, or git sparse-checkout add <dir>), "
+                           "or review from a full checkout." + accept)
+    return [p for p in flagged["changed"] if p not in changed]
+
+
+def reviewed_paths(base):
+    """The paths a diff review from base to HEAD covers."""
+    res = subprocess.run(["git", "-c", "core.quotePath=false", "diff", "--name-only", "-z", "--no-renames", base,
+                          "HEAD"], capture_output=True, text=True, errors="surrogateescape")
+    if res.returncode != 0:
+        raise RuntimeError(f"git diff failed: {res.stderr.strip()[:200]}")
+    return {p for p in res.stdout.split("\0") if p}
+
+
+def tracked_changes():
+    """Tracked files whose content on disk differs from HEAD (untracked files are left out)."""
+    res = subprocess.run(["git", "status", "--porcelain=v1", "-z", "--untracked-files=no",
+                          "--ignore-submodules=untracked"], capture_output=True, text=True, errors="surrogateescape")
+    if res.returncode != 0:
+        raise RuntimeError("could not tell whether the working tree matches HEAD (`git status` failed: "
+                           f"{res.stderr.strip()[:200]})")
+    return [e[3:] for e in res.stdout.split("\0") if len(e) > 3 and e[2] == " "]
 
 
 def git_ok(*args):
@@ -99,28 +205,62 @@ def write_capped(path, max_bytes, lines):
 def git_to_file(path, *args):
     """Stream git output straight to a file instead of holding it in memory."""
     with open(path, "w", encoding="utf-8") as fh:
-        res = subprocess.run(["git", *args], stdout=fh, stderr=subprocess.PIPE, text=True,
+        res = subprocess.run(["git", "-c", "core.quotePath=false", *args], stdout=fh, stderr=subprocess.PIPE, text=True,
                              encoding="utf-8", errors="replace")
     if res.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)} failed: {res.stderr.strip()}")
 
 
-def git_lines(*args):
-    """Yield git output line by line (stderr goes to a temp file so a failure can say why)."""
+def git_lines(*args, max_line=None, deadline=None, state=None):
+    """Yield git output line by line (stderr goes to a temp file so a failure can say why).
+    max_line: a longer line comes out in pieces of that size. The first piece keeps the line's real start
+    (the diff's marker columns); each later piece is prefixed with CONTINUATION and carries the previous
+    piece's tail, so scan_added_lines reuses the line's marker and a pattern across a cut is still seen.
+    deadline (time.monotonic()): git is stopped then, even if it is busy without output, and
+    state["cut"] is set instead of reporting a failure."""
+    overlap = 512
     with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as err:
-        proc = subprocess.Popen(["git", *args], stdout=subprocess.PIPE, stderr=err, text=True,
-                                encoding="utf-8", errors="replace")
+        proc = subprocess.Popen(["git", "-c", "core.quotePath=false", *args], stdout=subprocess.PIPE, stderr=err)
+        # Lines end only at "\n": a lone "\r" (CR-only files, binary blobs under --text) stays inside its line,
+        # where the scan sees it, instead of starting a new line that has no diff marker.
+        out = io.TextIOWrapper(proc.stdout, encoding="utf-8", errors="replace", newline="\n")
+        timer = None
+        if deadline is not None:
+            timer = threading.Timer(max(deadline - time.monotonic(), 0), proc.kill)
+            timer.daemon = True
+            timer.start()
         try:
-            for line in proc.stdout:
+            while True:
+                line = out.readline(max_line or -1)
+                if not line:
+                    break
+                if max_line and len(line) >= max_line and not line.endswith("\n"):
+                    yield line  # first piece: real marker columns intact
+                    piece = line
+                    while piece and not piece.endswith("\n"):
+                        more = out.readline(max_line)
+                        if not more:
+                            break
+                        yield CONTINUATION + piece[-overlap:] + more.rstrip("\n")
+                        piece = more
+                    continue
                 yield line.rstrip("\n")
         except GeneratorExit:
             # The caller stopped early (e.g. a size cap): end git quietly instead of reporting a failure.
             proc.kill()
-            proc.stdout.close()
+            out.close()
             proc.wait()
             raise
-        proc.stdout.close()
-        if proc.wait() != 0:
+        finally:
+            if timer:
+                timer.cancel()
+        out.close()
+        code = proc.wait()
+        if deadline is not None and time.monotonic() >= deadline and code != 0:
+            if state is not None:
+                state["cut"] = True
+            return
+        if code != 0:
             err.seek(0)
             raise RuntimeError(f"git {' '.join(args)} failed: {err.read().strip()[:500]}")
 
@@ -285,24 +425,29 @@ def decide_range(args, sdir):
 
 # -------------------------------------------------------------- classification
 
+# First match wins. Code is recognised by its extension before the path-based buckets, so
+# src/documents/upload.ts, src/auth/credentials.ts or infra/repository.ts still reach the code reviewers.
 CATEGORY_RULES = [
-    ("secret-file", re.compile(r"(^|/)(\.env(\..*)?|\.dev\.vars|.*\.pem|.*\.key|.*\.p12|.*\.pfx|id_rsa|id_ed25519|"
-                               r".*credentials.*|.*\.tfstate(\.backup)?|.*\.tfvars|service[-_]account.*\.json|"
-                               r".*\.sqlite3?|.*\.db|\.npmrc|\.pypirc|\.netrc)$", re.I)),
     ("ci", re.compile(r"(^|/)(\.github/workflows/|\.gitlab-ci\.yml|\.circleci/|azure-pipelines|bitbucket-pipelines)", re.I)),
     ("container", re.compile(r"(^|/)(Dockerfile[^/]*|docker-compose[^/]*\.ya?ml|compose\.ya?ml|\.dockerignore)$", re.I)),
-    ("iac", re.compile(r"(\.tf$|\.tfvars$|(^|/)cdk\.json$|(^|/)lib/.*-stack\.(ts|js|py)$|cloudformation|template\.ya?ml$|"
-                       r"serverless\.ya?ml$|samconfig|(^|/)infra/|(^|/)terraform/|policy.*\.json$)", re.I)),
     ("manifest", re.compile(r"(^|/)(package\.json|package-lock\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|bun\.lockb?|"
                             r"requirements[^/]*\.txt|Pipfile(\.lock)?|pyproject\.toml|poetry\.lock|uv\.lock|setup\.(py|cfg)|"
                             r"Cargo\.(toml|lock)|go\.(mod|sum)|Gemfile(\.lock)?|composer\.(json|lock)|pom\.xml|build\.gradle(\.kts)?)$", re.I)),
-    ("config", re.compile(r"(^|/)(wrangler\.(toml|jsonc?)|\.gitignore|.*\.config\.(js|ts|mjs|cjs)|.*\.(ya?ml|toml|ini|conf|cfg)|"
-                          r"nginx.*|\.htaccess|_headers|_redirects|vercel\.json|netlify\.toml|firebase\.json)$", re.I)),
+    ("iac", re.compile(r"(\.tf$|\.tfvars$|(^|/)cdk\.json$|(^|/)lib/[^/]*-stack\.(ts|js|py)$|cloudformation|template\.ya?ml$|"
+                       r"serverless\.ya?ml$|samconfig|policy[^/]*\.json$)", re.I)),
     ("test", re.compile(r"(^|/)(tests?|__tests__|spec|e2e)/|\.(test|spec)\.[a-z]+$|_test\.(go|py)$|(^|/)test_[^/]+\.py$", re.I)),
-    ("docs", re.compile(r"\.(md|mdx|rst|txt|adoc)$|(^|/)(docs?|LICENSE|CHANGELOG)", re.I)),
+    ("code", re.compile(r"\.(js|jsx|ts|tsx|mjs|cjs|mts|cts|py|rb|go|rs|java|kt|kts|swift|php|cs|c|cc|cpp|h|hpp|m|mm|sh|"
+                        r"bash|zsh|ps1|psm1|bat|cmd|pl|pm|sql|html?|vue|svelte|astro|lua|dart|scala|groovy|ex|exs|erl|hs|"
+                        r"clj|cljs|fs|r|jl|sol|ejs|erb|hbs|njk|twig|liquid|j2|jinja2?)$", re.I)),
+    ("secret-file", re.compile(r"(^|/)(\.env(\..*)?|\.dev\.vars|.*\.pem|.*\.key|.*\.p12|.*\.pfx|id_rsa|id_ed25519|"
+                               r".*credentials.*|.*\.tfstate(\.backup)?|.*\.tfvars|service[-_]account.*\.json|"
+                               r".*\.sqlite3?|.*\.db|\.npmrc|\.pypirc|\.netrc)$", re.I)),
+    ("iac", re.compile(r"(^|/)(infra|terraform)/", re.I)),
+    ("config", re.compile(r"(^|/)(wrangler\.(toml|jsonc?)|\.gitignore|\.gitattributes|.*\.(ya?ml|toml|ini|conf|cfg)|"
+                          r"\.htaccess|_headers|_redirects|vercel\.json|netlify\.toml|firebase\.json)$", re.I)),
+    ("docs", re.compile(r"\.(md|mdx|rst|txt|adoc)$|(^|/)docs?/|(^|/)(LICENSE|LICENCE|COPYING|NOTICE|AUTHORS|CHANGELOG)"
+                        r"([.-][^/]*)?$", re.I)),
     ("asset", re.compile(r"\.(png|jpe?g|gif|webp|svg|ico|woff2?|ttf|otf|mp[34]|wav|pdf|zip|gz)$", re.I)),
-    ("code", re.compile(r"\.(js|jsx|ts|tsx|mjs|cjs|py|rb|go|rs|java|kt|swift|php|cs|c|cc|cpp|h|hpp|sh|bash|zsh|sql|"
-                        r"html?|vue|svelte|astro|lua|dart|scala|ex|exs)$", re.I)),
 ]
 
 
@@ -311,6 +456,12 @@ def classify(path):
         if rx.search(path):
             return name
     return "other"
+
+
+def classify_file(path):
+    """classify(), plus extension-less scripts in the working tree (bin/deploy with a #! line) count as code."""
+    c = classify(path)
+    return "code" if c == "other" and has_shebang(path) else c
 
 
 # Secondary tags used to decide which reviewers run. A file can carry several.
@@ -325,6 +476,10 @@ SIGNAL_RULES = [
                        re.I)),
     ("env", re.compile(r"(^|/)(\.env\.example|\.env\.sample|\.dev\.vars\.example|wrangler\.(toml|jsonc?)|"
                        r"serverless\.ya?ml|docker-compose[^/]*\.ya?ml)$", re.I)),
+    # Infrastructure written as code (CDK, SST, Pulumi) and framework config: code, but infra-config-auditor's too.
+    ("infra", re.compile(r"(^|/)(infra|infrastructure|terraform|cdk|pulumi|sst|deploy)/|-stack\.(ts|js|py)$|"
+                         r"(^|/)(sst|pulumi|cdk)\.[a-z.]+$|(^|/)Pulumi(\.[^/]+)?\.ya?ml$|"
+                         r"\.config\.(js|ts|mjs|cjs|mts|cts)$", re.I)),
 ]
 
 
@@ -390,7 +545,7 @@ def audit_inventory(files, sizes):
     generated = marked_generated(paths)
     code, skipped = [], {}
     for p in paths:
-        c = classify(p)
+        c = classify_file(p)
         added = sizes.get(p, ("-", "-"))[0]
         if os.path.basename(p) in LOCKFILES:
             skipped[p] = "lockfile"
@@ -398,7 +553,7 @@ def audit_inventory(files, sizes):
             skipped[p] = "vendored/generated"
         elif not added.isdigit():
             skipped[p] = "binary"
-        elif c == "code" or (c == "other" and has_shebang(p)):
+        elif c == "code":
             high = bool(HIGH_RISK.search(p)) or bool({"api", "migration"} & set(signals_for(p)))
             code.append((p, int(added), high))
         else:
@@ -501,34 +656,56 @@ def scan_added_lines(lines, commit_label=None):
     """Return [(file, line_no, pattern, redacted, likely_placeholder, commit)] for an iterable of diff lines."""
     hits = []
     current_file, new_line, commit = None, 0, commit_label
+    # `+++ b/file` is a header only between `diff …` and the first `@@`; inside a hunk every line is content,
+    # even one that starts with `++` (so text can't pass itself off as a header and go unscanned). Combined
+    # diffs of merges (`@@@`) have one marker column per parent.
+    in_hunk, columns, scanning_added = False, 1, False
+
+    def scan(line):
+        # Every pattern and every match: an example key earlier on a line must not hide a real one.
+        for name, rx in SECRET_PATTERNS:
+            for m in rx.finditer(line):
+                val = m.group(1) if name in VALUE_GROUP else m.group(0)
+                if name == "Generic secret assignment" and not looks_secret(val):
+                    continue
+                # The value decides; for `name = value` pairs a test-ish name (test_api_key) also counts.
+                placeholder = is_placeholder(val)
+                if name == "Generic secret assignment":
+                    placeholder = placeholder or bool(TESTISH_NAME.search(line[m.start():m.start(1)]))
+                digest = sha256_bytes(val.encode("utf-8", "surrogateescape"))[:16]
+                hits.append((current_file, new_line, name, redact(val), placeholder, commit, digest))
+
     for raw in lines:
-        if raw.startswith("commit ") and len(raw.split()) >= 2 and re.fullmatch(r"[0-9a-f]{40}", raw.split()[1]):
-            commit = raw.split()[1][:8]
+        if raw.startswith(CONTINUATION):
+            # A later piece of an over-long line: same file and line number as the piece it continues,
+            # scanned only if that line was an added line (its marker already decided that).
+            if scanning_added:
+                scan(raw[len(CONTINUATION):])
             continue
-        if raw.startswith("+++ "):
+        scanning_added = False
+        if raw.startswith("commit ") and len(raw.split()) >= 2 and re.fullmatch(r"[0-9a-f]{40}", raw.split()[1]):
+            commit, in_hunk = raw.split()[1][:8], False
+            continue
+        if raw.startswith("diff "):
+            in_hunk = False
+            continue
+        if not in_hunk and raw.startswith("+++ "):
             p = raw[4:]
             current_file = p[2:] if p.startswith("b/") else (None if p == "/dev/null" else p)
             continue
         if raw.startswith("@@"):
             m = re.search(r"\+(\d+)", raw)
             new_line = int(m.group(1)) - 1 if m else 0
+            in_hunk, columns = True, max(len(raw) - len(raw.lstrip("@")) - 1, 1)
             continue
-        if raw.startswith("+") and not raw.startswith("+++"):
+        if not in_hunk:
+            continue
+        marker = raw[:columns]
+        if "+" in marker and "-" not in marker:
             new_line += 1
-            line = raw[1:]
-            # Every pattern and every match: an example key earlier on a line must not hide a real one.
-            for name, rx in SECRET_PATTERNS:
-                for m in rx.finditer(line):
-                    val = m.group(1) if name in VALUE_GROUP else m.group(0)
-                    if name == "Generic secret assignment" and not looks_secret(val):
-                        continue
-                    # The value decides; for `name = value` pairs a test-ish name (test_api_key) also counts.
-                    placeholder = is_placeholder(val)
-                    if name == "Generic secret assignment":
-                        placeholder = placeholder or bool(TESTISH_NAME.search(line[m.start():m.start(1)]))
-                    digest = sha256_bytes(val.encode("utf-8", "surrogateescape"))[:16]
-                    hits.append((current_file, new_line, name, redact(val), placeholder, commit, digest))
-        elif not raw.startswith("-"):
+            scanning_added = True
+            scan(raw[columns:])
+        elif "-" not in marker:
             new_line += 1
     return hits
 
@@ -545,6 +722,16 @@ def cmd_prepare(args):
         return 0
     head = git("rev-parse", "HEAD")
     base, label, mode, covered_base = decide_range(args, sdir)
+    ignore_repo_attributes()
+    overrides = []
+    if mode != "worktree":
+        overrides = refuse_hidden_files(None if mode == "full" else reviewed_paths(base), run_exists=False)
+    if mode == "full":
+        changed = tracked_changes()
+        if changed:
+            raise RuntimeError("a full audit has its reviewers read the files on disk, so they must match HEAD, but "
+                               f"these tracked files have uncommitted changes: {', '.join(changed[:5])}"
+                               f"{' …' if len(changed) > 5 else ''}. Commit or stash them first.")
     run_id, cur = new_run_dir(sdir)
     diff_path = os.path.join(cur, "diff.patch")
 
@@ -554,17 +741,17 @@ def cmd_prepare(args):
     patch_truncated = False
     touched = ""
     if mode == "worktree":
-        git_to_file(diff_path, "diff", "HEAD", "--no-color", "--no-ext-diff", "-U8")
-        names = git("diff", "HEAD", "--name-status", "--no-renames")
-        numstat = git("diff", "HEAD", "--numstat", "--no-renames")
+        git_to_file(diff_path, *ATTR_FREE, "diff", "HEAD", "--no-color", "--no-ext-diff", "--no-textconv", "-U8")
+        names = git(*ATTR_FREE, "diff", "HEAD", "--name-status", "--no-renames")
+        numstat = git(*ATTR_FREE, "diff", "HEAD", "--numstat", "--no-renames")
         commits = ""
         rng = None
     else:
         # A full audit has no diff to read: the reviewers read the files at HEAD, group by group.
         if mode != "full":
-            git_to_file(diff_path, "diff", base, "HEAD", "--no-color", "--no-ext-diff", "-U8")
-        names = git("diff", base, "HEAD", "--name-status", "--no-renames")
-        numstat = git("diff", base, "HEAD", "--numstat", "--no-renames")
+            git_to_file(diff_path, *ATTR_FREE, "diff", base, "HEAD", "--no-color", "--no-ext-diff", "--no-textconv", "-U8")
+        names = git(*ATTR_FREE, "diff", base, "HEAD", "--name-status", "--no-renames")
+        numstat = git(*ATTR_FREE, "diff", base, "HEAD", "--numstat", "--no-renames")
         rng = "HEAD" if base == empty_tree() else f"{base}..HEAD"
         n_commits = int(git("rev-list", "--count", rng))
         commits = git("log", "--no-color", "--format=%h %s", "-n", "50", rng)
@@ -573,7 +760,8 @@ def cmd_prepare(args):
         if 1 < n_commits <= PER_COMMIT_LIMIT and mode != "full":
             commits_path = os.path.join(cur, "commits.patch")
             patch_truncated = write_capped(commits_path, PATCH_MAX_BYTES, git_lines(
-                "log", "-p", "--reverse", "--no-color", "--no-ext-diff", "--format=commit %H%n%s%n", rng,
+                *ATTR_FREE, "log", "-p", "--reverse", "--no-color", "--no-ext-diff", "--no-textconv",
+                "--format=commit %H%n%s%n", rng,
                 "--", ".", *(f":(exclude,glob)**/{p}" for p in LOCKFILES)))
 
     files = []
@@ -604,7 +792,7 @@ def cmd_prepare(args):
     cats = {}
     with open(os.path.join(cur, "files.txt"), "w", encoding="utf-8") as fh:
         for status, path in files:
-            c = classify(path)
+            c = classify_file(path)
             cats.setdefault(c, []).append(path)
             a, d = sizes.get(path, ("-", "-"))
             extra = ""
@@ -612,14 +800,28 @@ def cmd_prepare(args):
                 extra = "\t" + (in_group.get(path) or f"not grouped: {skipped.get(path, c)}")
             fh.write(f"{status}\t{c}\t+{a}/-{d}\t{path}{extra}\n")
 
-    # Scan: committed history (catches secrets added then removed), or the diff for worktree/full mode.
-    # Both are streamed so a long history never has to fit in memory.
+    # Scan: committed history (catches secrets added then removed), or the uncommitted diff for worktree
+    # mode. Streamed so a long history never has to fit in memory; --text so neither `-diff`/`binary`
+    # attributes nor a NUL byte can hide a file's lines. A history too big for the time budget is
+    # replaced by a scan of the files at HEAD, and the context says so.
+    scan = {"commits": 0, "cut": False}
+    text_opts = ("--no-color", "--no-ext-diff", "--text", "--no-textconv")
+    started = time.monotonic()
     if rng:
-        hits = scan_added_lines(git_lines("log", "-p", "--cc", "--no-color", "--no-ext-diff",
-                                          "--format=commit %H", rng))
+        # Two thirds of the budget for the history; the rest (at least) for the files at HEAD if it runs out.
+        hits = scan_added_lines(budgeted(git_lines(*ATTR_FREE, "log", "-p", "--cc", *text_opts, "--format=commit %H",
+                                                   rng, max_line=MAX_SCAN_LINE, deadline=started + HISTORY_SCAN_SECONDS,
+                                                   state=scan), HISTORY_SCAN_SECONDS, scan))
+        if scan["cut"]:
+            tree = {"commits": 0, "cut": False}
+            left = max(SCAN_SECONDS - (time.monotonic() - started), 60)
+            hits += scan_added_lines(budgeted(git_lines(*ATTR_FREE, "diff", empty_tree(), "HEAD", *text_opts,
+                                                        max_line=MAX_SCAN_LINE, deadline=time.monotonic() + left,
+                                                        state=tree), left, tree), "HEAD")
+            scan["tree_cut"] = tree["cut"]
     else:
-        with open(diff_path, encoding="utf-8", errors="replace") as fh:
-            hits = scan_added_lines(line.rstrip("\n") for line in fh)
+        hits = scan_added_lines(budgeted(git_lines(*ATTR_FREE, "diff", "HEAD", *text_opts, max_line=MAX_SCAN_LINE,
+                                                   deadline=started + SCAN_SECONDS, state=scan), SCAN_SECONDS, scan))
     # One entry per distinct value (by hash), so two different keys with the same prefix are both listed.
     seen, uniq, repeats = {}, [], {}
     for h in hits:
@@ -630,7 +832,8 @@ def cmd_prepare(args):
         else:
             repeats[seen[key]] = repeats.get(seen[key], 0) + 1
 
-    sensitive = [p for s, p in files if s != "D" and classify(p) == "secret-file"]
+    secret_rule, code_rule = dict(CATEGORY_RULES)["secret-file"], dict(CATEGORY_RULES)["code"]
+    sensitive = [p for s, p in files if s != "D" and secret_rule.search(p) and not code_rule.search(p)]
     large = []
     for s, p in files:
         if s != "D" and os.path.isfile(p) and os.path.getsize(p) > LARGE_FILE_BYTES:
@@ -682,6 +885,10 @@ def cmd_prepare(args):
         out.append("- note: worktree reviews cover uncommitted changes only and do not unlock the push gate")
     if uncommitted and mode != "worktree":
         out.append(f"- note: {uncommitted} uncommitted change(s) in the working tree are NOT part of this review and will not be pushed")
+    if overrides:
+        out.append(f"- note: {len(overrides)} file(s) marked skip-worktree/assume-unchanged differ on disk from the commit "
+                   "(local overrides, NOT what is pushed); read their committed version with `git show HEAD:<path>`: "
+                   + ", ".join(overrides[:10]) + (" …" if len(overrides) > 10 else ""))
     if mode == "worktree":
         untracked = git("ls-files", "--others", "--exclude-standard")
         if untracked:
@@ -705,7 +912,7 @@ def cmd_prepare(args):
         for s in signals_for(path):
             sig.setdefault(s, []).append(path)
     deleted = [p for s, p in files if s == "D"]
-    own_code = [p for _, p in own if classify(p) == "code"]
+    own_code = [p for _, p in own if classify_file(p) == "code"]
     code_changed = len(own_code)
     tests_changed = sum(1 for _, p in own if classify(p) == "test")
     code_lines = sum(int(sizes.get(p, ("0", "0"))[0]) + int(sizes.get(p, ("0", "0"))[1])
@@ -713,21 +920,21 @@ def cmd_prepare(args):
     out.append("")
     out.append("## Signals")
     labels = {"ui": "ui / user-facing", "migration": "schema / migration", "api": "api / routes / entry points",
-              "env": "environment / deploy config"}
-    for s in ["ui", "migration", "api", "env"]:
+              "env": "environment / deploy config", "infra": "infrastructure as code / framework config"}
+    for s in ["ui", "migration", "api", "env", "infra"]:
         if s in sig:
             shown = sig[s][:20]
             more = f" … and {len(sig[s]) - 20} more" if len(sig[s]) > 20 else ""
             out.append(f"- {labels[s]} ({len(sig[s])}): " + ", ".join(shown) + more)
     if deleted:
         out.append(f"- deleted files ({len(deleted)}): " + ", ".join(deleted[:20]))
-    new_code = [p for s, p in files if s == "A" and classify(p) == "code"]
+    new_code = [p for s, p in files if s == "A" and classify_file(p) == "code"]
     if new_code and mode != "full":
         out.append(f"- new code files ({len(new_code)}): " + ", ".join(new_code[:20]))
     if mode == "full":
         out.append(f"- code lines: {code_lines}; code files: {code_changed}; test files: {tests_changed}"
                    + (" (the repository has no tests)" if code_changed and not tests_changed else ""))
-        found = personal_data_files(git_lines("diff", base, "HEAD", "--no-color", "--no-ext-diff", "--", ".",
+        found = personal_data_files(git_lines(*ATTR_FREE, "diff", base, "HEAD", "--no-color", "--no-ext-diff", "--", ".",
                                               *(f":(exclude,glob)**/{p}" for p in LOCKFILES)))
     else:
         out.append(f"- code lines changed: {code_lines}; code files: {code_changed}; test files: {tests_changed}"
@@ -753,6 +960,14 @@ def cmd_prepare(args):
         if reasons:
             out.append("- not in any group (still secret-scanned): "
                        + ", ".join(f"{r} {n}" for r, n in sorted(reasons.items())))
+        # Files with a code extension or #! line that no group reviews: repository content (.gitattributes,
+        # a NUL byte) can put them there, so name each one.
+        codeish = sorted(p for p, r in skipped.items() if r in ("binary", "vendored/generated")
+                         and (dict(CATEGORY_RULES)["code"].search(p) or has_shebang(p)))
+        if codeish:
+            out.append(f"- code-like files in no group ({len(codeish)}): " + ", ".join(codeish[:30])
+                       + (f" … and {len(codeish) - 30} more" if len(codeish) > 30 else "")
+                       + " — tell the owner; if any is their own source, add it to a group")
         # Repository content (paths, .gitattributes) decides what counts as vendored, so show all of it.
         by_dir = {}
         for p, r in skipped.items():
@@ -786,7 +1001,20 @@ def cmd_prepare(args):
             out.append(f"- … and {n_commits - 50} more")
     out.append("")
     out.append("## Deterministic scan")
-    if not (uniq or sensitive or large or gitignore_gaps):
+    if scan["cut"] and not rng:
+        out.append(f"- WARNING: secret scan incomplete: the uncommitted changes were only partly scanned "
+                   f"({SCAN_SECONDS} s budget). Run gitleaks on the working tree.")
+    elif scan["cut"]:
+        out.append(f"- WARNING: history scan incomplete: stopped after {scan['commits']} of {n_commits} commit(s) "
+                   f"({HISTORY_SCAN_SECONDS} s budget); the files at HEAD were scanned instead"
+                   + (" (that scan was cut short too)" if scan.get("tree_cut") else "")
+                   + ". Secrets added and later removed in the rest of the history were not checked; run gitleaks "
+                   "on the full history.")
+    binary = sorted(p for s, p in files if s != "D" and sizes.get(p, ("0",))[0] == "-")
+    if binary and mode != "full":
+        out.append(f"- binary in the diff ({len(binary)}; reviewers can't read them there, the secret scan does): "
+                   + ", ".join(binary[:20]) + (f" … and {len(binary) - 20} more" if len(binary) > 20 else ""))
+    if not (uniq or sensitive or large or gitignore_gaps or scan["cut"]):
         out.append("- clean: no secret patterns, sensitive files, large files or .gitignore gaps detected")
     for i, (f, ln, name, red, ph, cm, _) in enumerate(uniq):
         tag = "possible placeholder" if ph else "LIKELY REAL"
@@ -800,7 +1028,7 @@ def cmd_prepare(args):
     for g in gitignore_gaps:
         out.append(f"- GITIGNORE GAP: {g}")
 
-    if not files and not touched and not (uniq or sensitive or large):
+    if not files and not touched and not (uniq or sensitive or large or scan["cut"]):
         out.append("")
         out.append("NOTHING TO REVIEW: the range contains no file changes"
                    + (" (commits only)." if commits else "."))
@@ -820,6 +1048,7 @@ def cmd_prepare(args):
         f"blocking_checks={','.join(blocking)}",
         f"head={head}", f"diff_base={base}", f"base={covered_base}", f"mode={mode}", f"range={label}",
         f"likely_secrets={likely}", f"profile={'quick' if args.quick else 'standard'}", f"draft_dir={draft_dir}",
+        f"scan_incomplete={1 if scan['cut'] else 0}", f"head_scan_incomplete={1 if scan.get('tree_cut') else 0}",
     ])
     write_kv_atomic(os.path.join(sdir, "runs", "latest"), [run_id])
     print(text)
@@ -899,6 +1128,13 @@ def cmd_mark(args):
     if prepared["head"] != head:
         raise RuntimeError(f"HEAD moved since this review was prepared (reviewed {prepared['head'][:8]}, "
                            f"now {head[:8]}); the verdict would cover commits nobody reviewed. Review again.")
+    if args.verdict in ("pass", "warn") and prepared.get("mode") != "worktree":
+        # Reviewers and checks read the files on disk; they must be the commit the verdict unlocks.
+        full = prepared.get("mode") == "full"
+        refuse_hidden_files(None if full else reviewed_paths(prepared.get("diff_base") or empty_tree()))
+        if full and tracked_changes():
+            raise RuntimeError("tracked files changed on disk since this full audit was prepared, so the reviewers may "
+                               "not have read what HEAD contains. Commit or stash, then review again.")
     brief_sha = current_brief_sha(sdir)
     if args.verdict in ALLOWED and prepared.get("brief_sha", "") != brief_sha:
         raise RuntimeError("the approved project brief changed since this review was prepared, so its checks, "
@@ -928,6 +1164,15 @@ def cmd_mark(args):
         raise RuntimeError(f"the deterministic scan found {likely} likely real secret(s) in this range. A push can't "
                            "be unlocked until each is removed from history and rotated, or the owner confirms they "
                            "are not credentials (pass --secrets-cleared).")
+    # A secret scan cut short by its time budget can't vouch for the range: only the owner can let it pass.
+    incomplete = prepared.get("scan_incomplete") == "1" and prepared.get("mode") != "worktree"
+    if args.verdict in ALLOWED and incomplete and not args.scan_incomplete_accepted:
+        part = ("neither the whole history nor all files at HEAD were scanned"
+                if prepared.get("head_scan_incomplete") == "1"
+                else "only part of the history was scanned (all files at HEAD were)")
+        raise RuntimeError(f"the deterministic secret scan ran out of time: {part}. Run gitleaks over the "
+                           "full history, then pass --scan-incomplete-accepted if the owner accepts the gap (also with "
+                           "`accepted`), or record `block`.")
     lines = [
         f"head={head}",
         f"base={prepared.get('base', '')}",
@@ -942,6 +1187,9 @@ def cmd_mark(args):
         lines.append(f"report={clean_value(store_report(sdir, run_id, head, args.report))}")
     if args.note:
         lines.append("note=" + clean_value(args.note)[:300])
+    if incomplete:
+        lines.append(f"scan_incomplete={'head' if prepared.get('head_scan_incomplete') == '1' else 'history'}"
+                     + ("+accepted" if args.scan_incomplete_accepted else ""))
     with open(os.path.join(sdir, "history.log"), "a", encoding="utf-8") as fh:
         fh.write(" | ".join(lines) + "\n")
     if prepared.get("mode") == "worktree":
@@ -1483,6 +1731,7 @@ def cmd_checks(args):
         raise RuntimeError("checks run the files on disk, so they need exactly the reviewed commits, but there are "
                            f"uncommitted or untracked files: {listed}. Commit them, `git stash -u`, or add them to "
                            ".gitignore — then prepare the review again if you committed.")
+    refuse_hidden_files()
     shim_dir = tempfile.mkdtemp(prefix="ravenwatch-git-")
     real_git = shutil.which("git") or "/usr/bin/git"
     with open(os.path.join(shim_dir, "git"), "w", encoding="utf-8") as fh:
@@ -1686,34 +1935,52 @@ def cmd_status(_args):
     return 0 if covers and st.get("verdict") in ALLOWED else 1
 
 
+class Once(argparse.Action):
+    """Store an option's value, refusing a second one: `mark --verdict block … --verdict pass` must not
+    record something other than what the owner read in the permission prompt."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        if getattr(namespace, self.dest, None) is not None:
+            parser.error(f"{option_string} given more than once")
+        setattr(namespace, self.dest, values)
+
+
 def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    # No abbreviated options (`--sc` for --scan-incomplete-accepted): the permission prompt shows the command
+    # as typed, and every option the owner approves must be spelled out there.
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+                                 allow_abbrev=False)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    p = sub.add_parser("prepare")
+
+    def command(name, **kw):
+        return sub.add_parser(name, allow_abbrev=False, **kw)
+    p = command("prepare")
     p.add_argument("--base")
     p.add_argument("--since-last", action="store_true")
     p.add_argument("--worktree", action="store_true")
     p.add_argument("--full", action="store_true")
     p.add_argument("--quick", action="store_true",
                    help="only the core reviewers (bugs, security, loopholes, plus config/dependency checks)")
-    m = sub.add_parser("mark")
-    m.add_argument("--verdict", required=True, choices=list(ALLOWED) + ["block"])
-    m.add_argument("--run", help="run id printed by prepare (default: the most recent run)")
-    m.add_argument("--report")
-    m.add_argument("--note")
+    m = command("mark")
+    m.add_argument("--verdict", required=True, choices=list(ALLOWED) + ["block"], action=Once)
+    m.add_argument("--run", help="run id printed by prepare (default: the most recent run)", action=Once)
+    m.add_argument("--report", action=Once)
+    m.add_argument("--note", action=Once)
     m.add_argument("--checks-skipped", action="store_true",
                    help="owner chose not to run the brief's blocking checks for this review")
     m.add_argument("--secrets-cleared", action="store_true",
                    help="owner confirms the scan's likely secrets are not credentials (or were removed and rotated)")
-    sub.add_parser("status")
-    t = sub.add_parser("trust-brief", help="approve the current .ravenwatch.md (owner only)")
+    m.add_argument("--scan-incomplete-accepted", action="store_true",
+                   help="owner confirms the range is free of secrets although the secret scan ran out of time")
+    command("status")
+    t = command("trust-brief", help="approve the current .ravenwatch.md (owner only)")
     t.add_argument("--private", action="store_true", help="also git-ignore .ravenwatch.md for this clone")
     t.add_argument("--approve", metavar="SHA256",
                    help="approve the brief only if its content still has this hash (shown by trust-brief)")
-    c = sub.add_parser("checks", help="run the checks listed in the approved brief")
+    c = command("checks", help="run the checks listed in the approved brief")
     c.add_argument("--run", help="run id printed by prepare (default: the most recent run)")
     c.add_argument("--only", nargs="+", help="run only these named checks")
-    h = sub.add_parser("install-hook")
+    h = command("install-hook")
     h.add_argument("--uninstall", action="store_true")
     h.add_argument("--hooks-path-ok", action="store_true")
     args = ap.parse_args()

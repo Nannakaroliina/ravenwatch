@@ -85,6 +85,22 @@ check_target() {
     fail "this push overrides the receive command or recurses into submodules, so the gate cannot check it." \
       "Push again without --exec/--receive-pack/--recurse-submodules (push submodules from inside each one)."
   fi
+  # The same recursion, switched on in git config: refused whenever it is on, whether or not submodules can
+  # be found (git finds them in places a hook would miss). push.recurseSubmodules and submodule.recurse both
+  # set it and the one git reads last wins (the order --get-regexp lists them in); any value not known to
+  # mean off counts as on (git reads submodule.recurse=2 as true). Same rule as the Claude guard.
+  recurse=0
+  while IFS=' ' read -r key value; do
+    value=$(printf '%s' "$value" | tr 'A-Z' 'a-z')
+    case "$(printf '%s' "$key" | tr 'A-Z' 'a-z')" in
+      push.recursesubmodules) case "$value" in check | no | false | off | 0) recurse=0 ;; *) recurse=1 ;; esac ;;
+      submodule.recurse) case "$value" in false | no | off | 0) recurse=0 ;; *) recurse=1 ;; esac ;;
+    esac
+  done <<EOF
+$(git config --get-regexp '^(push\.recursesubmodules|submodule\.recurse)$' 2>/dev/null)
+EOF
+  [ "$recurse" = 1 ] && fail "push.recurseSubmodules / submodule.recurse is on, so git may push submodules through their own hooks, which the gate cannot check." \
+    "Set push.recurseSubmodules to check (or submodule.recurse to false) in this repository's config, and push submodules from inside each one."
   listed=$(git ls-remote --get-url "$remote_url" 2>/dev/null)
   if [ "$listed" != "$remote_url" ]; then
     fail "url.*.insteadOf rewrites the push URL to a different one for reads; the gate cannot check this push." \
