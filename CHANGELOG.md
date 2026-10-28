@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.4.2 — 2026-10-28
+
+Fixes from the review of 0.4.1.
+
+**Upgrade:** re-run /ravenwatch:install-git-hook in each gated repository (the guard refuses Claude's pushes while the installed hook is out of date).
+
+- Guard, bypasses closed:
+  - A variable whose value goes on after a quote or `$(…)` (`X='/repo'/.git`, `X="$HOME"/….git`, `X=$(mktemp -d)/../…`), or whose bare value has quotes or backslashes inside, used to be read only up to that point, so a write through `"$X/hooks/pre-push"` or into the verdict state got through. Such a value now counts as unknown, and writes through it are refused.
+  - An alias chain the guard can't follow to its end (more than five levels, or a loop) is refused instead of allowed.
+  - Bash writes to git config files outside a git directory (`~/.gitconfig`, `~/.config/git/config`) are refused, as Write/Edit already were: they could add aliases or a hooks path.
+  - `segments()` now reads quotes, comments and line continuations through `quoting()`, so the guard has one quote scanner instead of two that disagreed (`$'…'`, quotes inside `"$(…)"`).
+- Secret scan:
+  - A lone CR no longer ends a line: text after it (CR-only files, binary blobs) used to go unscanned, and a CR followed by `diff ` hid the rest of the hunk.
+  - When the scan runs out of time, `mark` refuses pass and warn unless the owner confirms the range is clean with `--scan-incomplete-accepted` (ideally after gitleaks over the full history). The verdict records it. The review skill reports both scan-incomplete warnings as SCAN-1.
+- A skip-worktree or assume-unchanged file that differs from the commit blocks a review only when it is among the reviewed files, or in checks and full audits. A local override elsewhere is listed in the context for the reviewers instead, so `accepted` is reachable again. The refusal no longer suggests committing the file; it gives the stash round trip.
+- Tests: new `tests/round12.sh` covers all of the above, including NUL-byte and `binary`-attribute files in the scan, the HEAD fallback after a history scan out of time, and git killed at its deadline.
+
 ## 0.4.1 — 2026-10-28
 
 Fixes from the first full-repository audit and four review rounds of those fixes.
@@ -22,7 +39,7 @@ Fixes from the first full-repository audit and four review rounds of those fixes
   - Over-long lines are scanned in overlapping 1 MB pieces that carry the line's own marker, and `+++` counts as a file header only outside a hunk, so content — including a merge diff's `++` lines — can't pass itself off as a header or a deletion to go unscanned.
   - Non-ASCII paths are no longer quoted into misclassification.
   - The scan has a 4-minute budget (3 for the history, the rest for the files at HEAD if the history runs out), git is stopped at the deadline, and an incomplete scan is reported. Binary files in a diff and code-like files left out of a full audit's groups are listed by path.
-- Files on disk that differ from the commit: a skip-worktree, assume-unchanged or sparse-checkout file that is **changed** on disk blocks a review in every mode (it could show the reviewers code that isn't committed); one that is only **missing** blocks a diff review when it is among the reviewed files, and always blocks checks and full audits (those read the whole tree) — so an ordinary sparse checkout still reviews normally, but with blocking checks it can only be `accepted` or reviewed from a full checkout. A full audit also refuses uncommitted tracked changes (untracked content inside submodules doesn't count). `mark` re-checks before pass/warn; `accepted` is never blocked by it.
+- Files on disk that differ from the commit: a skip-worktree, assume-unchanged or sparse-checkout file that is **changed** on disk blocks a review in every mode (it could show the reviewers code that isn't committed); one that is only **missing** blocks a diff review when it is among the reviewed files, and always blocks checks and full audits (those read the whole tree) — so an ordinary sparse checkout still reviews normally, but with blocking checks it can only be `accepted` or reviewed from a full checkout. A full audit also refuses uncommitted tracked changes (untracked content inside submodules doesn't count). `mark` re-checks before pass/warn; `accepted` is never blocked by it. (Narrowed in 0.4.2: see above.)
 - Checks: `tests/run.sh` drops the checks runner's push shim for its own throwaway remotes, so ravenwatch's suite can run as an approved check.
 - Review skill: `prepare` gets a 10-minute Bash timeout; an incomplete history scan is reported as finding SCAN-1.
 - Tests: new round-11 suite; the FIFO test no longer needs `timeout`, which macOS doesn't have.

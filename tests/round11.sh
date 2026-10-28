@@ -160,9 +160,9 @@ git rm -q keys.py .gitattributes; git commit -qm unkeys
 echo "print(1)" > "työkalut.py"; git add "työkalut.py"; git commit -qm uml
 python3 "$RV" prepare | grep "^- code" | grep -q "työkalut.py" && ok || bad "non-ASCII code file misclassified"
 
-# --- LOOP-3 / IMP-2 / LOOP-2 (round 4-5): a skip-worktree file that is present but DIFFERS from the commit
-# is refused in every mode (it can show reviewers code that isn't committed), whether or not it is in the
-# reviewed range. A MISSING one is refused only when reviewed, or in a full audit. `a` is committed and not
+# --- LOOP-3 / IMP-2 (round 4-5, scoped in round 6 by UX-1): a skip-worktree file that is present but
+# DIFFERS from the commit, or is MISSING, is refused when it is among the reviewed files, or in a full
+# audit; outside the range it is a local override the context points out. `a` is committed and not
 # changed on the branch (out of range); U is added on the branch (in range).
 U=src/documents/upload.ts
 git update-index --skip-worktree "$U"
@@ -171,10 +171,15 @@ echo changed >> "$U"
 python3 "$RV" prepare >/dev/null 2>"$T/err" && bad "prepare ignored a changed, reviewed skip-worktree file" || ok
 grep -q "differ on disk" "$T/err" && ok || bad "changed skip-worktree refusal unclear: $(cat "$T/err")"
 git update-index --no-skip-worktree "$U"; git checkout -q -- "$U"
-# A changed file OUTSIDE the reviewed range is still refused (LOOP-2): reviewers may read it.
+# A changed file OUTSIDE the reviewed range (a local override kept out of commits) doesn't block a diff
+# review: the context tells reviewers it isn't the commit. A full audit still refuses it.
 git update-index --skip-worktree a; echo override >> a
-python3 "$RV" prepare >/dev/null 2>"$T/err" && bad "a changed skip-worktree file outside the range was allowed" || ok
-grep -q "differ on disk" "$T/err" && ok || bad "out-of-range changed refusal unclear: $(cat "$T/err")"
+ctx=$(python3 "$RV" prepare 2>"$T/err") && ok || bad "a local override outside the range blocked a diff review: $(cat "$T/err")"
+echo "$ctx" | grep "local overrides, NOT what is pushed" | grep -q ": a$" && ok || bad "override not noted: $ctx"
+python3 "$RV" prepare --full >/dev/null 2>"$T/err" && bad "full audit ignored a changed skip-worktree file" || ok
+grep -q "differ on disk" "$T/err" && ok || bad "full-audit changed refusal unclear: $(cat "$T/err")"
+grep -q "git stash" "$T/err" && ok || bad "changed refusal doesn't give the stash round trip: $(cat "$T/err")"
+grep -q "and commit or stash" "$T/err" && bad "changed refusal still advises committing a local override" || ok
 git update-index --no-skip-worktree a; git checkout -q -- a
 # A MISSING file outside the reviewed range is allowed in a diff review (sparse checkout), refused in --full.
 git update-index --skip-worktree a; rm a

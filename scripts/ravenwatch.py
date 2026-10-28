@@ -26,6 +26,7 @@ All state lives inside the git directory (never committed):
 
 import argparse
 import datetime as _dt
+import io
 import os
 import re
 import shutil
@@ -135,26 +136,29 @@ def hidden_tracked_files():
 
 
 def refuse_hidden_files(paths=None):
-    """Refuse while hidden files could change what is reviewed or tested.
-    A changed file (present on disk but different from the commit) is refused in every mode: it can show
-    reviewers code that isn't in the commit. A missing file is refused only when it is in `paths` (the
-    reviewed files of a diff review) or when `paths` is None (checks and full audits read the whole tree),
-    so an ordinary sparse checkout still works for a normal review."""
+    """Refuse while hidden files could change what is reviewed or tested; return the ones that don't.
+    A changed file (present on disk but different from the commit) is refused when it is in `paths` (the
+    reviewed files of a diff review) or when `paths` is None (checks and full audits read the whole tree);
+    any other changed file is returned, so the context can tell reviewers it is a local override, not the
+    commit. A missing file is refused on the same terms, so an ordinary sparse checkout or a local config
+    override kept out of commits still works for a normal review."""
     flagged = hidden_tracked_files()
-    changed = flagged["changed"]
+    changed = [p for p in flagged["changed"] if paths is None or p in paths]
     missing = [p for p in flagged["missing"] if paths is None or p in paths]
     if changed:
         raise RuntimeError("these tracked files are marked skip-worktree or assume-unchanged and differ on disk from "
                            f"what is committed: {', '.join(changed[:5])}{' …' if len(changed) > 5 else ''}. Reviewers "
-                           "and checks would read the version on disk, not the commit. Clear the flag (git "
-                           "update-index --no-skip-worktree --no-assume-unchanged <file>) and commit or stash the "
-                           "change first.")
+                           "and checks would read the version on disk, not the commit. If it is a local override, set "
+                           "it aside for the review: git update-index --no-skip-worktree --no-assume-unchanged <file> "
+                           "&& git stash push -- <file>; review and push; then git stash pop and set the flag again. "
+                           "Or record the review as `accepted`.")
     if missing:
         raise RuntimeError("these tracked files are missing from disk but are marked skip-worktree/assume-unchanged "
                            f"or left out by a sparse checkout: {', '.join(missing[:5])}{' …' if len(missing) > 5 else ''}. "
                            "Reviewers and checks would run without them. Restore them (git update-index "
                            "--no-skip-worktree <file> && git checkout -- <file>, or git sparse-checkout add <dir>), "
-                           "or review from a full checkout.")
+                           "review from a full checkout, or record the review as `accepted`.")
+    return [p for p in flagged["changed"] if p not in changed]
 
 
 def reviewed_paths(base):
@@ -214,8 +218,10 @@ def git_lines(*args, max_line=None, deadline=None, state=None):
     state["cut"] is set instead of reporting a failure."""
     overlap = 512
     with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as err:
-        proc = subprocess.Popen(["git", "-c", "core.quotePath=false", *args], stdout=subprocess.PIPE, stderr=err, text=True,
-                                encoding="utf-8", errors="replace")
+        proc = subprocess.Popen(["git", "-c", "core.quotePath=false", *args], stdout=subprocess.PIPE, stderr=err)
+        # Lines end only at "\n": a lone "\r" (CR-only files, binary blobs under --text) stays inside its line,
+        # where the scan sees it, instead of starting a new line that has no diff marker.
+        out = io.TextIOWrapper(proc.stdout, encoding="utf-8", errors="replace", newline="\n")
         timer = None
         if deadline is not None:
             timer = threading.Timer(max(deadline - time.monotonic(), 0), proc.kill)
@@ -223,14 +229,14 @@ def git_lines(*args, max_line=None, deadline=None, state=None):
             timer.start()
         try:
             while True:
-                line = proc.stdout.readline(max_line or -1)
+                line = out.readline(max_line or -1)
                 if not line:
                     break
                 if max_line and len(line) >= max_line and not line.endswith("\n"):
                     yield line  # first piece: real marker columns intact
                     piece = line
                     while piece and not piece.endswith("\n"):
-                        more = proc.stdout.readline(max_line)
+                        more = out.readline(max_line)
                         if not more:
                             break
                         yield CONTINUATION + piece[-overlap:] + more.rstrip("\n")
@@ -240,13 +246,13 @@ def git_lines(*args, max_line=None, deadline=None, state=None):
         except GeneratorExit:
             # The caller stopped early (e.g. a size cap): end git quietly instead of reporting a failure.
             proc.kill()
-            proc.stdout.close()
+            out.close()
             proc.wait()
             raise
         finally:
             if timer:
                 timer.cancel()
-        proc.stdout.close()
+        out.close()
         code = proc.wait()
         if deadline is not None and time.monotonic() >= deadline and code != 0:
             if state is not None:
@@ -715,8 +721,9 @@ def cmd_prepare(args):
     head = git("rev-parse", "HEAD")
     base, label, mode, covered_base = decide_range(args, sdir)
     ignore_repo_attributes()
+    overrides = []
     if mode != "worktree":
-        refuse_hidden_files(None if mode == "full" else reviewed_paths(base))
+        overrides = refuse_hidden_files(None if mode == "full" else reviewed_paths(base))
     if mode == "full":
         changed = tracked_changes()
         if changed:
@@ -876,6 +883,10 @@ def cmd_prepare(args):
         out.append("- note: worktree reviews cover uncommitted changes only and do not unlock the push gate")
     if uncommitted and mode != "worktree":
         out.append(f"- note: {uncommitted} uncommitted change(s) in the working tree are NOT part of this review and will not be pushed")
+    if overrides:
+        out.append(f"- note: {len(overrides)} file(s) marked skip-worktree/assume-unchanged differ on disk from the commit "
+                   "(local overrides, NOT what is pushed); read their committed version with `git show HEAD:<path>`: "
+                   + ", ".join(overrides[:10]) + (" …" if len(overrides) > 10 else ""))
     if mode == "worktree":
         untracked = git("ls-files", "--others", "--exclude-standard")
         if untracked:
@@ -1035,7 +1046,7 @@ def cmd_prepare(args):
         f"blocking_checks={','.join(blocking)}",
         f"head={head}", f"diff_base={base}", f"base={covered_base}", f"mode={mode}", f"range={label}",
         f"likely_secrets={likely}", f"profile={'quick' if args.quick else 'standard'}", f"draft_dir={draft_dir}",
-        f"scan_incomplete={1 if scan['cut'] else 0}",
+        f"scan_incomplete={1 if scan['cut'] else 0}", f"head_scan_incomplete={1 if scan.get('tree_cut') else 0}",
     ])
     write_kv_atomic(os.path.join(sdir, "runs", "latest"), [run_id])
     print(text)
@@ -1151,6 +1162,14 @@ def cmd_mark(args):
         raise RuntimeError(f"the deterministic scan found {likely} likely real secret(s) in this range. A push can't "
                            "be unlocked until each is removed from history and rotated, or the owner confirms they "
                            "are not credentials (pass --secrets-cleared).")
+    # A secret scan cut short by its time budget can't vouch for the range: only the owner can let it pass.
+    incomplete = prepared.get("scan_incomplete") == "1" and prepared.get("mode") != "worktree"
+    if args.verdict in ("pass", "warn") and incomplete and not args.scan_incomplete_accepted:
+        part = ("neither the whole history nor all files at HEAD were" if prepared.get("head_scan_incomplete") == "1"
+                else "the files at HEAD were, but not the whole history was")
+        raise RuntimeError(f"the deterministic secret scan ran out of time: {part} scanned. Run gitleaks over the "
+                           "full history, then pass --scan-incomplete-accepted if the owner confirms it is clean, or "
+                           "record `block` / `accepted`.")
     lines = [
         f"head={head}",
         f"base={prepared.get('base', '')}",
@@ -1165,6 +1184,9 @@ def cmd_mark(args):
         lines.append(f"report={clean_value(store_report(sdir, run_id, head, args.report))}")
     if args.note:
         lines.append("note=" + clean_value(args.note)[:300])
+    if incomplete:
+        lines.append(f"scan_incomplete={'head' if prepared.get('head_scan_incomplete') == '1' else 'history'}"
+                     + ("+accepted" if args.scan_incomplete_accepted else ""))
     with open(os.path.join(sdir, "history.log"), "a", encoding="utf-8") as fh:
         fh.write(" | ".join(lines) + "\n")
     if prepared.get("mode") == "worktree":
@@ -1929,6 +1951,8 @@ def main():
                    help="owner chose not to run the brief's blocking checks for this review")
     m.add_argument("--secrets-cleared", action="store_true",
                    help="owner confirms the scan's likely secrets are not credentials (or were removed and rotated)")
+    m.add_argument("--scan-incomplete-accepted", action="store_true",
+                   help="owner confirms the range is free of secrets although the secret scan ran out of time")
     sub.add_parser("status")
     t = sub.add_parser("trust-brief", help="approve the current .ravenwatch.md (owner only)")
     t.add_argument("--private", action="store_true", help="also git-ignore .ravenwatch.md for this clone")

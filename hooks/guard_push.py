@@ -152,6 +152,8 @@ DECLARERS = {"export", "declare", "typeset", "readonly", "local", "set", "unset"
 UNKNOWN_ASSIGN = re.compile(r"(?:^|[\s;&|(])(?:read|mapfile|readarray|getopts)\b[^\n;&|]*")
 ASSIGNMENT = re.compile(r"(?:^|[\s;&|(])(?:(?:export|declare|typeset|readonly|local)\s+(?:-\w+\s+)*)?"
                         r"([A-Za-z_][A-Za-z0-9_]*)=(\$\([^)]*\)|`[^`]*`|\"[^\"]*\"|'[^']*'|[^\s;&|()<>]*)")
+# What may follow a complete shell word (an assignment value ends there).
+WORD_END = ("", " ", "\t", "\n", ";", "&", "|", "(", ")", "<", ">")
 FOR_LOOP = re.compile(r"\bfor\s+([A-Za-z_][A-Za-z0-9_]*)\s+in\s+([^;\n]*)")
 MKTEMP = re.compile(r"^\$\(\s*mktemp\b([^)`]*)\)$")
 TMPDIR_REF = re.compile(r"\$\{?TMPDIR(?::?-[^}]*)?\}?")
@@ -174,7 +176,7 @@ def quoting(command):
     """Walk a command the way the shell's quoting does. Yields (index, context) before each character and
     once more at the end, where context is None (plain), "'", '"', "$'" (ANSI-C), "#" (comment) or "\\"
     (escaped). `$(…)` and backticks start a fresh context, even inside double quotes. The one quote
-    scanner: segments() aside, everything that asks "is this quoted?" uses it."""
+    scanner: everything that asks "is this quoted?", segments() included, uses it."""
     # Each stack level: [open quote char or None, what opened the level: None (top), "$(" , "(" or "`"].
     # A plain unquoted "(" opens its own level, so only the ")" that matches "$(" pops the substitution —
     # a subshell's or case pattern's ")" closes its own "(" level instead.
@@ -383,34 +385,26 @@ def git_dir_of(path):
 def segments(command):
     """Split a command into simple commands, each (tokens, redirect targets, the separator after it),
     honouring quotes, comments and line continuations like the shell does. None if it can't be parsed."""
-    # last_escaped: index in out of the last backslash-escaped character (`a\ #` is one word, not a comment).
-    out, quote, escaped, i, n, last_escaped = [], None, False, 0, len(command), -1
-    while i < n:
+    # Comments, line continuations, separating newlines and literal `$`/backticks are decided by quoting(),
+    # the guard's one quote scanner; shlex then splits the words.
+    out, last = [], -1
+    walk = list(quoting(command))
+    for (i, context), (_, after) in zip(walk, walk[1:]):
+        out.extend(command[last + 1:i])  # the `(` of `$(` and the `'` of `$'`, which quoting() steps over
+        last = i
         ch = command[i]
-        if escaped:
-            escaped = False
-            last_escaped = len(out)
-        elif ch == "\\" and quote != "'":
-            if command[i + 1:i + 2] == "\n":  # line continuation: the shell joins the lines
-                i += 2
-                continue
-            escaped = True
-        elif quote:
-            if ch == quote:
-                quote = None
-            elif quote == "'" and ch in LITERAL:
-                ch = LITERAL[ch]  # `$` and backticks in single quotes are text, never an expansion
-        elif ch in "'\"":
-            quote = ch
-        elif ch == "#" and (not out or (out[-1] in " \t;&|()" and last_escaped != len(out) - 1)):
-            i = command.find("\n", i)  # a comment runs to the end of its line only
-            if i < 0:
-                break
+        if context == "#" or (ch == "#" and context is None and after == "#"):  # the `#` that opens it too
+            if ch == "\n":
+                out.append(";")  # a comment runs to the end of its line only; the newline still separates
             continue
-        elif ch == "\n":
+        if context == "\\" and ch == "\n":
+            out.pop()  # line continuation: the shell joins the lines (drop the backslash too)
+            continue
+        if context in ("'", "$'") and ch in LITERAL:
+            ch = LITERAL[ch]  # `$` and backticks in single quotes are text, never an expansion
+        elif context is None and ch == "\n":
             ch = ";"  # unquoted newlines separate commands
         out.append(ch)
-        i += 1
     lexer = shlex.shlex("".join(out), posix=True, punctuation_chars=True)
     lexer.whitespace_split = True
     lexer.commenters = ""
@@ -492,6 +486,16 @@ def shell_vars(command, cwd):
 
     for m in ASSIGNMENT.finditer(command):
         raw = m.group(2)
+        # The value is known only when the match is the whole word: `X='/r'/.git` or `X=$(mktemp -d)/..` go on
+        # after the quote or `)`, and quotes or backslashes inside a bare word (`X=/r/.gi''t`) are removed by
+        # the shell, not by this reading.
+        bare = not raw.startswith(("'", '"', "`", "$("))
+        if command[m.end(2):m.end(2) + 1] not in WORD_END or (bare and any(ch in raw for ch in "'\"\\")):
+            add(m.group(1), None)
+            continue
+        if raw.startswith('"') and any(ch in raw[1:-1] for ch in "\\`"):
+            add(m.group(1), None)  # escapes or command output inside double quotes
+            continue
         if raw.startswith("'") and raw.endswith("'") and len(raw) >= 2:
             add(m.group(1), [raw[1:-1]])
             continue
@@ -675,6 +679,8 @@ def touches_git_dir(bases, words, protect_plugin=False, variables=None, writes=F
             for p in paths:
                 if git_dir_of(p) and not REPORTS_PATH.search(p):
                     return w, "git"
+                if writes and GITCONFIG_FILE.search(p):
+                    return w, "config"
                 if protect_plugin and under_plugin(p):
                     return w, "plugin"
     return None
@@ -689,6 +695,9 @@ def path_refusal(word, kind):
         return (f"the guard can't tell where `{word}` points (a variable set from command output, `read`, a "
                 "loop, or not set at all), and this command writes there or names git internals. Use a literal "
                 "path or a literal file list (`for f in a.md b.md`), or the Edit tool for in-place edits.")
+    if kind == "config":
+        return (f"`{word}` is a git config file; changes there (aliases, hooks path, includes) could skip or redirect "
+                "the review hook. Ask the owner to make the change.")
     if kind == "lost":
         return (f"the guard can't tell which directory `{word}` is in, because an earlier `cd` uses a variable, an "
                 "option or `-`. Use absolute paths, or `cd` to a plain absolute path first.")
@@ -907,15 +916,17 @@ def check_bash(command, cwd):
         is_push = sub == "push"
         for repo in repos if not is_push and sub else []:
             # Follow aliases of aliases (`aa = bb`, `bb = push`) a few levels deep.
-            name, seen_names = sub, set()
+            name, seen_names, resolved = sub, set(), False
             while len(seen_names) < 5 and name not in seen_names:
                 seen_names.add(name)
                 value = alias_of(repo, name)
                 if value is None:
+                    resolved = True
                     break
                 if value.startswith("!"):
                     if may_push(value):
                         return f"`git {sub}` is a shell alias that pushes, which the gate cannot check. Run `git push` directly."
+                    resolved = True
                     break
                 why = bypass_reason(value)
                 if why:
@@ -928,8 +939,11 @@ def check_bash(command, cwd):
                     if aglobs:
                         return (f"`git {sub}` expands to `{value}`, a push with git options (-c, -C …) the gate "
                                 "cannot check. Run `git push` directly.")
-                    is_push, args = True, aargs + args
+                    is_push, args, resolved = True, aargs + args, True
                     break
+            if not resolved:
+                return (f"`git {sub}` is an alias chain too deep (or looping) for the gate to follow, so it could "
+                        "hide a push that skips the hook. Run the git command it stands for directly.")
         if not is_push:
             if sub in RUNS_COMMANDS and may_push(seg_text):
                 # e.g. `git submodule foreach git push`, `git rebase --exec "git push"`
