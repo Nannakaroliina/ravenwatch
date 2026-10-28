@@ -327,14 +327,18 @@ class TooManyMatches(Exception):
     pass
 
 
+class UnreadablePattern(Exception):
+    """A pattern Python's glob can't read, though a shell may still expand it."""
+
+
 def glob_existing(pattern):
     """Matches of a pattern; if none, the pattern's leading directories that do match, with the rest
     appended literally (the path that would be created there)."""
     found = []
     try:
         matches = list(itertools.islice(glob.iglob(pattern), GLOB_LIMIT + 1))  # stop at the limit, like before
-    except (re.error, ValueError, OSError):
-        return []  # not a pattern glob can read (a regex such as `[z-a]`): the word is a literal path
+    except (re.error, ValueError) as exc:
+        raise UnreadablePattern(pattern) from exc  # the caller decides: refuse a write, ignore a read
     for path in matches:
         found.append(path)
         if len(found) > GLOB_LIMIT:
@@ -345,9 +349,20 @@ def glob_existing(pattern):
     return [os.path.join(d, name) for d in glob_existing(parent)]
 
 
+def safe_expand(base, target):
+    """expand(), with a pattern glob can't read giving no paths."""
+    try:
+        return expand(base, target)
+    except UnreadablePattern:
+        return None
+
+
 def resolve(base, target):
     """The single directory a `cd` target refers to, or None if it is unknowable or ambiguous."""
-    paths = expand(base, target)
+    try:
+        paths = expand(base, target)
+    except UnreadablePattern:
+        return None
     return paths[0] if paths is not None and len(paths) == 1 else None
 
 
@@ -376,6 +391,10 @@ def touches_git_dir(bases, words, protect_plugin=False, writes=False, check_lost
                 paths = expand(base, w) or []
             except TooManyMatches:
                 return w, "many"
+            except UnreadablePattern:
+                if writes:
+                    return w, "pattern"
+                continue  # a read: a regex such as `grep '[z-a]'` is just text
             for p in paths:
                 if git_dir_of(p) and not REPORTS_PATH.search(p):
                     return w, "git"
@@ -390,6 +409,9 @@ def path_refusal(word, kind):
     if kind == "many":
         return (f"`{word}` matches more than {GLOB_LIMIT} paths, too many for the guard to check. Use a narrower "
                 "pattern or name the files.")
+    if kind == "pattern":
+        return (f"the guard can't read the pattern in `{word}`, and this command writes there. Write the path "
+                "out.")
     if kind == "config":
         return (f"`{word}` is a git config file; changes there (aliases, hooks path, includes) could skip or redirect "
                 "the review hook. Ask the owner to make the change.")
@@ -475,6 +497,11 @@ CAT_SUBST_START = re.compile(r"\$\([ \t]*cat[ \t]+<<(-?)[ \t]*(['\"])(\w+)\2[ \t
 # Downloads named after the URL in the current directory (curl -O, wget without -O), or by the server.
 NAMED_BY_URL = {"curl": {"-O", "--remote-name", "--remote-name-all"}, "wget": set()}
 NAMED_BY_SERVER = {"curl": {"-J", "--remote-header-name"}, "wget": {"--content-disposition", "--trust-server-names"}}
+# Options that make a URL-named download land somewhere else or under other names.
+UNMODELLED_DOWNLOAD = {"curl": {"--output-dir", "--create-dirs", "-K", "--config"},
+                       "wget": {"-r", "--recursive", "-m", "--mirror", "-p", "--page-requisites", "-i",
+                                "--input-file", "-x", "--force-directories", "-e", "--execute", "-B", "--base",
+                                "--cut-dirs", "-nH", "--no-host-directories"}}
 # A heredoc (`<<'EOF'`, `<<-"EOF"`, `<<EOF`, but not `<<<`). With a quoted delimiter its body is never
 # expanded; with a bare one, only a body free of `$`, backticks and backslashes counts as plain text.
 DATA_HEREDOC = re.compile(r"<<(-?)[ \t]*(['\"]?)(\w+)\2(?=[\s;&|<>]|$)")
@@ -790,10 +817,16 @@ def downloaded_names(head, args):
         return []
     if head == "wget" and has({"-O", "--output-document"}):
         return []
+    # Only the simplest form is modelled: a download named after a full URL, in the current directory or
+    # wget's -P. Anything that changes where or under which names files land is refused instead.
+    if has(UNMODELLED_DOWNLOAD[head]):
+        return None
+    words = [a for a in args if not a.startswith("-")]
+    if not words or any(not re.match(r"(?i)[a-z][a-z0-9+.-]*://[^\s{}\[\]]*$", w) for w in words):
+        return None  # a word that isn't a plain URL (no scheme, URL globbing, an option's value): can't tell
     prefix = (option_values(args, {"-P", "--directory-prefix"}) or [""])[-1] if head == "wget" else ""
-    urls = [a for a in args if re.match(r"(?i)[a-z][a-z0-9+.-]*://", a)]
     return [os.path.join(prefix, re.sub(r"[?#].*", "", u).rstrip("/").rsplit("/", 1)[-1] or "index.html")
-            for u in urls]
+            for u in words]
 
 
 def reads_code_from_stdin(seg):
@@ -967,7 +1000,7 @@ def check_bash(command, cwd, depth=0):
             continue
         args = seg[1:]
         if PYTHONS.match(head) and args and all(
-                os.path.realpath(p) == HELPER for b in heres for p in (expand(b, args[0]) or [""])):
+                os.path.realpath(p) == HELPER for b in heres for p in (safe_expand(b, args[0]) or [""])):
             refusal = helper_refusal()
             if refusal:
                 return refusal
@@ -985,8 +1018,9 @@ def check_bash(command, cwd, depth=0):
                 # in the current directory; ones the server names can't be checked.
                 named = downloaded_names(head, args)
                 if named is None:
-                    return (f"`{head}` would save a file under a name the server chooses, which the guard can't "
-                            "check. Give the file name with `-o`/`-O <file>`.")
+                    flag = "-o <file>" if head == "curl" else "-O <file>"
+                    return (f"`{head}` would save files under names or in places the guard can't work out. Give "
+                            f"the file name with `{flag}` (and a full `https://` URL).")
                 word = (touches_git_dir(heres, option_values(args, OUTPUT_OPTS[head]) + named, protect, writes=True)
                         or touches_git_dir(heres, args, protect, writes=False))
             else:
@@ -1118,13 +1152,9 @@ def risky_on_failure(command, target):
     could write somewhere, names git internals or the plugin, or uses shell features. Never unrelated tools."""
     if command is None:  # Write/Edit: only git-looking or plugin paths
         return bool(re.search(r"(?i)\.git\b|ravenwatch|hooks", target))
-    # Command names (the first word wherever a command could start) may be globs; other words count only
-    # as plain names (`grep '[z-a]' f` is a read).
-    heads = [p.split()[0].strip("'\"") for p in re.split(r"[;&|\n(){}`]|\$\(", command) if p.split()]
-    words = [w.strip("'\"") for w in command.split()]
-    return may_push(command) or any(dangerous_program(h) for h in heads) or \
-        any(dangerous_program(w) for w in words if not GLOB_CHARS.search(w)) or \
-        bool(re.search(r"[>$`]|\.git|ravenwatch|hooks", command, re.I))
+    words = [re.sub(r"[\"'\\]", "", w) for w in command.split()]
+    return may_push(command) or any(dangerous_program(w) for w in words) or \
+        bool(re.search(r"[*?\[>$`(){}#\\]|\.git|ravenwatch|hooks", command, re.I))
 
 
 def _too_slow(signum, frame):

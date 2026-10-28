@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.3 — 2026-10-28
+
+Fixes from the review of 0.5.2, two of them regressions in 0.5.2 itself.
+
+- Guard:
+  - When the checks fail (time limit or crash), the fallback is as strict as before 0.5.2 again: glob characters and other shell features count, and program names are read without quotes or backslashes. (0.5.2 narrowed it to stop refusing searches like `grep '[z-a]'`; that search no longer crashes the checks, so the narrowing isn't needed.)
+  - A pattern Python's glob can't read is refused where the command writes (the shell may still expand it), and only treated as plain text for reads. 0.5.2 treated it as a literal path everywhere.
+  - Downloads named by URL are only allowed in their simplest form: a full `https://`-style URL saved into the current directory (or wget's `-P`). Anything else that names or places files — server-chosen names, curl `--output-dir`/`--create-dirs`/`-K`, wget recursive, mirror, input-file and `-e` modes, URLs without a scheme or with URL globbing — is refused with a pointer to `-o`/`-O <file>`.
+- Review skill: the accept-risk step says when `--secrets-cleared` / `--scan-incomplete-accepted` are needed.
+- Tests: `tests/round16.sh` extended.
+
 ## 0.5.2 — 2026-10-28
 
 Fixes from the review of 0.5.1.

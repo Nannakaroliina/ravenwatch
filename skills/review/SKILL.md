@@ -193,6 +193,8 @@ If the verdict is BLOCK and the owner explicitly says they accept the risk and w
 python3 ${CLAUDE_PLUGIN_ROOT}/scripts/ravenwatch.py mark --verdict accepted --run <run id> --report <stored report path from the earlier mark output or status> --note "<owner's reason, or 'accepted by owner'>"
 ```
 
+If the run's scan found `LIKELY REAL` secrets or ran out of time, ask the owner the specific questions from step 6 first and add `--secrets-cleared` / `--scan-incomplete-accepted` only on their own answer; `accepted` alone is refused then.
+
 Write the note in plain words without the characters `; & | < > $ \` or backticks (the push gate only lets a plain call of the helper through).
 
 Do not accept risk on behalf of the owner for a confirmed live credential; insist on rotation first and say why.
