@@ -39,7 +39,8 @@ bash_gate() { # expect cwd command [text the reason must contain]
   cmd=$(python3 -c 'import json,sys; print(json.dumps({"command":sys.argv[1]}))' "$3")
   tool_gate "$1" "$2" "$cmd" Bash
   if [ $# -ge 4 ] && [ "$1" = deny ]; then
-    echo "$out" | grep -q -- "$4" && ok || bad "reason for '$3' lacks '$4': $out"
+    # Since 0.5.0 a command that isn't plain gets one refusal for every reason: it counts for any of them.
+    echo "$out" | grep -q -e "$4" -e "must be plain" && ok || bad "reason for '$3' lacks '$4': $out"
   fi
 }
 rwq() { python3 "$RV" "$@" >/dev/null 2>&1; }

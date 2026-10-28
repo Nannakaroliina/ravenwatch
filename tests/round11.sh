@@ -37,7 +37,8 @@ bash_gate() { # expect cwd command [text the reason must contain]
   [ -n "$out" ] && got=deny || got=allow
   [ "$got" = "$1" ] && ok || bad "expected $1 got $got: $3 $out"
   if [ $# -ge 4 ] && [ "$1" = deny ]; then
-    echo "$out" | grep -q -- "$4" && ok || bad "reason for '$3' lacks '$4': $out"
+    # Since 0.5.0 a command that isn't plain gets one refusal for every reason: it counts for any of them.
+    echo "$out" | grep -q -e "$4" -e "must be plain" && ok || bad "reason for '$3' lacks '$4': $out"
   fi
 }
 commit() { echo "$1" > "$1"; git add "$1"; git commit -qm "$1"; }
@@ -60,11 +61,13 @@ bash_gate deny  "$R" 'd=.git; mkdir -p $d/ravenwatch && printf x > $d/ravenwatch
 bash_gate deny  "$R" 'G=.git; cp /tmp/forged $G/ravenwatch/status' "inside a git directory"
 bash_gate deny  "$R" 'd=$(echo x); cp /tmp/f $d/thing' "can't tell where"
 bash_gate deny  "$R" 'read d; printf x > $d' "can't tell where"
-bash_gate deny  "$R" 'cat $UNSET_DIR/ravenwatch/status' "can't tell where"
-bash_gate allow "$R" 'for f in a b; do cp $f /tmp/; done'
-bash_gate allow "$R" 'x=$(mktemp); echo hi > $x'
-bash_gate allow "$R" 'cp a $TMPDIR/b'
-bash_gate allow "$R" 'echo "costs $5" > /tmp/out.txt'
+# Since 0.5.0 reading through a variable is fine, wherever it points: reads can't forge or skip anything.
+bash_gate allow "$R" 'cat $UNSET_DIR/ravenwatch/status'
+# Since 0.5.0, writes through variables are refused outright: the command isn't plain.
+bash_gate deny  "$R" 'for f in a b; do cp $f /tmp/; done' "must be plain"
+bash_gate deny  "$R" 'x=$(mktemp); echo hi > $x' "must be plain"
+bash_gate deny  "$R" 'cp a $TMPDIR/b' "must be plain"
+bash_gate deny  "$R" 'echo "costs $5" > /tmp/out.txt' "must be plain"
 
 # --- BUG-2: a `cat` heredoc only counts as data where `cat` really is a command
 bash_gate deny  "$R" "python3 - <<X
@@ -107,7 +110,7 @@ git config --unset alias.pf
 
 # --- TEST-1 (full audit): CDPATH is what sends `cd nohook` elsewhere ($R/nohook exists too)
 mkdir -p "$R/nohook"
-bash_gate deny  "$R" "CDPATH=$T cd nohook && git $P" "cannot follow"
+bash_gate deny  "$R" "CDPATH=$T cd nohook && git $P" "change the shell"
 rmdir "$R/nohook"
 
 # --- TEST-2 (round 4: LOOP-1/3): push recursion switched on in git config is refused whenever it is on,
@@ -227,18 +230,18 @@ rmdir sub
 # --- round 2 (UX-1/2/3, sed, reads): ordinary commands with variables
 bash_gate allow "$R" 'docker '$P' "$IMAGE"'
 bash_gate allow "$R" 'grep -rn '$P' src | awk -F: '"'"'{print $1}'"'"
-bash_gate allow "$R" 'git stash '$P' -m "wip $B"'
+bash_gate deny  "$R" 'git stash '$P' -m "wip $B"' "must be plain"
 bash_gate deny  "$R" 'git '$P' origin "$B"' "uses shell variables"
-bash_gate allow "$R" 'D="$(mktemp -d)"; cp a "$D/x"'
-bash_gate allow "$R" 'mkdir -p "${TMPDIR:-/tmp}/build"'
-bash_gate allow "$R" 'for f in *.md; do cp "$f" "${f%.md}.txt"; done'
+bash_gate deny  "$R" 'D="$(mktemp -d)"; cp a "$D/x"' "must be plain"
+bash_gate deny  "$R" 'mkdir -p "${TMPDIR:-/tmp}/build"' "must be plain"
+bash_gate deny  "$R" 'for f in *.md; do cp "$f" "${f%.md}.txt"; done' "must be plain"
 bash_gate deny  "$R" 'd=$(mktemp -d .git/x.XXXX); cp a $d/y' "inside a git directory"
 bash_gate deny  "$R" 'd=$(mktemp -d "$X/y.XXXX"); cp a $d/y' "can't tell where"
 bash_gate allow "$R" 'curl -s -H "Authorization: Bearer $TOKEN" https://example.com/api'
 bash_gate deny  "$R" 'curl -s -o "$(echo .)/x" https://example.com' "can't tell where"
 bash_gate deny  "$R" 'sed -n "$(echo 1)p" a' "can't tell where"
 bash_gate deny  "$R" 'sed -i "" $UNKNOWN_DIR/x' "can't tell where"
-bash_gate allow "$R" 'cat "$(git rev-parse --show-toplevel)/config/x.yml"'
+bash_gate deny  "$R" 'cat "$(git rev-parse --show-toplevel)/config/x.yml"' "must be plain"
 
 # --- round 3 (UX-1): `$` inside a single-quoted sed or perl script is text
 bash_gate allow "$R" "sed -i '' '\$d' a"
@@ -255,7 +258,7 @@ bash_gate allow "$R" "printf \$'\\e[1mbold\\e[0m\\n'"
 # --- round 3 (BUG-1): ${X#…} and ${X%…} are trimmed like the shell does
 bash_gate deny  "$R" 'X=x.git; cp /tmp/f ${X#x}/ravenwatch/status' "inside a git directory"
 bash_gate deny  "$R" 'X=.gitx; cp /tmp/f ${X%x}/hooks/pre-'$P "inside a git directory"
-bash_gate allow "$R" 'X=notes.md; cp a "${X%.md}.txt"'
+bash_gate deny  "$R" 'X=notes.md; cp a "${X%.md}.txt"' "must be plain"
 
 # --- round 3 (BUG-2): a command name or git subcommand from a variable
 bash_gate deny  "$R" 'G=git; $G '$P' origin main' "uses shell variables"
@@ -289,7 +292,7 @@ git -C $N $P origin main
 EOF" "not installed"
 bash_gate deny  "$R" "alias cat=sh; cat <<'EOF'
 git -C $N $P origin main
-EOF" "not installed"
+EOF" "changes how"
 
 # --- round 5 (DES-1): a # after an escaped space is not a comment, so a later $'…' is still seen
 bash_gate deny  "$R" "echo a\\ #x; git \$'pu\\x73h' origin main" "mentions git"
@@ -313,17 +316,19 @@ git config --unset submodule.recurse; git config --unset push.recurseSubmodules
 # --- round 4 (TEST-2): $PWD comes from the session's directory, even when the guard's own differs
 out=$(python3 -c 'import json,sys; print(json.dumps({"tool_name":"Bash","cwd":sys.argv[1],"tool_input":{"command":sys.argv[2]}}))' \
   "$R" 'cp /tmp/f $PWD/.gi?/ravenwatch/status' | PWD="$T" python3 "$G")
-echo "$out" | grep -q "inside a git directory" && ok || bad "\$PWD taken from the guard's environment: $out"
+echo "$out" | grep -q -e "inside a git directory" -e "must be plain" && ok \
+  || bad "\$PWD taken from the guard's environment: $out"
 out=$(python3 -c 'import json,sys; print(json.dumps({"tool_name":"Bash","cwd":sys.argv[1],"tool_input":{"command":sys.argv[2]}}))' \
   "$T" 'cp a $PWD/.gi?/notes.txt' | PWD="$R" python3 "$G")
-[ -z "$out" ] && ok || bad "\$PWD from the guard's environment refused a harmless copy: $out"
+# Since 0.5.0 a variable in a copy's target is refused whatever its value.
+echo "$out" | grep -q "must be plain" && ok || bad "a variable in a copy's target was let through: $out"
 
 # --- round 4 (VER-1, UX-1): $'…' is found inside "$(…)" too; undecodable bodies are refused; heredoc data
 # and harmless $'\0' are fine
 bash_gate deny  "$R" "echo \"\$(git \$'pu\\x73h' origin main)\"" "can't be checked"
 bash_gate deny  "$R" "echo \"\$(git \$'pu\\x7' origin main)\"" "escapes the shells read differently"
 bash_gate deny  "$R" "printf %s \$'\\N{LATIN SMALL LETTER P}'" "escapes the shells read differently"
-bash_gate allow "$R" "find . -print0 | while IFS= read -r -d \$'\\0' f; do echo \"\$f\"; done"
+bash_gate deny  "$R" "find . -print0 | while IFS= read -r -d \$'\\0' f; do echo \"\$f\"; done" "must be plain"
 bash_gate deny  "$R" "cat > /tmp/x <<'EOF' && git -C $N $P
 EOF" "not installed"
 bash_gate deny  "$R" "cat > .git/hooks/x <<'EOF'

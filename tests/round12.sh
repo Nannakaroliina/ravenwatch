@@ -35,7 +35,8 @@ bash_gate() { # expect cwd command [text the reason must contain]
   [ -n "$out" ] && got=deny || got=allow
   [ "$got" = "$1" ] && ok || bad "expected $1 got $got: $3 $out"
   if [ $# -ge 4 ] && [ "$1" = deny ]; then
-    echo "$out" | grep -q -- "$4" && ok || bad "reason for '$3' lacks '$4': $out"
+    # Since 0.5.0 a command that isn't plain gets one refusal for every reason: it counts for any of them.
+    echo "$out" | grep -q -e "$4" -e "must be plain" && ok || bad "reason for '$3' lacks '$4': $out"
   fi
 }
 k=AKIA  # credential-like fixtures are built from split pieces
@@ -47,11 +48,11 @@ bash_gate deny  "$R" "X=\$HOME'/../r/.git'; cp evil \"\$X/hooks/pre-$P\"" "can't
 bash_gate deny  "$R" "X=\$(mktemp -d)/../../../..$R/.git; cp evil \"\$X/hooks/pre-$P\"" "can't tell where"
 bash_gate deny  "$R" "X=$R/.gi''t; cp evil \"\$X/hooks/pre-$P\"" "can't tell where"
 bash_gate deny  "$R" "X=\"$R/.gi\\t\"; cp evil \"\$X/hooks/pre-$P\"" "can't tell where"
-# Whole-word values are still followed, both ways.
+# Since 0.5.0 no variable value is followed: a write through any variable is refused.
 bash_gate deny  "$R" "X='$R/.git'; cp evil \"\$X/hooks/pre-$P\"" "inside a git directory"
-bash_gate allow "$R" "X='/tmp/a b'; cp f \"\$X/c\""
-bash_gate allow "$R" "D=\$(mktemp -d); cp f \"\$D/c\""
-bash_gate allow "$R" "X=/tmp/x; cp f \$X/c"
+bash_gate deny  "$R" "X='/tmp/a b'; cp f \"\$X/c\"" "must be plain"
+bash_gate deny  "$R" "D=\$(mktemp -d); cp f \"\$D/c\"" "must be plain"
+bash_gate deny  "$R" "X=/tmp/x; cp f \$X/c" "must be plain"
 
 # --- SEC-1: an alias chain the guard can't follow to its end, and Bash writes to git config files
 git config alias.a1 a2; git config alias.a2 a3; git config alias.a3 a4; git config alias.a4 a5
@@ -67,18 +68,20 @@ bash_gate deny  "$R" "printf x | tee -a $HOME/.config/git/config" "git config fi
 bash_gate deny  "$R" "cp evil ~/.gitconfig" "git config file"
 bash_gate allow "$R" "cat ~/.gitconfig"
 
-# --- DES-1: segments() takes comments, continuations and literal `$` from quoting()
-python3 - "$RW/hooks" <<'EOF' && ok || bad "segments()"
+# --- DES-1 (0.5.0): only plain commands are parsed; escapes, `$(…)` and odd comments make a command not plain
+python3 - "$RW/hooks" <<'EOF' && ok || bad "plain commands and segments()"
 import sys; sys.path.insert(0, sys.argv[1]); import guard_push as g
-cases = {
-    "echo a\\ #x; git status": [["echo", "a #x"], ["git", "status"]],
-    "echo hi # c\ngit status": [["echo", "hi"], ["git", "status"]],
-    "echo hi #": [["echo", "hi"]],
-    "echo a#b": [["echo", "a#b"]],
-    "ls \\\n -la": [["ls", "-la"]],
-    "echo \"$(echo 'a$b')\"": [["echo", "$(echo 'a" + g.LITERAL["$"] + "b')"]],
-}
-bad = {c: [s[0] for s in g.segments(c)] for c in cases if [s[0] for s in g.segments(c)] != cases[c]}
+not_plain = ["echo a\\ #x; git status", "ls \\\n -la", "echo \"$(echo 'a$b')\"", "echo `ls`", "(cd x)",
+             "echo {a,b}", "echo \"$HOME\"", "cat <<EOF\n$x\nEOF", "cp e =(x)", "echo ~+/x", "echo # don't"]
+plain = {"echo hi # c\ngit status": [["echo", "hi"], ["git", "status"]], "echo hi #": [["echo", "hi"]],
+         "echo a#b": [["echo", "a#b"]], "echo 'a$b' \"c d\"": [["echo", "a$b", "c d"]],
+         "find . -exec grep -l x {} +": [["find", ".", "-exec", "grep", "-l", "x", "{}", "+"]]}
+bad = [c for c in not_plain if not g.plain_problem(g.strip_inert_comments(c))]
+for c, want in plain.items():
+    text = g.strip_inert_comments(c)
+    got = None if g.plain_problem(text) else [s[0] for s in g.segments(text)]
+    if got != want:
+        bad.append((c, got))
 sys.exit(print(bad) or 1 if bad else 0)
 EOF
 

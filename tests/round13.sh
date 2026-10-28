@@ -37,7 +37,8 @@ bash_gate() { # expect cwd command [text the reason must contain]
   [ -n "$out" ] && got=deny || got=allow
   [ "$got" = "$1" ] && ok || bad "expected $1 got $got: $3 $out"
   if [ $# -ge 4 ] && [ "$1" = deny ]; then
-    echo "$out" | grep -q -- "$4" && ok || bad "reason for '$3' lacks '$4': $out"
+    # Since 0.5.0 a command that isn't plain gets one refusal for every reason: it counts for any of them.
+    echo "$out" | grep -q -e "$4" -e "must be plain" && ok || bad "reason for '$3' lacks '$4': $out"
   fi
 }
 
@@ -54,12 +55,10 @@ bash_gate deny  "$R" "(#'
 X=$R/.gi; cp evil \"\${X}t/hooks/pre-$P\"
 #'
 )" "inside a git directory"
-# … but after the `)` of `$(…)` the word goes on.
-python3 - "$RW/hooks" <<'EOF' && ok || bad "segments() and comments after ( ) \$("
+# … (0.5.0: such commands aren't plain, so they are never parsed at all).
+python3 - "$RW/hooks" <<'EOF' && ok || bad "( ) and \$( make a command not plain"
 import sys; sys.path.insert(0, sys.argv[1]); import guard_push as g
-segs = [s[0] for s in g.segments("(#'\necho hi\n#'\n)")]
-toks = [t for s in g.segments("echo $(echo a)#b") for t in s[0]]
-sys.exit(0 if ["echo", "hi"] in segs and "#b" in "".join(toks) else print(segs, toks) or 1)
+sys.exit(0 if all(g.plain_problem(c) for c in ("(#'\necho hi\n#'\n)", "echo $(echo a)#b", "true <(:)#x")) else 1)
 EOF
 
 # --- BUG-2 / SEC-1: a variable the guard can't follow counts as unknown, so writes through it are refused
@@ -75,12 +74,12 @@ bash_gate deny  "$R" "unset HOME; cp evil \"\$HOME/x\"" "can't tell where"
 bash_gate deny  "$R" "TMPDIR=$R/.git; D=\$(mktemp -d); cp evil \"\$D/../hooks/pre-$P\"" "can't tell where"
 bash_gate deny  "$R" "D=\$(mktemp -d -p $R/.gi); cp evil \"\$D/../hooks/pre-$P\"" "can't tell where"
 bash_gate deny  "$R" "D=\$(mktemp -d /etc/x.XXXX); cp evil \"\$D/y\"" "can't tell where"
-# Literal values, the environment and plain temp dirs are still followed.
-bash_gate allow "$R" "X=/tmp/a; cp f \"\$X/b\""
-bash_gate allow "$R" "D=\$(mktemp -d); cp f \"\$D/b\""
-bash_gate allow "$R" "D=\$(mktemp -d \"\$TMPDIR/x.XXXX\"); cp f \"\$D/b\""
-bash_gate allow "$R" "cp f \"\$HOME/b\""
-bash_gate allow "$R" "for f in a.md b.md; do cp \$f /tmp/\$f; done"
+# Since 0.5.0 no variable is followed at all: writes through any of them are refused.
+bash_gate deny  "$R" "X=/tmp/a; cp f \"\$X/b\"" "must be plain"
+bash_gate deny  "$R" "D=\$(mktemp -d); cp f \"\$D/b\"" "must be plain"
+bash_gate deny  "$R" "D=\$(mktemp -d \"\$TMPDIR/x.XXXX\"); cp f \"\$D/b\"" "must be plain"
+bash_gate deny  "$R" "cp f \"\$HOME/b\"" "must be plain"
+bash_gate deny  "$R" "for f in a.md b.md; do cp \$f /tmp/\$f; done" "must be plain"
 bash_gate allow "$R" "echo hi # (a comment)"
 
 # --- BUG-3: options in the middle of an alias chain count

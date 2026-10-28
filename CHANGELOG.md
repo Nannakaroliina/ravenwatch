@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.5.0 — 2026-10-28
+
+The Claude guard no longer tries to work out what shell variables, substitutions and comments do. Four review rounds in a row found a new way around that guesswork, and some of the fixes opened the next one. It now parses only **plain** commands, and refuses anything else that could matter.
+
+**Upgrade:** re-run /ravenwatch:install-git-hook in each gated repository. **Behaviour change:** some commands Claude could run before are now refused (see the README "Limits" section): writes or git commands that use variables, `$(…)`, backticks, subshells or braces. Claude is told to write the values out, split the command or use the Write/Edit tools.
+
+- Guard:
+  - Plain commands (literal words, quoted strings without `$`/backticks/backslashes in double quotes, operators, plain-word comments, heredocs with plain bodies, and Claude Code's `-m "$(cat <<'EOF' … EOF)"` commit messages) get every check as before, on an exact parse.
+  - Any other command is let through only when its text can't touch git, write a file, run other code or change the environment; otherwise it gets one refusal saying how to rewrite it. Reads through variables (`echo $HOME`, `cat "$F"`) keep working.
+  - Gone: the variable tracking (`shell_vars`, `expand_vars`, `${X%…}` trimming, the `$(mktemp)` rules) and the comment and quote special cases in the old scanner. This closes the round-7 findings (a `#` after a backtick or `<(…)` hiding the rest of the line) and every earlier variant of them.
+  - The plugin's own helper gets no shortcut any more: its arguments are checked like any other command's, so zsh glob qualifiers (`*(e:…:)`) or `=(…)` can't run code through it.
+  - A push can't come with `export`/`NAME=` changes in the same command (`HOME=/tmp/x git push` reads another gitconfig), or from text fed to a shell or interpreter (`cat <<EOF | sh`, `printf 'git push' | sh`).
+  - `xargs`/`parallel` with a program that writes or runs code, and `find` with `-exec` of one or with `-delete`/`-fprint`, are refused: their paths come from input the guard can't see.
+  - The timeout and crash fallbacks share one rule for what to refuse.
+- `mark` takes no abbreviated options and no repeated ones (`--sc`, `--verdict block … --verdict pass`): the permission prompt must show exactly what is recorded.
+- Infrastructure folders (`infra/`, `terraform/`, `cdk/` …) bring in infra-config-auditor at any depth, not only at the top of the repository.
+- Tests: new `tests/round14.sh`; older suites updated where 0.5.0 deliberately refuses what they allowed.
+
 ## 0.4.3 — 2026-10-28
 
 Fixes from the review of 0.4.2.

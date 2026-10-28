@@ -475,7 +475,7 @@ SIGNAL_RULES = [
     ("env", re.compile(r"(^|/)(\.env\.example|\.env\.sample|\.dev\.vars\.example|wrangler\.(toml|jsonc?)|"
                        r"serverless\.ya?ml|docker-compose[^/]*\.ya?ml)$", re.I)),
     # Infrastructure written as code (CDK, SST, Pulumi) and framework config: code, but infra-config-auditor's too.
-    ("infra", re.compile(r"^(infra|infrastructure|terraform|cdk|pulumi|sst|deploy)/|-stack\.(ts|js|py)$|"
+    ("infra", re.compile(r"(^|/)(infra|infrastructure|terraform|cdk|pulumi|sst|deploy)/|-stack\.(ts|js|py)$|"
                          r"(^|/)(sst|pulumi|cdk)\.[a-z.]+$|(^|/)Pulumi(\.[^/]+)?\.ya?ml$|"
                          r"\.config\.(js|ts|mjs|cjs|mts|cts)$", re.I)),
 ]
@@ -1932,36 +1932,52 @@ def cmd_status(_args):
     return 0 if covers and st.get("verdict") in ALLOWED else 1
 
 
+class Once(argparse.Action):
+    """Store an option's value, refusing a second one: `mark --verdict block … --verdict pass` must not
+    record something other than what the owner read in the permission prompt."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        if getattr(namespace, self.dest, None) is not None:
+            parser.error(f"{option_string} given more than once")
+        setattr(namespace, self.dest, values)
+
+
 def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    # No abbreviated options (`--sc` for --scan-incomplete-accepted): the permission prompt shows the command
+    # as typed, and every option the owner approves must be spelled out there.
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+                                 allow_abbrev=False)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    p = sub.add_parser("prepare")
+
+    def command(name, **kw):
+        return sub.add_parser(name, allow_abbrev=False, **kw)
+    p = command("prepare")
     p.add_argument("--base")
     p.add_argument("--since-last", action="store_true")
     p.add_argument("--worktree", action="store_true")
     p.add_argument("--full", action="store_true")
     p.add_argument("--quick", action="store_true",
                    help="only the core reviewers (bugs, security, loopholes, plus config/dependency checks)")
-    m = sub.add_parser("mark")
-    m.add_argument("--verdict", required=True, choices=list(ALLOWED) + ["block"])
-    m.add_argument("--run", help="run id printed by prepare (default: the most recent run)")
-    m.add_argument("--report")
-    m.add_argument("--note")
+    m = command("mark")
+    m.add_argument("--verdict", required=True, choices=list(ALLOWED) + ["block"], action=Once)
+    m.add_argument("--run", help="run id printed by prepare (default: the most recent run)", action=Once)
+    m.add_argument("--report", action=Once)
+    m.add_argument("--note", action=Once)
     m.add_argument("--checks-skipped", action="store_true",
                    help="owner chose not to run the brief's blocking checks for this review")
     m.add_argument("--secrets-cleared", action="store_true",
                    help="owner confirms the scan's likely secrets are not credentials (or were removed and rotated)")
     m.add_argument("--scan-incomplete-accepted", action="store_true",
                    help="owner confirms the range is free of secrets although the secret scan ran out of time")
-    sub.add_parser("status")
-    t = sub.add_parser("trust-brief", help="approve the current .ravenwatch.md (owner only)")
+    command("status")
+    t = command("trust-brief", help="approve the current .ravenwatch.md (owner only)")
     t.add_argument("--private", action="store_true", help="also git-ignore .ravenwatch.md for this clone")
     t.add_argument("--approve", metavar="SHA256",
                    help="approve the brief only if its content still has this hash (shown by trust-brief)")
-    c = sub.add_parser("checks", help="run the checks listed in the approved brief")
+    c = command("checks", help="run the checks listed in the approved brief")
     c.add_argument("--run", help="run id printed by prepare (default: the most recent run)")
     c.add_argument("--only", nargs="+", help="run only these named checks")
-    h = sub.add_parser("install-hook")
+    h = command("install-hook")
     h.add_argument("--uninstall", action="store_true")
     h.add_argument("--hooks-path-ok", action="store_true")
     args = ap.parse_args()
