@@ -152,8 +152,19 @@ DECLARERS = {"export", "declare", "typeset", "readonly", "local", "set", "unset"
 UNKNOWN_ASSIGN = re.compile(r"(?:^|[\s;&|(])(?:read|mapfile|readarray|getopts)\b[^\n;&|]*")
 ASSIGNMENT = re.compile(r"(?:^|[\s;&|(])(?:(?:export|declare|typeset|readonly|local)\s+(?:-\w+\s+)*)?"
                         r"([A-Za-z_][A-Za-z0-9_]*)=(\$\([^)]*\)|`[^`]*`|\"[^\"]*\"|'[^']*'|[^\s;&|()<>]*)")
-# What may follow a complete shell word (an assignment value ends there).
-WORD_END = ("", " ", "\t", "\n", ";", "&", "|", "(", ")", "<", ">")
+# Other ways a command sets a variable: `X+=…`, `X[i]=…`, `${X:=…}`, `printf -v X`, namerefs, `let`/`((…))`,
+# `unset`, `select`. The guard doesn't follow them; such a variable's value counts as unknown.
+OTHER_ASSIGN = re.compile(
+    r"(?:^|[\s;&|(])([A-Za-z_][A-Za-z0-9_]*)(?:\[[^\]]*\])?\+=|(?:^|[\s;&|(])([A-Za-z_][A-Za-z0-9_]*)\[[^\]]*\]="
+    r"|\$\{([A-Za-z_][A-Za-z0-9_]*):?[=?]|\bprintf\s+(?:-\S+\s+)*-v\s*([A-Za-z_][A-Za-z0-9_]*)"
+    r"|\bselect\s+([A-Za-z_][A-Za-z0-9_]*)")
+# Commands whose every word may name a variable they set (`let X=…`, `((X=…))`, `unset X`, `declare -n X=Y`).
+SETS_NAMES = re.compile(r"(?:^|[\s;&|(])(?:let|unset|(?:declare|typeset|local)\s+(?:-\w+\s+)*-\w*n\w*)\b[^\n;&|]*"
+                        r"|\(\([^)]*\)\)")
+# A variable an expansion reads: $X, ${X…}.
+EXPANDED_NAME = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)")
+# What may follow a complete shell word (an assignment value ends there). Not `(`: `X=(…)` is an array.
+WORD_END = ("", " ", "\t", "\n", ";", "&", "|", ")", "<", ">")
 FOR_LOOP = re.compile(r"\bfor\s+([A-Za-z_][A-Za-z0-9_]*)\s+in\s+([^;\n]*)")
 MKTEMP = re.compile(r"^\$\(\s*mktemp\b([^)`]*)\)$")
 TMPDIR_REF = re.compile(r"\$\{?TMPDIR(?::?-[^}]*)?\}?")
@@ -204,6 +215,7 @@ def quoting(command):
             escaped = True
         elif ch == "$" and command[i + 1:i + 2] == "(":
             stack.append([None, "$("])
+            prev_was_space = True  # a command starts here: `$(# …` is a comment
             i += 2
             continue
         elif ch == "`":
@@ -211,6 +223,7 @@ def quoting(command):
                 stack.pop()
             else:
                 stack.append([None, "`"])
+                prev_was_space = True
         elif quote == '"':
             stack[-1][0] = None if ch == '"' else quote
         elif ch == "$" and command[i + 1:i + 2] == "'":
@@ -221,8 +234,9 @@ def quoting(command):
             stack[-1][0] = ch
         elif ch == "(":
             stack.append([None, "("])
+            prev_was_space = True  # `(#…` is a comment
         elif ch == ")" and len(stack) > 1 and stack[-1][1] in ("$(", "("):
-            stack.pop()
+            prev_was_space = stack.pop()[1] == "("  # `(true)#…` is a comment; `$(x)#y` is one word
         elif ch == "#" and was_space:
             comment = True
         else:
@@ -484,8 +498,25 @@ def shell_vars(command, cwd):
             found[name] = [os.environ[name]] if name in os.environ else []
         found[name] = None if values is None or found[name] is None else found[name] + values
 
+    # Every variable the command may set. A value that reads one of them is unknown: the guard fills values
+    # in from the environment only, never from the command's own earlier (or `+=`, `printf -v` …) settings.
+    assigned = {m.group(1) for m in ASSIGNMENT.finditer(command)} | {m.group(1) for m in FOR_LOOP.finditer(command)}
+    for m in OTHER_ASSIGN.finditer(command):
+        name = next(g for g in m.groups() if g)
+        assigned.add(name)
+        add(name, None)
+    for m in list(SETS_NAMES.finditer(command)) + list(UNKNOWN_ASSIGN.finditer(command)):
+        for name in re.findall(r"(?<![-\w$])[A-Za-z_][A-Za-z0-9_]*", m.group(0)):
+            assigned.add(name)
+
+    def reads_assigned(text):
+        return any(name in assigned for name in EXPANDED_NAME.findall(text))
+
     for m in ASSIGNMENT.finditer(command):
         raw = m.group(2)
+        if not raw.startswith("'") and reads_assigned(raw) and not MKTEMP.match(raw):
+            add(m.group(1), None)
+            continue
         # The value is known only when the match is the whole word: `X='/r'/.git` or `X=$(mktemp -d)/..` go on
         # after the quote or `)`, and quotes or backslashes inside a bare word (`X=/r/.gi''t`) are removed by
         # the shell, not by this reading.
@@ -502,9 +533,12 @@ def shell_vars(command, cwd):
         raw = raw[1:-1] if raw.startswith('"') and raw.endswith('"') and len(raw) >= 2 else raw
         temp = MKTEMP.match(raw)
         if temp:
-            # A new temp path, unless the template points somewhere the guard can't see or into git internals.
-            rest = TMPDIR_REF.sub("", temp.group(1))
-            safe = "$" not in rest and not re.search(r"(?i)\.git\b|hooks|ravenwatch", rest)
+            # A new temp path, unless the template or `-p` dir points somewhere else (any path not under $TMPDIR)
+            # or into git internals, or the command sets TMPDIR itself.
+            rest = TMPDIR_REF.sub("\0", temp.group(1))
+            safe = ("$" not in rest and not re.search(r"(?i)\.git\b|hooks|ravenwatch", rest)
+                    and "TMPDIR" not in assigned and not re.search(r"(?:^|\s)-[A-Za-z]*p|--tmpdir=|--tmpdir\s+\S", rest)
+                    and not re.search(r"(?<!\0)/", rest))
             add(m.group(1), [os.path.join(tempfile.gettempdir(), "tmp.XXXXXXXXXX")] if safe else None)
         else:
             add(m.group(1), expand_vars(raw, {}))
@@ -518,7 +552,7 @@ def shell_vars(command, cwd):
             words = None
         values = []
         for w in words or []:
-            filled = expand_vars(w, {})
+            filled = None if reads_assigned(w) else expand_vars(w, {})
             if filled is None:
                 values = None
                 break
@@ -527,6 +561,10 @@ def shell_vars(command, cwd):
     for m in UNKNOWN_ASSIGN.finditer(command):
         for name in re.findall(r"(?<![-\w$])[A-Za-z_][A-Za-z0-9_]*", m.group(0))[1:]:
             add(name, None)
+    for m in SETS_NAMES.finditer(command):
+        for name in re.findall(r"(?<![-\w$])[A-Za-z_][A-Za-z0-9_]*", m.group(0)):
+            if name not in ("let", "unset", "declare", "typeset", "local"):
+                add(name, None)
     return found
 
 
@@ -693,8 +731,9 @@ def path_refusal(word, kind):
                 "pattern or name the files.")
     if kind == "var":
         return (f"the guard can't tell where `{word}` points (a variable set from command output, `read`, a "
-                "loop, or not set at all), and this command writes there or names git internals. Use a literal "
-                "path or a literal file list (`for f in a.md b.md`), or the Edit tool for in-place edits.")
+                "loop, `+=`/`printf -v`/an array, from another variable set in the same command, or not set at "
+                "all), and this command writes there or names git internals. Use a literal path or a literal file "
+                "list (`for f in a.md b.md`), or the Edit tool for in-place edits.")
     if kind == "config":
         return (f"`{word}` is a git config file; changes there (aliases, hooks path, includes) could skip or redirect "
                 "the review hook. Ask the owner to make the change.")
@@ -917,6 +956,7 @@ def check_bash(command, cwd):
         for repo in repos if not is_push and sub else []:
             # Follow aliases of aliases (`aa = bb`, `bb = push`) a few levels deep.
             name, seen_names, resolved = sub, set(), False
+            chain_globs, pending = [], []  # options and arguments of the levels followed so far
             while len(seen_names) < 5 and name not in seen_names:
                 seen_names.add(name)
                 value = alias_of(repo, name)
@@ -932,15 +972,22 @@ def check_bash(command, cwd):
                 if why:
                     return f"`git {sub}` expands to `{value}`: {why}."
                 try:
-                    _, aglobs, name, aargs = parse_git(["git"] + shlex.split(value))
+                    _, aglobs, alias_sub, aargs = parse_git(["git"] + shlex.split(value))
                 except ValueError:
                     return f"`git {sub}` is an alias the gate cannot parse. Run `git push` directly."
-                if name == "push":
-                    if aglobs:
-                        return (f"`git {sub}` expands to `{value}`, a push with git options (-c, -C …) the gate "
-                                "cannot check. Run `git push` directly.")
-                    is_push, args, resolved = True, aargs + args, True
+                if alias_sub == name:
+                    resolved = True  # an alias that hides a builtin of the same name: git ignores it
                     break
+                name = alias_sub
+                chain_globs += aglobs
+                if name == "push":
+                    if chain_globs:
+                        return (f"`git {sub}` expands to a push with git options (-c, -C …) the gate cannot check. "
+                                "Run `git push` directly.")
+                    # git expands each level in front of the rest: `aa = bb --x`, `bb = push --y` → push --y --x …
+                    is_push, args, resolved = True, aargs + pending + args, True
+                    break
+                pending = aargs + pending
             if not resolved:
                 return (f"`git {sub}` is an alias chain too deep (or looping) for the gate to follow, so it could "
                         "hide a push that skips the hook. Run the git command it stands for directly.")

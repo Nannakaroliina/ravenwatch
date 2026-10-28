@@ -1026,7 +1026,7 @@ def cmd_prepare(args):
     for g in gitignore_gaps:
         out.append(f"- GITIGNORE GAP: {g}")
 
-    if not files and not touched and not (uniq or sensitive or large):
+    if not files and not touched and not (uniq or sensitive or large or scan["cut"]):
         out.append("")
         out.append("NOTHING TO REVIEW: the range contains no file changes"
                    + (" (commits only)." if commits else "."))

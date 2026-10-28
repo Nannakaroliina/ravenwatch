@@ -1,6 +1,6 @@
 {
   "name": "ravenwatch",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "description": "Pre-push code review for solo developers: specialist agents hunt for bugs, loopholes and security issues in your unpushed commits and check blast radius, privacy, UX, tests and design; your own tests run from an approved project brief; a skeptical verifier filters out false alarms; a push gate holds git push until the review passes.",
   "author": {
     "name": "Nanna Karoliina"

@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.4.3 — 2026-10-28
+
+Fixes from the review of 0.4.2.
+
+**Upgrade:** re-run /ravenwatch:install-git-hook in each gated repository.
+
+- Guard, bypasses closed:
+  - A `#` right after `(`, a subshell's `)`, `$(` or an opening backtick starts a comment, as in bash. 0.4.2's single quote scanner had lost this, so a command could hide a push or a write behind `(#'…`.
+  - Variables now fail closed. Any variable the command sets in a way the guard doesn't follow counts as unknown, and writes through it are refused: `X+=…`, `X[i]=…`, `X=(…)`, `${X:=…}`, `printf -v X`, `declare -n`, `let`, `((…))`, `unset` and `select`. So does a value that reads another variable the same command sets (`HOME=.g; V=${HOME}it/…`). `$(mktemp)` counts as a temp path only when the command doesn't set TMPDIR and gives no `-p` directory or template path.
+  - Alias chains: options and arguments from every level count, so `aa = bb --recurse-submodules=…` with `bb = push` is refused like a one-level alias. An alias that hides a builtin of the same name (`status = status -sb`, which git ignores) no longer makes the guard refuse the builtin.
+- Secret scan out of time: the review skill always reports SCAN-1, and asks the owner before `--scan-incomplete-accepted`. A clean gitleaks run is supporting evidence only, since the repository can configure gitleaks. `prepare` no longer says "nothing to review" after a cut scan.
+- Tests: new `tests/round13.sh`.
+
 ## 0.4.2 — 2026-10-28
 
 Fixes from the review of 0.4.1.
