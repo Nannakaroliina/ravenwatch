@@ -1,6 +1,6 @@
 # Lint settings for the plugin's Python (scripts/, hooks/). Standard library only, no build step.
 line-length = 150
-target-version = "py38"
+target-version = "py39"
 
 [lint]
 # pyflakes, pycodestyle and bugbear: real mistakes, not style churn.

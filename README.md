@@ -100,7 +100,7 @@ For public repos, keep the brief private (`init-brief` offers this): a committed
 
 ## Setup
 
-Requirements: `git` and `python3` (on macOS both come with the Xcode Command Line Tools).
+Requirements: `git` and `python3` 3.9 or newer (on macOS both come with the Xcode Command Line Tools).
 
 This repository is both the plugin and its own marketplace. In Claude Code:
 

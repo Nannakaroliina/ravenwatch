@@ -5,7 +5,7 @@
 Plugin directory flags, policies and CI. No change to how reviews, the guard or the git hook behave.
 
 - Privacy Policy (`PRIVACY.md`) and Terms of Use (`TERMS.md`); `privacyPolicyUrl` in `plugin.json`.
-- CI on every push and pull request: `ruff` (settings in `ruff.toml`), `shellcheck`, and the test suites on Linux and macOS. Dependabot keeps the CI actions current.
+- CI on every push and pull request: `ruff` (settings in `ruff.toml`), `shellcheck`, and the test suites on Linux (Python 3.9, 3.12, 3.15) and macOS (Apple's own `python3` and 3.15). Python 3.9 is now the stated minimum. Dependabot keeps the CI actions current.
 - Removed the unused `assets/icon.png` (the listing uses `assets/icon-code.png`; `assets/icon.svg` stays as the source).
 - Tests and docs no longer read as credential use or download-and-run to the plugin directory's scanner: the test counter is no longer called `pass`, test hooks read their input from a file instead of a pipe into `python3`, and fixtures don't spell a credential-named variable next to a URL.
 

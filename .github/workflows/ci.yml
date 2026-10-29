@@ -35,10 +35,18 @@ jobs:
           shellcheck -S error tests/*.sh
 
   test:
+    name: test (${{ matrix.os }}, python ${{ matrix.python }})
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          # 3.9 is the oldest supported; ubuntu-24.04 is the newest image with 3.9 builds.
+          - { os: ubuntu-24.04, python: "3.9" }
+          - { os: ubuntu-latest, python: "3.12" }
+          - { os: ubuntu-latest, python: "3.15" }
+          # Apple's /usr/bin/python3 from the Command Line Tools, what most Mac users run.
+          - { os: macos-latest, python: system }
+          - { os: macos-latest, python: "3.15" }
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:
@@ -46,7 +54,16 @@ jobs:
         with:
           persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        if: matrix.python != 'system'
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python }}
+      - name: put Apple's python3 first
+        if: matrix.python == 'system'
+        run: echo /usr/bin >> "$GITHUB_PATH"
+      - name: python version
+        run: command -v python3 && python3 --version
+      - name: check it is Apple's python3
+        if: matrix.python == 'system'
+        run: test "$(command -v python3)" = /usr/bin/python3
       - name: tests
         run: sh tests/run.sh
