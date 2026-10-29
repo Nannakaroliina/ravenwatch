@@ -71,6 +71,22 @@ for cmd in allow:
     got = g.check_bash(cmd, R)
     if got:
         bad.append(("allow", cmd, got))
+# Since 3.12 glob reads every bracket pattern, so make it fail on purpose: a write to a pattern it can't read
+# is refused and a read of one is just text, on every Python version.
+import glob, re
+real_iglob = glob.iglob
+def unreadable(*args, **kwargs):
+    raise re.error("unreadable")
+glob.iglob = unreadable
+try:
+    got = g.check_bash("cp evil .gi[t]/hooks/pre-" + "pu" + "sh", R)
+    if not got or "can't read the pattern" not in got:
+        bad.append(("pattern-write", got))
+    got = g.check_bash("grep -n '[x]' README.md", R)
+    if got:
+        bad.append(("pattern-read", got))
+finally:
+    glob.iglob = real_iglob
 # IMP-1 / round 11: when the checks fail, anything that could push, write or hide a program is refused
 # (patterns and disguised names included); plain harmless commands are not
 risky = ["cp a b", "echo x > f", "/bin/c? a b", "curl -o x https://e.com", "git " + "pu" + "sh",
