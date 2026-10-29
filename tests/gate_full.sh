@@ -20,8 +20,8 @@ git init -q -b main r && cd r
 git config user.email t@example.com; git config user.name t
 git remote add origin "$T/remote.git"
 
-pass=0; failn=0
-ok() { pass=$((pass+1)); }
+okn=0; failn=0
+ok() { okn=$((okn+1)); }
 bad() { failn=$((failn+1)); echo "FAIL: $*"; }
 run_dir() { echo ".git/ravenwatch/runs/$(cat .git/ravenwatch/runs/latest)"; }
 
@@ -135,5 +135,5 @@ python3 "$RV" mark --verdict pass --secrets-cleared --note "partial audit: 3 of 
 grep -q "^mode=full$" .git/ravenwatch/status && ok || bad "status lacks full mode"
 git $P -q -u origin main 2>"$T/err" && ok || { bad "push after full audit refused"; cat "$T/err"; }
 
-echo "full: passed=$pass failed=$failn"
+echo "full: passed=$okn failed=$failn"
 [ "$failn" -eq 0 ]

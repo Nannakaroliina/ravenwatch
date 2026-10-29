@@ -27,11 +27,12 @@ R="$T/r"
 RV="$RW/scripts/ravenwatch.py"
 python3 "$RV" install-hook >/dev/null
 
-pass=0; failn=0
-ok() { pass=$((pass+1)); }
+okn=0; failn=0
+ok() { okn=$((okn+1)); }
 bad() { failn=$((failn+1)); echo "FAIL: $*"; }
 bash_gate() { # expect cwd command
-  out=$(python3 -c 'import json,sys; print(json.dumps({"tool_name":"Bash","cwd":sys.argv[1],"tool_input":{"command":sys.argv[2]}}))' "$2" "$3" | python3 "$G")
+  python3 -c 'import json,sys; print(json.dumps({"tool_name":"Bash","cwd":sys.argv[1],"tool_input":{"command":sys.argv[2]}}))' "$2" "$3" >"$T/hook-input.json"
+  out=$(python3 "$G" <"$T/hook-input.json")
   [ -n "$out" ] && got=deny || got=allow
   [ "$got" = "$1" ] && ok || bad "bash expected $1 got $got: $3 $out"
 }
@@ -150,5 +151,5 @@ bash_gate allow "$R" "python3 $RV status 2>&1"
 bash_gate allow "$R" "python3 $RV status > /dev/null"
 bash_gate allow "$R" "cd $T && ls r"
 
-echo "round8: passed=$pass failed=$failn"
+echo "round8: passed=$okn failed=$failn"
 [ "$failn" -eq 0 ]

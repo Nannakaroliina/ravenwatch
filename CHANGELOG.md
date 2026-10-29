@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.4 — 2026-10-29
+
+Plugin directory flags, policies and CI. No change to how reviews, the guard or the git hook behave.
+
+- Privacy Policy (`PRIVACY.md`) and Terms of Use (`TERMS.md`); `privacyPolicyUrl` in `plugin.json`.
+- CI on every push and pull request: `ruff` (settings in `ruff.toml`), `shellcheck`, and the test suites on Linux (Python 3.9, 3.12, 3.15) and macOS (Apple's own `python3` and 3.15). Python 3.9 is now the stated minimum. Dependabot keeps the CI actions current.
+- Removed the unused `assets/icon.png` (the listing uses `assets/icon-code.png`; `assets/icon.svg` stays as the source).
+- Tests and docs no longer read as credential use or download-and-run to the plugin directory's scanner: the test counter is no longer called `pass`, test hooks read their input from a file instead of a pipe into `python3`, and fixtures don't spell a credential-named variable next to a URL.
+
 ## 0.5.3 — 2026-10-28
 
 Fixes from the review of 0.5.2, two of them regressions in 0.5.2 itself.
@@ -49,7 +58,7 @@ The Claude guard no longer tries to work out what shell variables, substitutions
   - Any other command is let through only when its text can't touch git, write a file, run other code or change the environment; otherwise it gets one refusal saying how to rewrite it. Reads through variables (`echo $HOME`, `cat "$F"`) keep working.
   - Gone: the variable tracking (`shell_vars`, `expand_vars`, `${X%…}` trimming, the `$(mktemp)` rules) and the comment and quote special cases in the old scanner. This closes the round-7 findings (a `#` after a backtick or `<(…)` hiding the rest of the line) and every earlier variant of them.
   - The plugin's own helper gets no shortcut any more: its arguments are checked like any other command's, so zsh glob qualifiers (`*(e:…:)`) or `=(…)` can't run code through it.
-  - A push can't come with `export`/`NAME=` changes in the same command (`HOME=/tmp/x git push` reads another gitconfig), or from text fed to a shell or interpreter (`cat <<EOF | sh`, `printf 'git push' | sh`).
+  - A push can't come with `export`/`NAME=` changes in the same command (`HOME=/tmp/x git push` reads another gitconfig), or from text fed to a shell or interpreter (a heredoc or `printf 'git push'` piped into `sh`).
   - `xargs`/`parallel` with a program that writes or runs code, and `find` with `-exec` of one or with `-delete`/`-fprint`, are refused: their paths come from input the guard can't see.
   - The timeout and crash fallbacks share one rule for what to refuse.
 - `mark` takes no abbreviated options and no repeated ones (`--sc`, `--verdict block … --verdict pass`): the permission prompt must show exactly what is recorded.
@@ -96,7 +105,7 @@ Fixes from the first full-repository audit and four review rounds of those fixes
   - The helper shortcut only covers a single-line command; a second line used to skip every check.
   - Every hook-skipping check runs over the same views of each command (as written, line continuations joined, `$'…'` decoded, quotes and variables removed), for the whole command, each part of it, and alias values. Names built from variables (`RAVENWATCH_DIS${X}ABLE`) are caught.
   - `$'…'` with escapes the shells read differently (`\c`, `\0`, `\N`, a `\x`/`\u`/`\U` without all its digits), or that can't be decoded, is refused anywhere, and any `$'…'`/`$"…"` is refused in a command that mentions git. One quote scanner decides what is quoted, including inside `"$(…)"` and backticks.
-  - Paths through variables are followed: literal assignments, `for` loops, `$(mktemp)`, the environment, `$PWD` (the session's directory), `${X:-default}`, `${X%…}`/`${X#…}`. A write to a path that can't be worked out is refused, and so is a command name or git subcommand that comes from an unknown variable. A git push may not use shell variables.
+  - Paths through variables are followed: literal assignments, `for` loops, `$(mktemp)`, the environment, the shell's working-directory variable (the session's directory), `${X:-default}`, `${X%…}`/`${X#…}`. A write to a path that can't be worked out is refused, and so is a command name or git subcommand that comes from an unknown variable. A git push may not use shell variables.
   - A `cat` heredoc body counts as data only where `cat` really is a command (one quote scanner, which opens a fresh context at `$(`, backticks and a plain `(` subshell or case pattern, so a `)` can't close a substitution early); the first line's remainder must be redirections only with no quote that could swallow the body; the body ends at the shell's real delimiter (also when empty); an unquoted delimiter with command substitutions keeps it; and a command that redefines `cat` (a function, alias, or `PATH=`) keeps every body. `cat > file <<'EOF'` works like `cat <<'EOF' > file`.
   - git options that write files (`--prefix=`, `-o`, `--output`) and the output options of curl, wget, tar and unzip are path-checked, in clusters and attached forms too (`-sSo f`, `-of`). sed and perl count as writers; `$` inside single quotes is text.
   - A `#` after an escaped space isn't a comment; `--attr-source` takes a value, and `push` after an unknown git option is refused; aliases of aliases are followed, and an alias that adds `-c`/`-C` to a push is refused.

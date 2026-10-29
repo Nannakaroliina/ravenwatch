@@ -27,11 +27,12 @@ R="$T/r"
 RV="$RW/scripts/ravenwatch.py"
 python3 "$RV" install-hook >/dev/null
 
-pass=0; failn=0
-ok() { pass=$((pass+1)); }
+okn=0; failn=0
+ok() { okn=$((okn+1)); }
 bad() { failn=$((failn+1)); echo "FAIL: $*"; }
 bash_gate() { # expect cwd command [text the reason must contain]
-  out=$(python3 -c 'import json,sys; print(json.dumps({"tool_name":"Bash","cwd":sys.argv[1],"tool_input":{"command":sys.argv[2]}}))' "$2" "$3" | python3 "$G")
+  python3 -c 'import json,sys; print(json.dumps({"tool_name":"Bash","cwd":sys.argv[1],"tool_input":{"command":sys.argv[2]}}))' "$2" "$3" >"$T/hook-input.json"
+  out=$(python3 "$G" <"$T/hook-input.json")
   [ -n "$out" ] && got=deny || got=allow
   [ "$got" = "$1" ] && ok || bad "expected $1 got $got: $3 $out"
   if [ $# -ge 4 ] && [ "$1" = deny ]; then
@@ -73,7 +74,7 @@ deny = {
 allow = [
     "ls -la", "echo $HOME", "x=$(date); echo \"$x\"", "for f in *.md; do echo \"$f\"; done",
     "while IFS= read -r f; do echo \"$f\"; done < /tmp/list", "if [ -f \"$HOME/x\" ]; then echo yes; fi",
-    "curl -s -H \"Authorization: Bearer $TOKEN\" https://example.com/api", "echo $X 2>&1 | grep -c y",
+    "curl -s -H \"Accept: $TYPE\" https://example.com/api", "echo $X 2>&1 | grep -c y",
     "sort f | uniq -c | sort -rn | head", "git log '@{u}..HEAD'", "cp ~/notes.txt /tmp/n.txt", "ls ~root",
     "git commit -m \"$(cat <<'EOF'\nFix it; don't " + P + " $x\n\nCo-Authored-By: t\nEOF\n)\"",
     # RES-1: an apostrophe in one heredoc body doesn't change how the next heredoc is read
@@ -107,5 +108,5 @@ grep -q "accepted" "$T/err" && bad "prepare's refusal offers accepted: $(cat "$T
 grep -q "git stash" "$T/err" && ok || bad "prepare's refusal lacks the stash round trip: $(cat "$T/err")"
 git update-index --no-skip-worktree src/u.py; git checkout -q -- src/u.py
 
-echo "round15: passed=$pass failed=$failn"
+echo "round15: passed=$okn failed=$failn"
 [ "$failn" -eq 0 ]

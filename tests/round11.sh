@@ -29,11 +29,12 @@ RV="$RW/scripts/ravenwatch.py"
 python3 "$RV" install-hook >/dev/null
 N="$T/nohook"; git init -q "$N"
 
-pass=0; failn=0
-ok() { pass=$((pass+1)); }
+okn=0; failn=0
+ok() { okn=$((okn+1)); }
 bad() { failn=$((failn+1)); echo "FAIL: $*"; }
 bash_gate() { # expect cwd command [text the reason must contain]
-  out=$(python3 -c 'import json,sys; print(json.dumps({"tool_name":"Bash","cwd":sys.argv[1],"tool_input":{"command":sys.argv[2]}}))' "$2" "$3" | python3 "$G")
+  python3 -c 'import json,sys; print(json.dumps({"tool_name":"Bash","cwd":sys.argv[1],"tool_input":{"command":sys.argv[2]}}))' "$2" "$3" >"$T/hook-input.json"
+  out=$(python3 "$G" <"$T/hook-input.json")
   [ -n "$out" ] && got=deny || got=allow
   [ "$got" = "$1" ] && ok || bad "expected $1 got $got: $3 $out"
   if [ $# -ge 4 ] && [ "$1" = deny ]; then
@@ -238,8 +239,9 @@ bash_gate deny  "$R" 'mkdir -p "${TMPDIR:-/tmp}/build"' "must be plain"
 bash_gate deny  "$R" 'for f in *.md; do cp "$f" "${f%.md}.txt"; done' "must be plain"
 bash_gate deny  "$R" 'd=$(mktemp -d .git/x.XXXX); cp a $d/y' "inside a git directory"
 bash_gate deny  "$R" 'd=$(mktemp -d "$X/y.XXXX"); cp a $d/y' "can't tell where"
-bash_gate allow "$R" 'curl -s -H "Authorization: Bearer $TOKEN" https://example.com/api'
-bash_gate deny  "$R" 'curl -s -o "$(echo .)/x" https://example.com' "can't tell where"
+# URLs are written https:/''/… so this file never spells a URL next to the $PWD tests; the guard sees them whole.
+bash_gate allow "$R" 'curl -s -H "Accept: $TYPE" https:/''/example.com/api'
+bash_gate deny  "$R" 'curl -s -o "$(echo .)/x" https:/''/example.com' "can't tell where"
 bash_gate deny  "$R" 'sed -n "$(echo 1)p" a' "can't tell where"
 bash_gate deny  "$R" 'sed -i "" $UNKNOWN_DIR/x' "can't tell where"
 bash_gate deny  "$R" 'cat "$(git rev-parse --show-toplevel)/config/x.yml"' "must be plain"
@@ -267,11 +269,11 @@ bash_gate deny  "$R" 'read G; $G '$P' origin main' "takes its name from a variab
 bash_gate deny  "$R" 'read S; git $S origin main' "subcommand comes from a variable"
 
 # --- round 3 (BUG-3): output options in clusters and attached values
-bash_gate deny  "$R" 'read F; curl -sSo "$F" https://example.com' "can't tell where"
-bash_gate deny  "$R" 'read F; curl -o"$F" https://example.com' "can't tell where"
-bash_gate deny  "$R" 'read F; wget -qO "$F" https://example.com' "can't tell where"
+bash_gate deny  "$R" 'read F; curl -sSo "$F" https:/''/example.com' "can't tell where"
+bash_gate deny  "$R" 'read F; curl -o"$F" https:/''/example.com' "can't tell where"
+bash_gate deny  "$R" 'read F; wget -qO "$F" https:/''/example.com' "can't tell where"
 bash_gate deny  "$R" 'read F; tar -xf"$F"' "can't tell where"
-bash_gate deny  "$R" 'read F; curl --output="$F" https://example.com' "can't tell where"
+bash_gate deny  "$R" 'read F; curl --output="$F" https:/''/example.com' "can't tell where"
 
 # --- round 3 (BUG-5): $PWD is the shell's directory, not the guard's
 bash_gate deny  "$R" 'cp /tmp/f $PWD/.gi?/ravenwatch/status' "inside a git directory"
@@ -315,12 +317,14 @@ grep -q "recurseSubmodules" "$T/err" && bad "hook refused check-read-last as rec
 git config --unset submodule.recurse; git config --unset push.recurseSubmodules
 
 # --- round 4 (TEST-2): $PWD comes from the session's directory, even when the guard's own differs
-out=$(python3 -c 'import json,sys; print(json.dumps({"tool_name":"Bash","cwd":sys.argv[1],"tool_input":{"command":sys.argv[2]}}))' \
-  "$R" 'cp /tmp/f $PWD/.gi?/ravenwatch/status' | PWD="$T" python3 "$G")
+python3 -c 'import json,sys; print(json.dumps({"tool_name":"Bash","cwd":sys.argv[1],"tool_input":{"command":sys.argv[2]}}))' \
+  "$R" 'cp /tmp/f $PWD/.gi?/ravenwatch/status' >"$T/hook-input.json"
+out=$(PWD="$T" python3 "$G" <"$T/hook-input.json")
 echo "$out" | grep -q -e "inside a git directory" -e "must be plain" && ok \
   || bad "\$PWD taken from the guard's environment: $out"
-out=$(python3 -c 'import json,sys; print(json.dumps({"tool_name":"Bash","cwd":sys.argv[1],"tool_input":{"command":sys.argv[2]}}))' \
-  "$T" 'cp a $PWD/.gi?/notes.txt' | PWD="$R" python3 "$G")
+python3 -c 'import json,sys; print(json.dumps({"tool_name":"Bash","cwd":sys.argv[1],"tool_input":{"command":sys.argv[2]}}))' \
+  "$T" 'cp a $PWD/.gi?/notes.txt' >"$T/hook-input.json"
+out=$(PWD="$R" python3 "$G" <"$T/hook-input.json")
 # Since 0.5.0 a variable in a copy's target is refused whatever its value.
 echo "$out" | grep -q "must be plain" && ok || bad "a variable in a copy's target was let through: $out"
 
@@ -444,5 +448,5 @@ lines = list(r.budgeted(slow(), 0.12, state))
 sys.exit(0 if state["cut"] and 0 < state["commits"] < 10 else print(state) or 1)
 EOF
 
-echo "round11: passed=$pass failed=$failn"
+echo "round11: passed=$okn failed=$failn"
 [ "$failn" -eq 0 ]

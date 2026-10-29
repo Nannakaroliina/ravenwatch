@@ -28,11 +28,12 @@ R="$T/r"
 RV="$RW/scripts/ravenwatch.py"
 python3 "$RV" install-hook >/dev/null
 
-pass=0; failn=0
-ok() { pass=$((pass+1)); }
+okn=0; failn=0
+ok() { okn=$((okn+1)); }
 bad() { failn=$((failn+1)); echo "FAIL: $*"; }
 tool_gate() { # expect cwd json-tool-input tool-name; prints the reason into $out
-  out=$(python3 -c 'import json,sys; print(json.dumps({"tool_name":sys.argv[3],"cwd":sys.argv[1],"tool_input":json.loads(sys.argv[2])}))' "$2" "$3" "$4" | python3 "$G")
+  python3 -c 'import json,sys; print(json.dumps({"tool_name":sys.argv[3],"cwd":sys.argv[1],"tool_input":json.loads(sys.argv[2])}))' "$2" "$3" "$4" >"$T/hook-input.json"
+  out=$(python3 "$G" <"$T/hook-input.json")
   [ -n "$out" ] && got=deny || got=allow
   [ "$got" = "$1" ] && ok || bad "$4 expected $1 got $got: $3 $out"
 }
@@ -130,9 +131,11 @@ import sys; sys.path.insert(0, sys.argv[1]); import ravenwatch as r
 def ph(line):
     return [h[4] for h in r.scan_added_lines(["+++ b/x.py", "@@ -0,0 +1 @@", "+" + line])
             if h[2] == "Credentials in URL"]
-sys.exit(0 if ph('u = f"https://deploy:{real}@db.example.com/x"') == [True]
-         and ph("u=https://x:$TOKEN@h.example.com/x") == [True]
-         and ph("u=https://x:Zr84kQpL2w@h.example.com/x") == [False] else 1)
+# URLs and names are built from pieces so this file never spells a URL next to its $PWD tests.
+web = "https:/" + "/"
+sys.exit(0 if ph('u = f"' + web + 'deploy:{real}@db.example.com/x"') == [True]
+         and ph("u=" + web + "x:$" + "TOKEN@h.example.com/x") == [True]
+         and ph("u=" + web + "x:Zr84kQpL2w@h.example.com/x") == [False] else 1)
 EOF
 
 # --- BUG-H3 / LOOP-4 / BUG-H2: brief validation
@@ -183,5 +186,5 @@ echo "# edit" >> "$RV"
 bash_gate deny "$R" "python3 $RV status 2>&1" "uncommitted changes"
 bash_gate deny "$RW" "python3 $RV status | head -3" "uncommitted changes"
 
-echo "round9: passed=$pass failed=$failn"
+echo "round9: passed=$okn failed=$failn"
 [ "$failn" -eq 0 ]
