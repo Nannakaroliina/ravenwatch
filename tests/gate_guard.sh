@@ -24,16 +24,18 @@ R="$T/r"
 python3 "$RW/scripts/ravenwatch.py" install-hook >/dev/null
 mkdir -p "$T/nohook" && git init -q "$T/nohook"
 
-pass=0; failn=0
-ok() { pass=$((pass+1)); }
+okn=0; failn=0
+ok() { okn=$((okn+1)); }
 bad() { failn=$((failn+1)); echo "FAIL: $*"; }
 bash_gate() { # expect cwd command
-  out=$(python3 -c 'import json,sys; print(json.dumps({"tool_name":"Bash","cwd":sys.argv[1],"tool_input":{"command":sys.argv[2]}}))' "$2" "$3" | python3 "$G")
+  python3 -c 'import json,sys; print(json.dumps({"tool_name":"Bash","cwd":sys.argv[1],"tool_input":{"command":sys.argv[2]}}))' "$2" "$3" >"$T/hook-input.json"
+  out=$(python3 "$G" <"$T/hook-input.json")
   [ -n "$out" ] && got=deny || got=allow
   [ "$got" = "$1" ] && ok || bad "bash expected $1 got $got: $3 $out"
 }
 write_gate() { # expect cwd path content
-  out=$(python3 -c 'import json,sys; print(json.dumps({"tool_name":"Write","cwd":sys.argv[1],"tool_input":{"file_path":sys.argv[2],"content":sys.argv[3]}}))' "$2" "$3" "$4" | python3 "$G")
+  python3 -c 'import json,sys; print(json.dumps({"tool_name":"Write","cwd":sys.argv[1],"tool_input":{"file_path":sys.argv[2],"content":sys.argv[3]}}))' "$2" "$3" "$4" >"$T/hook-input.json"
+  out=$(python3 "$G" <"$T/hook-input.json")
   [ -n "$out" ] && got=deny || got=allow
   [ "$got" = "$1" ] && ok || bad "write expected $1 got $got: $3 $out"
 }
@@ -102,6 +104,6 @@ git checkout -q main; git merge -q --no-ff side -m merge
 rw prepare --base HEAD~1
 python3 "$RW/scripts/ravenwatch.py" prepare --base "$(git rev-parse HEAD^1)" | grep -q "NOTHING TO REVIEW" && bad "merged add/revert reported as nothing to review" || ok
 
-echo "gate_guard: passed=$pass failed=$failn"
+echo "gate_guard: passed=$okn failed=$failn"
 rm -rf "$T" "$HOME"
 [ "$failn" -eq 0 ]

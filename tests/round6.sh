@@ -27,16 +27,18 @@ R="$T/r"
 python3 "$RW/scripts/ravenwatch.py" install-hook >/dev/null
 git init -q "$T/nohook"
 
-pass=0; failn=0
-ok() { pass=$((pass+1)); }
+okn=0; failn=0
+ok() { okn=$((okn+1)); }
 bad() { failn=$((failn+1)); echo "FAIL: $*"; }
 bash_gate() { # expect cwd command
-  out=$(python3 -c 'import json,sys; print(json.dumps({"tool_name":"Bash","cwd":sys.argv[1],"tool_input":{"command":sys.argv[2]}}))' "$2" "$3" | python3 "$G")
+  python3 -c 'import json,sys; print(json.dumps({"tool_name":"Bash","cwd":sys.argv[1],"tool_input":{"command":sys.argv[2]}}))' "$2" "$3" >"$T/hook-input.json"
+  out=$(python3 "$G" <"$T/hook-input.json")
   [ -n "$out" ] && got=deny || got=allow
   [ "$got" = "$1" ] && ok || bad "bash expected $1 got $got: $3 $out"
 }
 write_gate() { # expect cwd path
-  out=$(python3 -c 'import json,sys; print(json.dumps({"tool_name":"Write","cwd":sys.argv[1],"tool_input":{"file_path":sys.argv[2],"content":"x"}}))' "$2" "$3" | python3 "$G")
+  python3 -c 'import json,sys; print(json.dumps({"tool_name":"Write","cwd":sys.argv[1],"tool_input":{"file_path":sys.argv[2],"content":"x"}}))' "$2" "$3" >"$T/hook-input.json"
+  out=$(python3 "$G" <"$T/hook-input.json")
   [ -n "$out" ] && got=deny || got=allow
   [ "$got" = "$1" ] && ok || bad "write expected $1 got $got: $3 $out"
 }
@@ -155,5 +157,5 @@ ln "$T/own.txt" "$T/hard.md"
 rwq mark --verdict block --report "$T/hard.md" && bad "hard-linked report accepted" || ok
 grep -rq owned-secret "$reports" && bad "linked file copied into reports" || ok
 
-echo "round6: passed=$pass failed=$failn"
+echo "round6: passed=$okn failed=$failn"
 [ "$failn" -eq 0 ]

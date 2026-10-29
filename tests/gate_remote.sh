@@ -23,16 +23,18 @@ git $P -q -u origin main
 R="$T/r"
 python3 "$RW/scripts/ravenwatch.py" install-hook >/dev/null
 
-pass=0; failn=0
-ok() { pass=$((pass+1)); }
+okn=0; failn=0
+ok() { okn=$((okn+1)); }
 bad() { failn=$((failn+1)); echo "FAIL: $*"; }
 bash_gate() { # expect cwd command
-  out=$(python3 -c 'import json,sys; print(json.dumps({"tool_name":"Bash","cwd":sys.argv[1],"tool_input":{"command":sys.argv[2]}}))' "$2" "$3" | python3 "$G")
+  python3 -c 'import json,sys; print(json.dumps({"tool_name":"Bash","cwd":sys.argv[1],"tool_input":{"command":sys.argv[2]}}))' "$2" "$3" >"$T/hook-input.json"
+  out=$(python3 "$G" <"$T/hook-input.json")
   [ -n "$out" ] && got=deny || got=allow
   [ "$got" = "$1" ] && ok || bad "bash expected $1 got $got: $3 $out"
 }
 write_gate() { # expect path
-  out=$(python3 -c 'import json,sys; print(json.dumps({"tool_name":"Write","cwd":sys.argv[1],"tool_input":{"file_path":sys.argv[2],"content":"x"}}))' "$R" "$2" | python3 "$G")
+  python3 -c 'import json,sys; print(json.dumps({"tool_name":"Write","cwd":sys.argv[1],"tool_input":{"file_path":sys.argv[2],"content":"x"}}))' "$R" "$2" >"$T/hook-input.json"
+  out=$(python3 "$G" <"$T/hook-input.json")
   [ -n "$out" ] && got=deny || got=allow
   [ "$got" = "$1" ] && ok || bad "write expected $1 got $got: $2 $out"
 }
@@ -121,6 +123,6 @@ printf '#!/usr/bin/env sh\n. "$(dirname "$0")/_/husky.sh"\n' > "$T/husky/$D/hook
 (cd "$T/husky" && python3 "$RW/scripts/ravenwatch.py" install-hook >/dev/null 2>&1) && bad "installed over husky" || ok
 grep -q husky "$T/husky/$D/hooks/pre-$P" && ok || bad "husky hook was touched"
 
-echo "gate_remote: passed=$pass failed=$failn"
+echo "gate_remote: passed=$okn failed=$failn"
 rm -rf "$T" "$HOME"
 [ "$failn" -eq 0 ]

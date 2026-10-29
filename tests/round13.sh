@@ -29,11 +29,12 @@ RV="$RW/scripts/ravenwatch.py"
 python3 "$RV" install-hook >/dev/null
 N="$T/nohook"; git init -q "$N"
 
-pass=0; failn=0
-ok() { pass=$((pass+1)); }
+okn=0; failn=0
+ok() { okn=$((okn+1)); }
 bad() { failn=$((failn+1)); echo "FAIL: $*"; }
 bash_gate() { # expect cwd command [text the reason must contain]
-  out=$(python3 -c 'import json,sys; print(json.dumps({"tool_name":"Bash","cwd":sys.argv[1],"tool_input":{"command":sys.argv[2]}}))' "$2" "$3" | python3 "$G")
+  python3 -c 'import json,sys; print(json.dumps({"tool_name":"Bash","cwd":sys.argv[1],"tool_input":{"command":sys.argv[2]}}))' "$2" "$3" >"$T/hook-input.json"
+  out=$(python3 "$G" <"$T/hook-input.json")
   [ -n "$out" ] && got=deny || got=allow
   [ "$got" = "$1" ] && ok || bad "expected $1 got $got: $3 $out"
   if [ $# -ge 4 ] && [ "$1" = deny ]; then
@@ -112,5 +113,5 @@ grep -q "NOTHING TO REVIEW" "$T/ctx" && bad "a cut scan was reported as nothing 
 python3 "$RV" mark --verdict pass >/dev/null 2>"$T/err" && bad "mark passed over a cut scan" || ok
 python3 "$RV" mark --verdict block >/dev/null 2>&1 && ok || bad "mark refused block after a cut scan"
 
-echo "round13: passed=$pass failed=$failn"
+echo "round13: passed=$okn failed=$failn"
 [ "$failn" -eq 0 ]

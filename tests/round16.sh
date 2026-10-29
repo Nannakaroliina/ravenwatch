@@ -26,8 +26,8 @@ R="$T/r"
 RV="$RW/scripts/ravenwatch.py"
 python3 "$RV" install-hook >/dev/null
 
-pass=0; failn=0
-ok() { pass=$((pass+1)); }
+okn=0; failn=0
+ok() { okn=$((okn+1)); }
 bad() { failn=$((failn+1)); echo "FAIL: $*"; }
 
 # --- guard verdicts, straight from check_bash
@@ -98,5 +98,5 @@ python3 "$RV" mark --verdict accepted --note "owner accepts" --scan-incomplete-a
   || bad "accepted with the owner's flag refused: $(cat "$T/err")"
 python3 "$RV" mark --verdict block >/dev/null 2>&1 && ok || bad "block refused after a cut scan"
 
-echo "round16: passed=$pass failed=$failn"
+echo "round16: passed=$okn failed=$failn"
 [ "$failn" -eq 0 ]

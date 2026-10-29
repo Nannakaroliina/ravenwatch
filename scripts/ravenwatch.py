@@ -862,7 +862,7 @@ def cmd_prepare(args):
     out.append(f"- base: {base}")
     out.append(f"- size: {len(files)} files, +{added_lines}/-{deleted_lines} lines")
     if mode == "full":
-        out.append(f"- diff file: none (full audit: reviewers read the files at HEAD; see review groups)")
+        out.append("- diff file: none (full audit: reviewers read the files at HEAD; see review groups)")
         out.append(f"- review groups: {groups_path}")
     else:
         out.append(f"- diff file: {diff_path}")
@@ -908,7 +908,7 @@ def cmd_prepare(args):
     # In a full audit, vendored and generated files would only mislead triage.
     own = [(s, p) for s, p in files if skipped.get(p) not in ("vendored/generated", "lockfile")]
     sig = {}
-    for status, path in own:
+    for _status, path in own:
         for s in signals_for(path):
             sig.setdefault(s, []).append(path)
     deleted = [p for s, p in files if s == "D"]

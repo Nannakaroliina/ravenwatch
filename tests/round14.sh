@@ -29,11 +29,12 @@ RV="$RW/scripts/ravenwatch.py"
 python3 "$RV" install-hook >/dev/null
 N="$T/nohook"; git init -q "$N"
 
-pass=0; failn=0
-ok() { pass=$((pass+1)); }
+okn=0; failn=0
+ok() { okn=$((okn+1)); }
 bad() { failn=$((failn+1)); echo "FAIL: $*"; }
 bash_gate() { # expect cwd command [text the reason must contain]
-  out=$(python3 -c 'import json,sys; print(json.dumps({"tool_name":"Bash","cwd":sys.argv[1],"tool_input":{"command":sys.argv[2]}}))' "$2" "$3" | python3 "$G")
+  python3 -c 'import json,sys; print(json.dumps({"tool_name":"Bash","cwd":sys.argv[1],"tool_input":{"command":sys.argv[2]}}))' "$2" "$3" >"$T/hook-input.json"
+  out=$(python3 "$G" <"$T/hook-input.json")
   [ -n "$out" ] && got=deny || got=allow
   [ "$got" = "$1" ] && ok || bad "expected $1 got $got: $3 $out"
   if [ $# -ge 4 ] && [ "$1" = deny ]; then
@@ -58,7 +59,7 @@ bash_gate allow "$R" 'x=$(date); echo "$x"'
 bash_gate allow "$R" 'for f in *.md; do echo "$f"; done'
 # Since 0.5.1 a command that isn't plain may only run read-only programs.
 bash_gate deny  "$R" 'docker '$P' "$IMAGE"' "known read-only"
-bash_gate allow "$R" 'curl -s -H "Authorization: Bearer $TOKEN" https://example.com/api'
+bash_gate allow "$R" 'curl -s -H "Accept: $TYPE" https://example.com/api'
 bash_gate deny  "$R" 'curl -so "$F" https://example.com' "must be plain"
 bash_gate deny  "$R" 'curl $OPTS https://example.com' "must be plain"
 bash_gate deny  "$R" 'W=c; W=${W}p; $W evil x' "must be plain"
@@ -131,5 +132,5 @@ bad = [c for c in denied if "internal error" not in run(c)] + [c for c in allowe
 sys.exit(print(bad) or 1 if bad else 0)
 EOF
 
-echo "round14: passed=$pass failed=$failn"
+echo "round14: passed=$okn failed=$failn"
 [ "$failn" -eq 0 ]

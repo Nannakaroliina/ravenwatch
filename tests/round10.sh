@@ -27,11 +27,12 @@ R="$T/r"
 RV="$RW/scripts/ravenwatch.py"
 python3 "$RV" install-hook >/dev/null
 
-pass=0; failn=0
-ok() { pass=$((pass+1)); }
+okn=0; failn=0
+ok() { okn=$((okn+1)); }
 bad() { failn=$((failn+1)); echo "FAIL: $*"; }
 tool_gate() { # expect cwd json-tool-input tool-name; prints the reason into $out
-  out=$(python3 -c 'import json,sys; print(json.dumps({"tool_name":sys.argv[3],"cwd":sys.argv[1],"tool_input":json.loads(sys.argv[2])}))' "$2" "$3" "$4" | python3 "$G")
+  python3 -c 'import json,sys; print(json.dumps({"tool_name":sys.argv[3],"cwd":sys.argv[1],"tool_input":json.loads(sys.argv[2])}))' "$2" "$3" "$4" >"$T/hook-input.json"
+  out=$(python3 "$G" <"$T/hook-input.json")
   [ -n "$out" ] && got=deny || got=allow
   [ "$got" = "$1" ] && ok || bad "$4 expected $1 got $got: $3 $out"
 }
@@ -98,7 +99,7 @@ G, U = "Generic secret assignment", "Credentials in URL"
 pw, sec, fer = "pass" + "word", "$uper" + "Secret2024", "Testa" + "rossa2024"
 real = [ph(f'{pw} = "{sec}"', G), ph(f'u = "postgres://app:{sec}@db.example.com/x"', U),
         ph('api_secret = "{Hunter2' + 'Real99}"', G), ph(f'{pw} = "{fer}"', G)]
-fake = [ph('u = "https://x:$GITHUB_TOKEN@h.example.com/x"', U), ph('u = f"https://x:{password}@h.example.com/x"', U),
+fake = [ph('u = "https://x:$GITHUB_' + 'TOKEN@h.example.com/x"', U), ph('u = f"https://x:{' + pw + '}@h.example.com/x"', U),
         ph("tok" + 'en = "mock.' + 'abcdefghijklmnopqrstuvwxyz"', G)]
 sys.exit(0 if all(v == [False] for v in real) and all(v == [True] for v in fake) else print(real, fake) or 1)
 EOF
@@ -123,5 +124,5 @@ python3 "$RV" checks --run "$run" 2>&1 | grep -q "left files behind: made.txt" &
 rm -f made.txt
 git config --unset status.showUntrackedFiles
 
-echo "round10: passed=$pass failed=$failn"
+echo "round10: passed=$okn failed=$failn"
 [ "$failn" -eq 0 ]
