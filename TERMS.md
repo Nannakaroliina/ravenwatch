@@ -21,7 +21,7 @@ ravenwatch is an aid to reviewing your own code before you push it. It is not a 
 - Use ravenwatch only on code you have the right to review and to send to Claude.
 - Review the check commands in your project brief before approving them: ravenwatch runs them on your machine as you.
 - Your use of Claude Code, and the code you share with Claude through it, is governed by your own agreement with Anthropic (see [Anthropic's terms](https://www.anthropic.com/legal)). ravenwatch is not made, endorsed or supported by Anthropic.
-- Keep your own backups. ravenwatch only writes inside `.git/ravenwatch/` and the hook it installs, but you are responsible for your repositories.
+- Keep your own backups. ravenwatch only writes to the places listed in the [Privacy Policy](PRIVACY.md) (mainly `.git/ravenwatch/` and the hook it installs), but you are responsible for your repositories.
 
 ## No warranty and limitation of liability
 

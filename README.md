@@ -113,7 +113,7 @@ Then restart Claude Code (or run `/reload-plugins`). To work on the plugin itsel
 
 Then run `/ravenwatch:install-git-hook` once in each repository you want gated. Claude can't push in a repository until the hook is installed there.
 
-Optional: if [gitleaks](https://github.com/gitleaks/gitleaks), `osv-scanner`, `pip-audit` or similar tools are installed, the review uses them automatically.
+Optional: if [gitleaks](https://github.com/gitleaks/gitleaks) or `osv-scanner` is installed, the review uses it automatically.
 
 ## Day-to-day
 
